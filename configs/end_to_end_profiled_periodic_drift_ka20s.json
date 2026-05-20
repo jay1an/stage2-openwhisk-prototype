@@ -1,0 +1,55 @@
+{
+  "experiments": [
+    {
+      "name": "civic_alert_periodic_drift_ka20s_p95",
+      "workflow": "civic_alert_flow",
+      "regime": "profiled_periodic_drift_ka20s",
+      "workflow_config": "configs/civic_alert_flow.yaml",
+      "trace": "data/stage_synthetic/ka20s/civic_alert_flow_profiled_periodic_drift_ka20s_stage_trace.csv",
+      "forecast_detail": "reports/civic_alert_stage2_hazard_ka20s/civic_alert_flow_hazard-hurdle_stage_compare_detail.csv",
+      "latency_samples": "reports/stage3_civic_alert_profiled_ka20s/latency_samples_for_monte_carlo.csv",
+      "method": "dag-hazard-hurdle",
+      "policy": "p95",
+      "slo_ms": 5000.0,
+      "residual_cold_probability": 0.0,
+      "platform_keepalive_sec": 20.0,
+      "orion_downstream_warm_discount": 0.7,
+      "schedule": "data/azure_schedules_challenge/schedule_azure_periodic_drift_challenge_scaled30_sebs_video.csv",
+      "notes": "Profiled synthetic civic-alert workflow with scaled 20s platform keepalive, corresponding to a 10-minute real idle timeout under 30x time compression."
+    },
+    {
+      "name": "spoken_dialog_periodic_drift_ka20s_p95",
+      "workflow": "spoken_dialog_flow",
+      "regime": "profiled_periodic_drift_ka20s",
+      "workflow_config": "configs/spoken_dialog_flow.yaml",
+      "trace": "data/stage_synthetic/ka20s/spoken_dialog_flow_profiled_periodic_drift_ka20s_stage_trace.csv",
+      "forecast_detail": "reports/spoken_dialog_stage2_hazard_ka20s/spoken_dialog_flow_hazard-hurdle_stage_compare_detail.csv",
+      "latency_samples": "reports/stage3_spoken_dialog_profiled_ka20s/latency_samples_for_monte_carlo.csv",
+      "method": "dag-hazard-hurdle",
+      "policy": "p95",
+      "slo_ms": 4000.0,
+      "residual_cold_probability": 0.0,
+      "platform_keepalive_sec": 20.0,
+      "orion_downstream_warm_discount": 0.7,
+      "schedule": "data/azure_schedules_challenge/schedule_azure_periodic_drift_challenge_scaled30_spoken_dialog_flow.csv",
+      "notes": "Profiled synthetic spoken-dialog workflow with scaled 20s platform keepalive, corresponding to a 10-minute real idle timeout under 30x time compression."
+    },
+    {
+      "name": "visual_qa_periodic_drift_ka20s_p95",
+      "workflow": "visual_qa_flow",
+      "regime": "profiled_periodic_drift_ka20s",
+      "workflow_config": "configs/visual_qa_flow.yaml",
+      "trace": "data/stage_synthetic/ka20s/visual_qa_flow_profiled_periodic_drift_ka20s_stage_trace.csv",
+      "forecast_detail": "reports/visual_qa_stage2_hazard_ka20s/visual_qa_flow_hazard-hurdle_stage_compare_detail.csv",
+      "latency_samples": "reports/stage3_visual_qa_profiled_ka20s/latency_samples_for_monte_carlo.csv",
+      "method": "dag-hazard-hurdle",
+      "policy": "p95",
+      "slo_ms": 3500.0,
+      "residual_cold_probability": 0.0,
+      "platform_keepalive_sec": 20.0,
+      "orion_downstream_warm_discount": 0.7,
+      "schedule": "data/azure_schedules_challenge/schedule_azure_periodic_drift_challenge_scaled30_visual_qa_flow.csv",
+      "notes": "Profiled synthetic visual-QA workflow with scaled 20s platform keepalive, corresponding to a 10-minute real idle timeout under 30x time compression."
+    }
+  ]
+}

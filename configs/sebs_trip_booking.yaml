@@ -1,0 +1,20 @@
+workflow_name: sebs_trip_booking
+namespace: guest
+entry: reserve_hotel
+nodes:
+  - name: reserve_hotel
+    action: wf_sebs_trip_reserve_hotel
+    parents: []
+    sleep_ms: 12
+  - name: reserve_rental
+    action: wf_sebs_trip_reserve_rental
+    parents: [reserve_hotel]
+    sleep_ms: 14
+  - name: reserve_flight
+    action: wf_sebs_trip_reserve_flight
+    parents: [reserve_rental]
+    sleep_ms: 16
+  - name: confirm
+    action: wf_sebs_trip_confirm
+    parents: [reserve_flight]
+    sleep_ms: 8

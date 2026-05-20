@@ -1,0 +1,24 @@
+workflow_name: sebs_ml
+namespace: guest
+entry: generate
+nodes:
+  - name: generate
+    action: wf_sebs_ml_generate
+    parents: []
+    sleep_ms: 20
+  - name: train_0
+    action: wf_sebs_ml_train
+    parents: [generate]
+    sleep_ms: 70
+  - name: train_1
+    action: wf_sebs_ml_train
+    parents: [generate]
+    sleep_ms: 70
+  - name: train_2
+    action: wf_sebs_ml_train
+    parents: [generate]
+    sleep_ms: 70
+  - name: train_3
+    action: wf_sebs_ml_train
+    parents: [generate]
+    sleep_ms: 70

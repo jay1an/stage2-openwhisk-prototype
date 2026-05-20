@@ -1,0 +1,34 @@
+workflow_name: visual_qa_flow
+namespace: guest
+entry: image_embed
+nodes:
+  - name: image_embed
+    action: wf_visual_image_embed
+    parents: []
+    cpu_iters: 3600000
+    memory_kb: 8192
+    memory_passes: 2
+    memory_stride: 256
+    output_items: 8
+    warm_overhead_ms: 60
+    cold_overhead_ms: 1600
+  - name: text_embed
+    action: wf_visual_text_embed
+    parents: [image_embed]
+    cpu_iters: 2800000
+    memory_kb: 4096
+    memory_passes: 1
+    memory_stride: 256
+    output_items: 4
+    warm_overhead_ms: 45
+    cold_overhead_ms: 1350
+  - name: answer_question
+    action: wf_visual_answer_question
+    parents: [text_embed]
+    cpu_iters: 4200000
+    memory_kb: 6144
+    memory_passes: 2
+    memory_stride: 256
+    output_items: 2
+    warm_overhead_ms: 55
+    cold_overhead_ms: 1550

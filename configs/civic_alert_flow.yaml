@@ -1,0 +1,54 @@
+workflow_name: civic_alert_flow
+namespace: guest
+entry: detect_object
+nodes:
+  - name: detect_object
+    action: wf_civic_detect_object
+    parents: []
+    cpu_iters: 4800000
+    memory_kb: 8192
+    memory_passes: 2
+    memory_stride: 256
+    output_items: 8
+    warm_overhead_ms: 65
+    cold_overhead_ms: 1700
+  - name: estimate_pose
+    action: wf_civic_estimate_pose
+    parents: [detect_object]
+    cpu_iters: 3500000
+    memory_kb: 6144
+    memory_passes: 2
+    memory_stride: 256
+    output_items: 6
+    warm_overhead_ms: 55
+    cold_overhead_ms: 1500
+  - name: match_face
+    action: wf_civic_match_face
+    parents: [estimate_pose]
+    cpu_iters: 5200000
+    memory_kb: 12288
+    memory_passes: 2
+    memory_stride: 256
+    output_items: 4
+    warm_overhead_ms: 70
+    cold_overhead_ms: 1900
+  - name: classify_scene
+    action: wf_civic_classify_scene
+    parents: [detect_object, match_face]
+    cpu_iters: 4000000
+    memory_kb: 10240
+    memory_passes: 2
+    memory_stride: 256
+    output_items: 5
+    warm_overhead_ms: 60
+    cold_overhead_ms: 1750
+  - name: translate_alert
+    action: wf_civic_translate_alert
+    parents: [classify_scene]
+    cpu_iters: 2400000
+    memory_kb: 4096
+    memory_passes: 1
+    memory_stride: 256
+    output_items: 2
+    warm_overhead_ms: 45
+    cold_overhead_ms: 1300

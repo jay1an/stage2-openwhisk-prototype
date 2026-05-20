@@ -1,0 +1,44 @@
+workflow_name: sebs_map_reduce
+namespace: guest
+entry: split
+nodes:
+  - name: split
+    action: wf_sebs_mr_split
+    parents: []
+    sleep_ms: 12
+  - name: map_0
+    action: wf_sebs_mr_map
+    parents: [split]
+    sleep_ms: 30
+  - name: map_1
+    action: wf_sebs_mr_map
+    parents: [split]
+    sleep_ms: 30
+  - name: map_2
+    action: wf_sebs_mr_map
+    parents: [split]
+    sleep_ms: 30
+  - name: map_3
+    action: wf_sebs_mr_map
+    parents: [split]
+    sleep_ms: 30
+  - name: map_4
+    action: wf_sebs_mr_map
+    parents: [split]
+    sleep_ms: 30
+  - name: shuffle
+    action: wf_sebs_mr_shuffle
+    parents: [map_0, map_1, map_2, map_3, map_4]
+    sleep_ms: 16
+  - name: reduce_0
+    action: wf_sebs_mr_reduce
+    parents: [shuffle]
+    sleep_ms: 28
+  - name: reduce_1
+    action: wf_sebs_mr_reduce
+    parents: [shuffle]
+    sleep_ms: 28
+  - name: reduce_2
+    action: wf_sebs_mr_reduce
+    parents: [shuffle]
+    sleep_ms: 28

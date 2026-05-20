@@ -1,0 +1,54 @@
+workflow_name: spoken_dialog_flow
+namespace: guest
+entry: speech_decode
+nodes:
+  - name: speech_decode
+    action: wf_spoken_speech_decode
+    parents: []
+    cpu_iters: 4000000
+    memory_kb: 6144
+    memory_passes: 2
+    memory_stride: 256
+    output_items: 6
+    warm_overhead_ms: 65
+    cold_overhead_ms: 1650
+  - name: topic_route
+    action: wf_spoken_topic_route
+    parents: [speech_decode]
+    cpu_iters: 1800000
+    memory_kb: 3072
+    memory_passes: 1
+    memory_stride: 256
+    output_items: 3
+    warm_overhead_ms: 40
+    cold_overhead_ms: 1200
+  - name: entity_extract
+    action: wf_spoken_entity_extract
+    parents: [speech_decode]
+    cpu_iters: 2600000
+    memory_kb: 4096
+    memory_passes: 1
+    memory_stride: 256
+    output_items: 4
+    warm_overhead_ms: 45
+    cold_overhead_ms: 1400
+  - name: response_generate
+    action: wf_spoken_response_generate
+    parents: [topic_route, entity_extract]
+    cpu_iters: 4800000
+    memory_kb: 8192
+    memory_passes: 2
+    memory_stride: 256
+    output_items: 3
+    warm_overhead_ms: 70
+    cold_overhead_ms: 1800
+  - name: speech_synthesize
+    action: wf_spoken_speech_synthesize
+    parents: [response_generate]
+    cpu_iters: 3600000
+    memory_kb: 6144
+    memory_passes: 2
+    memory_stride: 256
+    output_items: 2
+    warm_overhead_ms: 60
+    cold_overhead_ms: 1600

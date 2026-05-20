@@ -1,0 +1,49 @@
+{
+  "experiments": [
+    {
+      "name": "civic_alert_periodic_drift_p95",
+      "workflow": "civic_alert_flow",
+      "regime": "profiled_periodic_drift",
+      "workflow_config": "configs/civic_alert_flow.yaml",
+      "trace": "data/stage_synthetic/civic_alert_flow_profiled_periodic_drift_stage_trace.csv",
+      "forecast_detail": "reports/civic_alert_stage2_hazard/civic_alert_flow_hazard-hurdle_stage_compare_detail.csv",
+      "latency_samples": "reports/stage3_civic_alert_profiled/latency_samples_for_monte_carlo.csv",
+      "method": "dag-hazard-hurdle",
+      "policy": "p95",
+      "slo_ms": 4000.0,
+      "residual_cold_probability": 0.0,
+      "schedule": "data/azure_schedules_challenge/schedule_azure_periodic_drift_challenge_scaled30_sebs_video.csv",
+      "notes": "Profiled synthetic civic-alert workflow driven by the Azure periodic-drift entry schedule."
+    },
+    {
+      "name": "spoken_dialog_periodic_drift_p95",
+      "workflow": "spoken_dialog_flow",
+      "regime": "profiled_periodic_drift",
+      "workflow_config": "configs/spoken_dialog_flow.yaml",
+      "trace": "data/stage_synthetic/spoken_dialog_flow_profiled_periodic_drift_stage_trace.csv",
+      "forecast_detail": "reports/spoken_dialog_stage2_hazard/spoken_dialog_flow_hazard-hurdle_stage_compare_detail.csv",
+      "latency_samples": "reports/stage3_spoken_dialog_profiled/latency_samples_for_monte_carlo.csv",
+      "method": "dag-hazard-hurdle",
+      "policy": "p95",
+      "slo_ms": 3000.0,
+      "residual_cold_probability": 0.0,
+      "schedule": "data/azure_schedules_challenge/schedule_azure_periodic_drift_challenge_scaled30_spoken_dialog_flow.csv",
+      "notes": "Profiled synthetic spoken-dialog workflow driven by the Azure periodic-drift entry schedule."
+    },
+    {
+      "name": "visual_qa_periodic_drift_p95",
+      "workflow": "visual_qa_flow",
+      "regime": "profiled_periodic_drift",
+      "workflow_config": "configs/visual_qa_flow.yaml",
+      "trace": "data/stage_synthetic/visual_qa_flow_profiled_periodic_drift_stage_trace.csv",
+      "forecast_detail": "reports/visual_qa_stage2_hazard/visual_qa_flow_hazard-hurdle_stage_compare_detail.csv",
+      "latency_samples": "reports/stage3_visual_qa_profiled/latency_samples_for_monte_carlo.csv",
+      "method": "dag-hazard-hurdle",
+      "policy": "p95",
+      "slo_ms": 2300.0,
+      "residual_cold_probability": 0.0,
+      "schedule": "data/azure_schedules_challenge/schedule_azure_periodic_drift_challenge_scaled30_visual_qa_flow.csv",
+      "notes": "Profiled synthetic visual-QA workflow driven by the Azure periodic-drift entry schedule."
+    }
+  ]
+}

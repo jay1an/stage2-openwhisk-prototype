@@ -1,0 +1,28 @@
+workflow_name: sebs_video
+namespace: guest
+entry: decode
+nodes:
+  - name: decode
+    action: wf_sebs_video_decode
+    parents: []
+    sleep_ms: 35
+  - name: analyse_0
+    action: wf_sebs_video_analyse
+    parents: [decode]
+    sleep_ms: 45
+  - name: analyse_1
+    action: wf_sebs_video_analyse
+    parents: [decode]
+    sleep_ms: 45
+  - name: analyse_2
+    action: wf_sebs_video_analyse
+    parents: [decode]
+    sleep_ms: 45
+  - name: analyse_3
+    action: wf_sebs_video_analyse
+    parents: [decode]
+    sleep_ms: 45
+  - name: summarize
+    action: wf_sebs_video_summarize
+    parents: [analyse_0, analyse_1, analyse_2, analyse_3]
+    sleep_ms: 18
