@@ -18,6 +18,7 @@ from .plan_joint_control import (
     parse_memory_tiers,
     topological_nodes,
 )
+from .propagator import propagate_entry_to_stage
 
 
 POLICY_TO_QUANTILE = {
@@ -36,7 +37,9 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--workflow-config", required=True)
-    parser.add_argument("--forecast-detail", required=True)
+    parser.add_argument("--forecast-detail", default=None)
+    parser.add_argument("--entry-forecast", default=None)
+    parser.add_argument("--delay-kernel", default=None)
     parser.add_argument("--latency-samples", required=True)
     parser.add_argument("--method", required=True)
     parser.add_argument("--policy", choices=["p50", "p90", "p95"], default="p95")
@@ -116,6 +119,34 @@ def selected_forecast_detail(
     return selected
 
 
+def selected_entry_forecast(
+    entry: pd.DataFrame,
+    *,
+    workflow_name: str,
+    method: str,
+    policy: str,
+    max_plan_windows: int,
+) -> pd.DataFrame:
+    selected = entry[
+        (entry["workflow_name"].astype(str) == workflow_name)
+        & (entry["policy"].astype(str) == policy)
+    ].copy()
+    if "method" in selected.columns:
+        selected = selected[selected["method"].astype(str) == method].copy()
+    if selected.empty:
+        raise ValueError(
+            f"no entry forecast rows for workflow={workflow_name}, method={method}, policy={policy}"
+        )
+    selected["target_window"] = pd.to_numeric(selected["target_window"], errors="coerce")
+    selected["forecast_count"] = pd.to_numeric(selected["forecast_count"], errors="coerce")
+    selected = selected.dropna(subset=["target_window", "forecast_count"]).copy()
+    selected["target_window"] = selected["target_window"].astype(int)
+    if max_plan_windows and max_plan_windows > 0:
+        windows = sorted(selected["target_window"].unique())[:max_plan_windows]
+        selected = selected[selected["target_window"].isin(windows)].copy()
+    return selected
+
+
 def stage_window_table(selected: pd.DataFrame) -> pd.DataFrame:
     return (
         selected.groupby(["stage_name", "target_window"], as_index=False)[
@@ -124,6 +155,25 @@ def stage_window_table(selected: pd.DataFrame) -> pd.DataFrame:
         .max()
         .reset_index(drop=True)
     )
+
+
+def baseline_prev_warm(
+    baseline_name: str,
+    *,
+    warm_count: int,
+    keepalive_ttl_sec: float,
+) -> bool:
+    if baseline_name == "cold_every_time":
+        return False
+    if baseline_name == "platform_default":
+        return keepalive_ttl_sec > 0.0
+    if baseline_name == "always_warm":
+        return True
+    if baseline_name == "orion_style":
+        return warm_count > 0
+    if baseline_name == "stepconf_style":
+        return keepalive_ttl_sec > 0.0
+    return bool(warm_count > 0 or keepalive_ttl_sec > 0.0)
 
 
 def stage_duration(
@@ -359,6 +409,121 @@ def build_plan(
     peak_by_stage = (
         table.groupby("stage_name")[warm_source].max().clip(lower=1).apply(math.ceil).to_dict()
     )
+
+
+def build_plan_from_entry(
+    *,
+    baseline_name: str,
+    entry_forecast: pd.DataFrame,
+    delay_kernel: pd.DataFrame,
+    workflow: WorkflowSpec,
+    ordered: list[str],
+    policy: str,
+    window_sec: float,
+    memory_lookup: dict[str, int],
+    warm_source: str,
+    always_warm_mode: str,
+    platform_keepalive_sec: float,
+    orion_downstream_warm_discount: float,
+    warmup_mode: str,
+) -> tuple[ControlPlan, pd.DataFrame]:
+    windows = sorted(entry_forecast["target_window"].astype(int).unique())
+    if always_warm_mode == "one":
+        peak_by_stage = {stage: 1 for stage in ordered}
+    else:
+        peak_by_stage = {}
+        for stage in ordered:
+            values = [
+                propagate_entry_to_stage(
+                    entry_forecast,
+                    delay_kernel,
+                    workflow_name=workflow.workflow_name,
+                    stage_name=stage,
+                    target_window=window,
+                    policy=policy,
+                    prev_warm=True,
+                )
+                for window in windows
+            ]
+            peak_by_stage[stage] = max(1, int(math.ceil(max(values) if values else 0.0)))
+
+    prev_warm = {stage: False for stage in ordered}
+    rows: list[PlanRow] = []
+    forecast_rows: list[dict] = []
+    for window in windows:
+        next_prev = dict(prev_warm)
+        for stage in ordered:
+            forecast_count = propagate_entry_to_stage(
+                entry_forecast,
+                delay_kernel,
+                workflow_name=workflow.workflow_name,
+                stage_name=stage,
+                target_window=window,
+                policy=policy,
+                prev_warm=prev_warm.get(stage, False),
+            )
+            allocated_count = int(math.ceil(max(0.0, forecast_count)))
+            source_count = forecast_count if warm_source == "forecast_count" else float(allocated_count)
+            memory_mb = int(memory_lookup.get(stage, 256))
+            if baseline_name == "cold_every_time":
+                warm_count = 0
+                keepalive_ttl_sec = 0.0
+            elif baseline_name == "platform_default":
+                warm_count = 0
+                keepalive_ttl_sec = platform_keepalive_sec
+            elif baseline_name == "always_warm":
+                warm_count = int(peak_by_stage[stage])
+                keepalive_ttl_sec = platform_keepalive_sec
+            elif baseline_name == "orion_style":
+                warm_count = 0 if not workflow.nodes[stage].parents else int(math.ceil(source_count * orion_downstream_warm_discount))
+                keepalive_ttl_sec = platform_keepalive_sec
+            elif baseline_name == "stepconf_style":
+                warm_count = 0
+                keepalive_ttl_sec = platform_keepalive_sec
+            else:
+                raise ValueError(f"unknown baseline {baseline_name}")
+            rows.append(
+                PlanRow(
+                    workflow_name=workflow.workflow_name,
+                    stage_name=stage,
+                    window=int(window),
+                    warm_count=float(warm_count),
+                    keepalive_ttl_sec=keepalive_ttl_sec,
+                    memory_mb=memory_mb,
+                    source="paper_baseline",
+                    note=baseline_name,
+                )
+            )
+            forecast_rows.append(
+                {
+                    "workflow_name": workflow.workflow_name,
+                    "method": "entry-kernel",
+                    "stage_name": stage,
+                    "target_window": int(window),
+                    "policy": policy,
+                    "forecast_count": float(forecast_count),
+                    "allocated_count": allocated_count,
+                }
+            )
+            next_prev[stage] = baseline_prev_warm(
+                baseline_name,
+                warm_count=warm_count,
+                keepalive_ttl_sec=keepalive_ttl_sec,
+            )
+        prev_warm = next_prev
+    return (
+        ControlPlan(
+            rows=rows,
+            window_sec=window_sec,
+            metadata={
+                "workflow_name": workflow.workflow_name,
+                "baseline": baseline_name,
+                "warmup_mode": warmup_mode,
+                "input_mode": "entry_forecast_delay_kernel",
+            },
+        ),
+        pd.DataFrame(forecast_rows),
+    )
     rows: list[PlanRow] = []
     for record in table.to_dict(orient="records"):
         stage = str(record["stage_name"])
@@ -435,6 +600,15 @@ def write_method_notes(out_dir: Path) -> None:
 
 def main() -> None:
     args = parse_args()
+    use_entry_kernel = args.entry_forecast is not None or args.delay_kernel is not None
+    if use_entry_kernel:
+        if args.forecast_detail is not None:
+            raise SystemExit("--entry-forecast/--delay-kernel and --forecast-detail are mutually exclusive")
+        if args.entry_forecast is None or args.delay_kernel is None:
+            raise SystemExit("--entry-forecast and --delay-kernel must be provided together")
+    elif args.forecast_detail is None:
+        raise SystemExit("one of --forecast-detail or --entry-forecast/--delay-kernel is required")
+
     root = project_root()
     out_dir = resolve_path(root, args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -442,15 +616,26 @@ def main() -> None:
     workflow = load_workflow(str(resolve_path(root, args.workflow_config)))
     ordered = topological_nodes(workflow)
     memory_tiers = parse_memory_tiers(args.memory_tiers_mb)
-    forecast_detail = pd.read_csv(resolve_path(root, args.forecast_detail))
-    selected = selected_forecast_detail(
-        forecast_detail,
-        workflow_name=workflow.workflow_name,
-        method=args.method,
-        policy=args.policy,
-        fold_id=args.fold_id,
-        max_plan_windows=args.max_plan_windows,
-    )
+    if use_entry_kernel:
+        selected_entry = selected_entry_forecast(
+            pd.read_csv(resolve_path(root, args.entry_forecast)),
+            workflow_name=workflow.workflow_name,
+            method=args.method,
+            policy=args.policy,
+            max_plan_windows=args.max_plan_windows,
+        )
+        delay_kernel = pd.read_csv(resolve_path(root, args.delay_kernel))
+        selected = pd.DataFrame()
+    else:
+        forecast_detail = pd.read_csv(resolve_path(root, args.forecast_detail))
+        selected = selected_forecast_detail(
+            forecast_detail,
+            workflow_name=workflow.workflow_name,
+            method=args.method,
+            policy=args.policy,
+            fold_id=args.fold_id,
+            max_plan_windows=args.max_plan_windows,
+        )
     latency_samples = pd.read_csv(resolve_path(root, args.latency_samples))
     latency_profile = latency_quantiles(
         latency_samples,
@@ -494,24 +679,43 @@ def main() -> None:
     summary_rows = []
     for baseline_name, memory_lookup in memory_plans.items():
         plan_warmup_mode = "window" if baseline_name == "always_warm" else args.warmup_mode
-        plan = build_plan(
-            baseline_name=baseline_name,
-            selected=selected,
-            workflow=workflow,
-            window_sec=args.window_sec,
-            memory_lookup=memory_lookup,
-            warm_source=args.warm_source,
-            always_warm_mode=args.always_warm_mode,
-            platform_keepalive_sec=args.platform_keepalive_sec,
-            orion_downstream_warm_discount=args.orion_downstream_warm_discount,
-            warmup_mode=plan_warmup_mode,
-        )
+        if use_entry_kernel:
+            plan, forecast_for_cost = build_plan_from_entry(
+                baseline_name=baseline_name,
+                entry_forecast=selected_entry,
+                delay_kernel=delay_kernel,
+                workflow=workflow,
+                ordered=ordered,
+                policy=args.policy,
+                window_sec=args.window_sec,
+                memory_lookup=memory_lookup,
+                warm_source=args.warm_source,
+                always_warm_mode=args.always_warm_mode,
+                platform_keepalive_sec=args.platform_keepalive_sec,
+                orion_downstream_warm_discount=args.orion_downstream_warm_discount,
+                warmup_mode=plan_warmup_mode,
+            )
+            forecast_for_cost.to_csv(out_dir / f"{baseline_name}_propagated_stage_forecast.csv", index=False)
+        else:
+            plan = build_plan(
+                baseline_name=baseline_name,
+                selected=selected,
+                workflow=workflow,
+                window_sec=args.window_sec,
+                memory_lookup=memory_lookup,
+                warm_source=args.warm_source,
+                always_warm_mode=args.always_warm_mode,
+                platform_keepalive_sec=args.platform_keepalive_sec,
+                orion_downstream_warm_discount=args.orion_downstream_warm_discount,
+                warmup_mode=plan_warmup_mode,
+            )
+            forecast_for_cost = selected
         save_control_plan(plan, out_dir / f"{baseline_name}_control_plan.json")
         frame = plan_to_frame(plan)
         frame.to_csv(out_dir / f"{baseline_name}_control_plan.csv", index=False)
         cost = estimate_control_plan_cost(
             plan,
-            forecast_detail=selected,
+            forecast_detail=forecast_for_cost,
             latency_samples=latency_samples,
             workflow_name=workflow.workflow_name,
             window_sec=args.window_sec,
@@ -543,7 +747,9 @@ def main() -> None:
     metadata = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "workflow_config": str(resolve_path(root, args.workflow_config)),
-        "forecast_detail": str(resolve_path(root, args.forecast_detail)),
+        "forecast_detail": str(resolve_path(root, args.forecast_detail)) if args.forecast_detail is not None else None,
+        "entry_forecast": str(resolve_path(root, args.entry_forecast)) if args.entry_forecast is not None else None,
+        "delay_kernel": str(resolve_path(root, args.delay_kernel)) if args.delay_kernel is not None else None,
         "latency_samples": str(resolve_path(root, args.latency_samples)),
         "method": args.method,
         "policy": args.policy,

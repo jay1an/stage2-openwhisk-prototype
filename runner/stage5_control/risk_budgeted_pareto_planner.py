@@ -27,6 +27,7 @@ from .plan_joint_control import (
     parse_memory_tiers,
     topological_nodes,
 )
+from .propagator import propagate_entry_to_stage
 
 
 POLICY_TO_QUANTILE = {
@@ -176,7 +177,9 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--workflow-config", required=True)
-    parser.add_argument("--forecast-detail", required=True)
+    parser.add_argument("--forecast-detail", default=None)
+    parser.add_argument("--entry-forecast", default=None)
+    parser.add_argument("--delay-kernel", default=None)
     parser.add_argument("--latency-samples", required=True)
     parser.add_argument("--method", required=True)
     parser.add_argument("--policy", choices=["p50", "p90", "p95"], default="p95")
@@ -272,6 +275,35 @@ def selected_forecast_detail(
     return selected
 
 
+def selected_entry_forecast(
+    entry: pd.DataFrame,
+    *,
+    workflow_name: str,
+    method: str,
+    policy: str,
+    max_plan_windows: int,
+) -> pd.DataFrame:
+    selected = entry[
+        (entry["workflow_name"].astype(str) == workflow_name)
+        & (entry["policy"].astype(str) == policy)
+    ].copy()
+    if "method" in selected.columns:
+        selected = selected[selected["method"].astype(str) == method].copy()
+    if selected.empty:
+        raise ValueError(
+            f"no entry forecast rows for workflow={workflow_name}, method={method}, policy={policy}"
+        )
+    for col in ["target_window", "forecast_count", "allocated_count"]:
+        if col in selected.columns:
+            selected[col] = pd.to_numeric(selected[col], errors="coerce")
+    selected = selected.dropna(subset=["target_window", "forecast_count"]).copy()
+    selected["target_window"] = selected["target_window"].astype(int)
+    if max_plan_windows and max_plan_windows > 0:
+        windows = sorted(selected["target_window"].unique())[:max_plan_windows]
+        selected = selected[selected["target_window"].isin(windows)].copy()
+    return selected
+
+
 def stage_window_table(selected: pd.DataFrame) -> pd.DataFrame:
     value_cols = [
         col
@@ -340,6 +372,77 @@ def next_larger(value: float, options: list[float]) -> float | None:
     return None
 
 
+def warm_count_for_record(
+    state: dict[str, dict[str, float]],
+    *,
+    stage: str,
+    record: dict[str, Any],
+    warm_source: str,
+    active_gate_threshold: float,
+) -> int:
+    source_count = max(0.0, float(record.get(warm_source, 0.0) or 0.0))
+    p_active = probability_value(record.get("p_active", 1.0), default=1.0)
+    multiplier = float(state["warm_multiplier"][stage])
+    if p_active < active_gate_threshold:
+        warm_count = 0
+    else:
+        warm_count = int(math.ceil(source_count * multiplier)) if source_count > 0 else 0
+    min_warm_count = float(state.get("min_warm_count", {}).get(stage, 0.0))
+    if p_active >= active_gate_threshold and source_count <= 0 and min_warm_count > 0:
+        warm_count = max(warm_count, int(math.ceil(min_warm_count)))
+    return int(warm_count)
+
+
+def candidate_selected_from_entry(
+    state: dict[str, dict[str, float]],
+    *,
+    entry_forecast: pd.DataFrame,
+    delay_kernel: pd.DataFrame,
+    workflow: WorkflowSpec,
+    ordered_nodes: list[str],
+    policy: str,
+    warm_source: str,
+    active_gate_threshold: float,
+) -> pd.DataFrame:
+    windows = sorted(entry_forecast["target_window"].astype(int).unique())
+    prev_warm = {stage: False for stage in ordered_nodes}
+    rows: list[dict[str, Any]] = []
+    for window in windows:
+        next_prev = dict(prev_warm)
+        for stage in ordered_nodes:
+            forecast_count = propagate_entry_to_stage(
+                entry_forecast,
+                delay_kernel,
+                workflow_name=workflow.workflow_name,
+                stage_name=stage,
+                target_window=window,
+                policy=policy,
+                prev_warm=prev_warm.get(stage, False),
+            )
+            record = {
+                "workflow_name": workflow.workflow_name,
+                "method": "entry-kernel",
+                "stage_name": stage,
+                "target_window": int(window),
+                "policy": policy,
+                "forecast_count": float(forecast_count),
+                "allocated_count": int(math.ceil(max(0.0, float(forecast_count)))),
+                "p_active": 1.0,
+            }
+            warm_count = warm_count_for_record(
+                state,
+                stage=stage,
+                record=record,
+                warm_source=warm_source,
+                active_gate_threshold=active_gate_threshold,
+            )
+            keepalive = float(state["keepalive_ttl_sec"][stage])
+            next_prev[stage] = bool(warm_count > 0 or keepalive > 0.0)
+            rows.append(record)
+        prev_warm = next_prev
+    return pd.DataFrame(rows)
+
+
 def build_plan_from_state(
     state: dict[str, dict[str, float]],
     *,
@@ -354,16 +457,13 @@ def build_plan_from_state(
     table = stage_window_table(selected)
     for record in table.to_dict(orient="records"):
         stage = str(record["stage_name"])
-        source_count = max(0.0, float(record.get(warm_source, 0.0) or 0.0))
-        p_active = probability_value(record.get("p_active", 1.0), default=1.0)
-        multiplier = float(state["warm_multiplier"][stage])
-        if p_active < active_gate_threshold:
-            warm_count = 0
-        else:
-            warm_count = int(math.ceil(source_count * multiplier)) if source_count > 0 else 0
-        min_warm_count = float(state.get("min_warm_count", {}).get(stage, 0.0))
-        if p_active >= active_gate_threshold and source_count <= 0 and min_warm_count > 0:
-            warm_count = max(warm_count, int(math.ceil(min_warm_count)))
+        warm_count = warm_count_for_record(
+            state,
+            stage=stage,
+            record=record,
+            warm_source=warm_source,
+            active_gate_threshold=active_gate_threshold,
+        )
         keepalive = float(state["keepalive_ttl_sec"][stage])
         rows.append(
             PlanRow(
@@ -570,6 +670,8 @@ def evaluate_candidate(
     action: str,
     state: dict[str, dict[str, float]],
     selected: pd.DataFrame,
+    entry_forecast: pd.DataFrame | None,
+    delay_kernel: pd.DataFrame | None,
     workflow: WorkflowSpec,
     ordered_nodes: list[str],
     latency_pools: PlannerLatencyPools,
@@ -577,9 +679,21 @@ def evaluate_candidate(
     rng: np.random.Generator,
     args: argparse.Namespace,
 ) -> CandidateEvaluation:
+    candidate_selected = selected
+    if entry_forecast is not None and delay_kernel is not None:
+        candidate_selected = candidate_selected_from_entry(
+            state,
+            entry_forecast=entry_forecast,
+            delay_kernel=delay_kernel,
+            workflow=workflow,
+            ordered_nodes=ordered_nodes,
+            policy=args.policy,
+            warm_source=args.warm_source,
+            active_gate_threshold=args.active_gate_threshold,
+        )
     plan = build_plan_from_state(
         state,
-        selected=selected,
+        selected=candidate_selected,
         workflow_name=workflow.workflow_name,
         window_sec=args.window_sec,
         warm_source=args.warm_source,
@@ -589,7 +703,7 @@ def evaluate_candidate(
     plan.metadata["warmup_mode"] = args.warmup_mode
     risk, p50_latency, p90_latency, p95_latency = evaluate_workflow_risk(
         plan=plan,
-        selected=selected,
+        selected=candidate_selected,
         workflow=workflow,
         ordered_nodes=ordered_nodes,
         latency_pools=latency_pools,
@@ -607,7 +721,7 @@ def evaluate_candidate(
     )
     cost = estimate_control_plan_cost(
         plan,
-        forecast_detail=selected,
+        forecast_detail=candidate_selected,
         latency_samples=latency_samples,
         workflow_name=workflow.workflow_name,
         window_sec=args.window_sec,
@@ -794,6 +908,15 @@ def write_readme(out_dir: Path, args: argparse.Namespace, selected: CandidateEva
 
 def main() -> None:
     args = parse_args()
+    use_entry_kernel = args.entry_forecast is not None or args.delay_kernel is not None
+    if use_entry_kernel:
+        if args.forecast_detail is not None:
+            raise SystemExit("--entry-forecast/--delay-kernel and --forecast-detail are mutually exclusive")
+        if args.entry_forecast is None or args.delay_kernel is None:
+            raise SystemExit("--entry-forecast and --delay-kernel must be provided together")
+    elif args.forecast_detail is None:
+        raise SystemExit("one of --forecast-detail or --entry-forecast/--delay-kernel is required")
+
     root = project_root()
     workflow = load_workflow(str(resolve_path(root, args.workflow_config)))
     ordered_nodes = topological_nodes(workflow)
@@ -805,15 +928,44 @@ def main() -> None:
     out_dir = resolve_path(root, args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    forecast_detail = pd.read_csv(resolve_path(root, args.forecast_detail))
-    selected = selected_forecast_detail(
-        forecast_detail,
-        workflow_name=workflow.workflow_name,
-        method=args.method,
-        policy=args.policy,
-        fold_id=args.fold_id,
-        max_plan_windows=args.max_plan_windows,
-    )
+    stages = sorted(workflow.nodes)
+    entry_selected: pd.DataFrame | None = None
+    delay_kernel: pd.DataFrame | None = None
+    if use_entry_kernel:
+        entry_selected = selected_entry_forecast(
+            pd.read_csv(resolve_path(root, args.entry_forecast)),
+            workflow_name=workflow.workflow_name,
+            method=args.method,
+            policy=args.policy,
+            max_plan_windows=args.max_plan_windows,
+        )
+        delay_kernel = pd.read_csv(resolve_path(root, args.delay_kernel))
+        selected = candidate_selected_from_entry(
+            initial_state(
+                stages,
+                warm_multiplier=0.0,
+                keepalive_ttl_sec=0.0,
+                memory_mb=args.base_memory_mb,
+            ),
+            entry_forecast=entry_selected,
+            delay_kernel=delay_kernel,
+            workflow=workflow,
+            ordered_nodes=ordered_nodes,
+            policy=args.policy,
+            warm_source=args.warm_source,
+            active_gate_threshold=args.active_gate_threshold,
+        )
+        selected.to_csv(out_dir / "initial_propagated_stage_forecast.csv", index=False)
+    else:
+        forecast_detail = pd.read_csv(resolve_path(root, args.forecast_detail))
+        selected = selected_forecast_detail(
+            forecast_detail,
+            workflow_name=workflow.workflow_name,
+            method=args.method,
+            policy=args.policy,
+            fold_id=args.fold_id,
+            max_plan_windows=args.max_plan_windows,
+        )
     latency_samples = pd.read_csv(resolve_path(root, args.latency_samples))
     latency_pools = PlannerLatencyPools(latency_samples, workflow.workflow_name, rng)
 
@@ -918,6 +1070,8 @@ def main() -> None:
             action=action,
             state=state,
             selected=selected,
+            entry_forecast=entry_selected,
+            delay_kernel=delay_kernel,
             workflow=workflow,
             ordered_nodes=ordered_nodes,
             latency_pools=latency_pools,
@@ -952,6 +1106,8 @@ def main() -> None:
                     action=action,
                     state=state,
                     selected=selected,
+                    entry_forecast=entry_selected,
+                    delay_kernel=delay_kernel,
                     workflow=workflow,
                     ordered_nodes=ordered_nodes,
                     latency_pools=latency_pools,
@@ -966,6 +1122,18 @@ def main() -> None:
     selected_candidate = choose_selected_candidate(evaluated, args.risk_budget)
     save_control_plan(selected_candidate.plan, out_dir / "selected_control_plan.json")
     plan_to_frame(selected_candidate.plan).to_csv(out_dir / "selected_control_plan.csv", index=False)
+    if entry_selected is not None and delay_kernel is not None:
+        selected_stage_forecast = candidate_selected_from_entry(
+            selected_candidate.state,
+            entry_forecast=entry_selected,
+            delay_kernel=delay_kernel,
+            workflow=workflow,
+            ordered_nodes=ordered_nodes,
+            policy=args.policy,
+            warm_source=args.warm_source,
+            active_gate_threshold=args.active_gate_threshold,
+        )
+        selected_stage_forecast.to_csv(out_dir / "selected_propagated_stage_forecast.csv", index=False)
 
     summary = candidate_summary(evaluated)
     summary.to_csv(out_dir / "candidate_summary.csv", index=False)
@@ -1000,7 +1168,9 @@ def main() -> None:
     metadata = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "workflow_config": str(resolve_path(root, args.workflow_config)),
-        "forecast_detail": str(resolve_path(root, args.forecast_detail)),
+        "forecast_detail": str(resolve_path(root, args.forecast_detail)) if args.forecast_detail is not None else None,
+        "entry_forecast": str(resolve_path(root, args.entry_forecast)) if args.entry_forecast is not None else None,
+        "delay_kernel": str(resolve_path(root, args.delay_kernel)) if args.delay_kernel is not None else None,
         "latency_samples": str(resolve_path(root, args.latency_samples)),
         "method": args.method,
         "policy": args.policy,
