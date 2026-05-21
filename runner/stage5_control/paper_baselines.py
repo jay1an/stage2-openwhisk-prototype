@@ -409,6 +409,53 @@ def build_plan(
     peak_by_stage = (
         table.groupby("stage_name")[warm_source].max().clip(lower=1).apply(math.ceil).to_dict()
     )
+    rows: list[PlanRow] = []
+    for record in table.to_dict(orient="records"):
+        stage = str(record["stage_name"])
+        source_count = max(0.0, float(record.get(warm_source, 0.0) or 0.0))
+        memory_mb = int(memory_lookup.get(stage, 256))
+        if baseline_name == "cold_every_time":
+            warm_count = 0
+            keepalive_ttl_sec = 0.0
+        elif baseline_name == "platform_default":
+            warm_count = 0
+            keepalive_ttl_sec = platform_keepalive_sec
+        elif baseline_name == "always_warm":
+            warm_count = 1 if always_warm_mode == "one" else int(peak_by_stage[stage])
+            keepalive_ttl_sec = platform_keepalive_sec
+        elif baseline_name == "orion_style":
+            if not workflow.nodes[stage].parents:
+                warm_count = 0
+            else:
+                warm_count = int(math.ceil(source_count * orion_downstream_warm_discount))
+            keepalive_ttl_sec = platform_keepalive_sec
+        elif baseline_name == "stepconf_style":
+            warm_count = 0
+            keepalive_ttl_sec = platform_keepalive_sec
+        else:
+            raise ValueError(f"unknown baseline {baseline_name}")
+
+        rows.append(
+            PlanRow(
+                workflow_name=workflow.workflow_name,
+                stage_name=stage,
+                window=int(record["target_window"]),
+                warm_count=float(warm_count),
+                keepalive_ttl_sec=keepalive_ttl_sec,
+                memory_mb=memory_mb,
+                source="paper_baseline",
+                note=baseline_name,
+            )
+        )
+    return ControlPlan(
+        rows=rows,
+        window_sec=window_sec,
+        metadata={
+            "workflow_name": workflow.workflow_name,
+            "baseline": baseline_name,
+            "warmup_mode": warmup_mode,
+        },
+    )
 
 
 def build_plan_from_entry(
@@ -501,6 +548,7 @@ def build_plan_from_entry(
                     "stage_name": stage,
                     "target_window": int(window),
                     "policy": policy,
+                    "actual_count": 0.0,
                     "forecast_count": float(forecast_count),
                     "allocated_count": allocated_count,
                 }
@@ -523,53 +571,6 @@ def build_plan_from_entry(
             },
         ),
         pd.DataFrame(forecast_rows),
-    )
-    rows: list[PlanRow] = []
-    for record in table.to_dict(orient="records"):
-        stage = str(record["stage_name"])
-        source_count = max(0.0, float(record.get(warm_source, 0.0) or 0.0))
-        memory_mb = int(memory_lookup.get(stage, 256))
-        if baseline_name == "cold_every_time":
-            warm_count = 0
-            keepalive_ttl_sec = 0.0
-        elif baseline_name == "platform_default":
-            warm_count = 0
-            keepalive_ttl_sec = platform_keepalive_sec
-        elif baseline_name == "always_warm":
-            warm_count = 1 if always_warm_mode == "one" else int(peak_by_stage[stage])
-            keepalive_ttl_sec = platform_keepalive_sec
-        elif baseline_name == "orion_style":
-            if not workflow.nodes[stage].parents:
-                warm_count = 0
-            else:
-                warm_count = int(math.ceil(source_count * orion_downstream_warm_discount))
-            keepalive_ttl_sec = platform_keepalive_sec
-        elif baseline_name == "stepconf_style":
-            warm_count = 0
-            keepalive_ttl_sec = platform_keepalive_sec
-        else:
-            raise ValueError(f"unknown baseline {baseline_name}")
-
-        rows.append(
-            PlanRow(
-                workflow_name=workflow.workflow_name,
-                stage_name=stage,
-                window=int(record["target_window"]),
-                warm_count=float(warm_count),
-                keepalive_ttl_sec=keepalive_ttl_sec,
-                memory_mb=memory_mb,
-                source="paper_baseline",
-                note=baseline_name,
-            )
-        )
-    return ControlPlan(
-        rows=rows,
-        window_sec=window_sec,
-        metadata={
-            "workflow_name": workflow.workflow_name,
-            "baseline": baseline_name,
-            "warmup_mode": warmup_mode,
-        },
     )
 
 

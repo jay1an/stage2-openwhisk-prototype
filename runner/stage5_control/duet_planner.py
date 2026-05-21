@@ -661,6 +661,7 @@ def build_duet_plan_from_entry(
                         "stage_name": stage_name,
                         "target_window": int(window),
                         "policy": policy,
+                        "actual_count": 0.0,
                         "forecast_count": float(value),
                         "allocated_count": int(math.ceil(max(0.0, float(value)))),
                     }

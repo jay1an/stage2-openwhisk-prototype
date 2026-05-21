@@ -425,6 +425,7 @@ def candidate_selected_from_entry(
                 "stage_name": stage,
                 "target_window": int(window),
                 "policy": policy,
+                "actual_count": 0.0,
                 "forecast_count": float(forecast_count),
                 "allocated_count": int(math.ceil(max(0.0, float(forecast_count)))),
                 "p_active": 1.0,

@@ -39,7 +39,9 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--workflow-config", required=True)
     p.add_argument("--trace", required=True)
-    p.add_argument("--forecast-detail", required=True)
+    p.add_argument("--forecast-detail", default=None)
+    p.add_argument("--entry-forecast", default=None)
+    p.add_argument("--delay-kernel", default=None)
     p.add_argument("--latency-samples", required=True)
     p.add_argument("--method", required=True)
     p.add_argument("--policy", choices=["p50", "p90", "p95"], default="p95")
@@ -114,8 +116,6 @@ def common_stage_args(args: argparse.Namespace, root: Path) -> list[str]:
     out = [
         "--workflow-config",
         str(resolve_path(root, args.workflow_config)),
-        "--forecast-detail",
-        str(resolve_path(root, args.forecast_detail)),
         "--latency-samples",
         str(resolve_path(root, args.latency_samples)),
         "--method",
@@ -139,6 +139,18 @@ def common_stage_args(args: argparse.Namespace, root: Path) -> list[str]:
         "--warmup-mode",
         args.warmup_mode,
     ]
+    use_entry_kernel = args.entry_forecast is not None or args.delay_kernel is not None
+    if use_entry_kernel:
+        out.extend(
+            [
+                "--entry-forecast",
+                str(resolve_path(root, args.entry_forecast)),
+                "--delay-kernel",
+                str(resolve_path(root, args.delay_kernel)),
+            ]
+        )
+    else:
+        out.extend(["--forecast-detail", str(resolve_path(root, args.forecast_detail))])
     if args.fold_id is not None:
         out.extend(["--fold-id", str(args.fold_id)])
     return out
@@ -221,8 +233,6 @@ def gen_duet(args: argparse.Namespace, root: Path, out_dir: Path,
         "runner.stage5_control.duet_planner",
         "--workflow-config",
         str(resolve_path(root, args.workflow_config)),
-        "--forecast-detail",
-        str(resolve_path(root, args.forecast_detail)),
         "--latency-samples",
         str(resolve_path(root, args.latency_samples)),
         "--method",
@@ -270,6 +280,18 @@ def gen_duet(args: argparse.Namespace, root: Path, out_dir: Path,
         "--out-dir",
         str(duet_dir),
     ]
+    use_entry_kernel = args.entry_forecast is not None or args.delay_kernel is not None
+    if use_entry_kernel:
+        command.extend(
+            [
+                "--entry-forecast",
+                str(resolve_path(root, args.entry_forecast)),
+                "--delay-kernel",
+                str(resolve_path(root, args.delay_kernel)),
+            ]
+        )
+    else:
+        command.extend(["--forecast-detail", str(resolve_path(root, args.forecast_detail))])
     if args.fold_id is not None:
         command.extend(["--fold-id", str(args.fold_id)])
     maybe_run(command, root, duet_dir / "duet_control_plan.json", args.skip_existing)
@@ -277,9 +299,16 @@ def gen_duet(args: argparse.Namespace, root: Path, out_dir: Path,
 
 
 def evaluate(args: argparse.Namespace, root: Path, out_dir: Path, *, plan_path: Path,
-             label: str, warmup_mode_override: str | None = None) -> Path:
+             label: str, warmup_mode_override: str | None = None,
+             forecast_detail_override: Path | None = None,
+             method_override: str | None = None) -> Path:
     eval_dir = out_dir / "stage4_eval" / label
     warmup_mode = warmup_mode_override or args.warmup_mode
+    forecast_detail = forecast_detail_override
+    if forecast_detail is None and args.forecast_detail is not None:
+        forecast_detail = resolve_path(root, args.forecast_detail)
+    if forecast_detail is None:
+        raise ValueError(f"no forecast detail available for Stage4 evaluation of {label}")
     command = [
         sys.executable,
         "-m",
@@ -289,13 +318,13 @@ def evaluate(args: argparse.Namespace, root: Path, out_dir: Path, *, plan_path: 
         "--trace",
         str(resolve_path(root, args.trace)),
         "--forecast-detail",
-        str(resolve_path(root, args.forecast_detail)),
+        str(forecast_detail),
         "--latency-samples",
         str(resolve_path(root, args.latency_samples)),
         "--control-plan",
         str(plan_path),
         "--method",
-        args.method,
+        method_override or args.method,
         "--policy",
         args.policy,
         "--window-sec",
@@ -439,6 +468,14 @@ def _build_row(args: argparse.Namespace, method: str, label: str, cost: dict[str
 
 def main() -> None:
     args = parse_args()
+    use_entry_kernel = args.entry_forecast is not None or args.delay_kernel is not None
+    if use_entry_kernel:
+        if args.forecast_detail is not None:
+            raise SystemExit("--entry-forecast/--delay-kernel and --forecast-detail are mutually exclusive")
+        if args.entry_forecast is None or args.delay_kernel is None:
+            raise SystemExit("--entry-forecast and --delay-kernel must be provided together")
+    elif args.forecast_detail is None:
+        raise SystemExit("one of --forecast-detail or --entry-forecast/--delay-kernel is required")
     root = project_root()
     out_dir = resolve_path(root, args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -463,24 +500,46 @@ def main() -> None:
         if not plan_path.exists():
             plan_path = baseline_dir / f"{baseline_name}_control_plan.json"
         warmup_mode = "window" if baseline_name == "always_warm" else args.warmup_mode
+        forecast_override = (
+            baseline_dir / f"{baseline_name}_propagated_stage_forecast.csv"
+            if use_entry_kernel
+            else None
+        )
         evaluate(args, root, out_dir, plan_path=plan_path, label=baseline_name,
-                 warmup_mode_override=warmup_mode)
+                 warmup_mode_override=warmup_mode,
+                 forecast_detail_override=forecast_override if forecast_override and forecast_override.exists() else None,
+                 method_override="entry-kernel" if use_entry_kernel else None)
 
     pareto_plan = pareto_dir / "selected_control_plan.json"
     if pareto_plan.exists():
-        evaluate(args, root, out_dir, plan_path=pareto_plan, label="smiless_pareto")
+        forecast_override = pareto_dir / "selected_propagated_stage_forecast.csv"
+        evaluate(
+            args,
+            root,
+            out_dir,
+            plan_path=pareto_plan,
+            label="smiless_pareto",
+            forecast_detail_override=forecast_override if use_entry_kernel and forecast_override.exists() else None,
+            method_override="entry-kernel" if use_entry_kernel else None,
+        )
 
     duet_balanced_plan = duet_balanced_dir / "duet_control_plan.json"
     if duet_balanced_plan.exists():
+        forecast_override = duet_balanced_dir / "duet_propagated_stage_forecast.csv"
         evaluate(args, root, out_dir, plan_path=duet_balanced_plan,
                  label="duet_balanced",
-                 warmup_mode_override=args.duet_warmup_mode)
+                 warmup_mode_override=args.duet_warmup_mode,
+                 forecast_detail_override=forecast_override if use_entry_kernel and forecast_override.exists() else None,
+                 method_override="entry-kernel" if use_entry_kernel else None)
 
     duet_economy_plan = duet_economy_dir / "duet_control_plan.json"
     if duet_economy_plan.exists():
+        forecast_override = duet_economy_dir / "duet_propagated_stage_forecast.csv"
         evaluate(args, root, out_dir, plan_path=duet_economy_plan,
                  label="duet_economy",
-                 warmup_mode_override=args.duet_warmup_mode)
+                 warmup_mode_override=args.duet_warmup_mode,
+                 forecast_detail_override=forecast_override if use_entry_kernel and forecast_override.exists() else None,
+                 method_override="entry-kernel" if use_entry_kernel else None)
 
     frame = aggregate(args, out_dir)
     frame = frame.sort_values("cost_gb_seconds")
