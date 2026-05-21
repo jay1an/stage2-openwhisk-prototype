@@ -467,6 +467,7 @@ def main() -> None:
         per_method_point: dict[str, float] = {}
         per_method_upper: dict[str, dict[str, float]] = {}
         per_method_alloc: dict[str, dict[str, int]] = {}
+        current_losses: dict[str, dict[str, float]] = {}
 
         for method in streaming_methods:
             forecast = forecast_from_series(
@@ -506,7 +507,7 @@ def main() -> None:
                         "pinball_loss": pinball,
                     }
                 )
-                loss_buf[method][policy].append(pinball)
+                current_losses.setdefault(method, {})[policy] = pinball
 
         # ---- 2. Hawkes-exp (optional) ----
         if args.enable_hawkes:
@@ -584,7 +585,7 @@ def main() -> None:
                         "pinball_loss": pinball,
                     }
                 )
-                loss_buf["hawkes-exp"][policy].append(pinball)
+                current_losses.setdefault("hawkes-exp", {})[policy] = pinball
 
         # ---- 2b. ML wrappers (AutoARIMA / LightGBM / LSTM) ----
         for ml_name, wrapper in ml_wrappers.items():
@@ -619,7 +620,7 @@ def main() -> None:
                         "pinball_loss": pinball,
                     }
                 )
-                loss_buf[ml_name][policy].append(pinball)
+                current_losses.setdefault(ml_name, {})[policy] = pinball
 
         # ---- 3. ACI calibration on each base method's p50 (per-policy) ----
         if args.enable_aci:
@@ -642,7 +643,7 @@ def main() -> None:
                         upper,
                         args.activation_threshold,
                     )
-                    loss_buf[aci_label][policy].append(pinball)
+                    current_losses.setdefault(aci_label, {})[policy] = pinball
 
         # ---- 4. Oracle (knows actual) ----
         for policy in POLICIES:
@@ -712,14 +713,22 @@ def main() -> None:
                 }
             )
 
-        # ---- 6. Update ACI states with observed actual ----
+        # ---- 6. Update selector loss buffers after choosing.
+        # The selector must score experts using only previous windows. We defer
+        # these appends until after the selector row for this target window has
+        # been emitted to avoid leaking the current actual into the choice.
+        for method, policy_losses in current_losses.items():
+            for policy, pinball in policy_losses.items():
+                loss_buf[method][policy].append(pinball)
+
+        # ---- 7. Update ACI states with observed actual ----
         if args.enable_aci:
             for m in base_methods:
                 point = per_method_point.get(m, 0.0)
                 for policy in POLICIES:
                     aci_states[m][policy].update(point, actual)
 
-        # ---- 7. Update ML wrappers that maintain online state (e.g. LSTM residuals) ----
+        # ---- 8. Update ML wrappers that maintain online state (e.g. LSTM residuals) ----
         for ml_name, wrapper in ml_wrappers.items():
             if hasattr(wrapper, "observe"):
                 point = per_method_point.get(ml_name, 0.0)
