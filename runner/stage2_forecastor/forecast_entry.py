@@ -28,6 +28,7 @@ def parse_args() -> argparse.Namespace:
             "hurdle-ewma",
             "tsb",
             "hazard-hurdle",
+            "dag-hazard-hurdle",
             "fip-fourier",
         ],
         default="ewma",
@@ -68,6 +69,14 @@ def parse_args() -> argparse.Namespace:
         help="use only entry rows whose window index is <= this value",
     )
     parser.add_argument("--out", required=True)
+    parser.add_argument(
+        "--write-entry-forecast",
+        default=None,
+        help=(
+            "Optional long-format entry-only forecast CSV. Schema: "
+            "workflow_name, method, target_window, policy, forecast_count, allocated_count."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -111,6 +120,24 @@ def alloc_count(value: float, activation_threshold: float) -> int:
     if value < activation_threshold:
         return 0
     return ceil_count(value)
+
+
+def entry_only_rows(rows: list[dict], *, activation_threshold: float) -> list[dict]:
+    out: list[dict] = []
+    for row in rows:
+        for policy in ["p50", "p90", "p95", "p99"]:
+            forecast_count = float(row[f"{policy}_count"])
+            out.append(
+                {
+                    "workflow_name": row["workflow_name"],
+                    "method": row["method"],
+                    "target_window": int(row["window"]),
+                    "policy": policy,
+                    "forecast_count": forecast_count,
+                    "allocated_count": alloc_count(forecast_count, activation_threshold),
+                }
+            )
+    return out
 
 
 def burst_aware_forecast(
@@ -537,7 +564,7 @@ def main() -> None:
             args.alpha,
             args.history_window,
         )
-    elif args.method == "hazard-hurdle":
+    elif args.method in {"hazard-hurdle", "dag-hazard-hurdle"}:
         p50_base, p90_base, p95_base, p99_base = 0.0, 0.0, 0.0, 0.0
     elif args.method == "fip-fourier":
         p50_base, p90_base, p95_base, p99_base = 0.0, 0.0, 0.0, 0.0
@@ -560,7 +587,7 @@ def main() -> None:
                 args.burst_width_windows,
                 args.background_count,
             )
-        elif args.method == "hazard-hurdle":
+        elif args.method in {"hazard-hurdle", "dag-hazard-hurdle"}:
             p50_count, p90_count, p95_count, p99_count, p_active = hazard_hurdle_forecast(
                 count_values,
                 args.alpha,
@@ -606,6 +633,13 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(out, index=False)
     print(f"wrote {out}")
+    if args.write_entry_forecast is not None:
+        entry_out = Path(args.write_entry_forecast)
+        entry_out.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(
+            entry_only_rows(rows, activation_threshold=args.activation_threshold)
+        ).to_csv(entry_out, index=False)
+        print(f"wrote {entry_out}")
 
 
 if __name__ == "__main__":
