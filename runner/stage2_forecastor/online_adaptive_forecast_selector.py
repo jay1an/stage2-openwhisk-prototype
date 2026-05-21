@@ -29,6 +29,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--detail", nargs="+", required=True)
     parser.add_argument("--out-dir", required=True)
     parser.add_argument(
+        "--write-entry-forecast",
+        default=None,
+        help=(
+            "optional path for the Stage-5 entry-only forecast CSV. "
+            "Use this only when --detail-level entry is selected."
+        ),
+    )
+    parser.add_argument(
         "--detail-level",
         choices=["all", "entry", "stage"],
         default="stage",
@@ -710,6 +718,29 @@ def selector_latency_summary(selected: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def write_entry_forecast(selected: pd.DataFrame, path: Path) -> None:
+    if selected.empty:
+        raise ValueError("cannot write entry forecast from an empty online selection")
+    if set(selected["detail_level"].astype(str).unique()) != {"entry"}:
+        raise ValueError("--write-entry-forecast requires --detail-level entry output")
+    out = selected[
+        [
+            "workflow_name",
+            "method",
+            "target_window",
+            "policy",
+            "forecast_count",
+            "allocated_count",
+        ]
+    ].copy()
+    out["target_window"] = pd.to_numeric(out["target_window"], errors="raise").astype(int)
+    out["forecast_count"] = pd.to_numeric(out["forecast_count"], errors="raise").astype(float)
+    out["allocated_count"] = pd.to_numeric(out["allocated_count"], errors="raise").astype(int)
+    out = out.sort_values(["workflow_name", "target_window", "policy"]).reset_index(drop=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(path, index=False)
+
+
 def markdown_table(frame: pd.DataFrame, max_rows: int = 20) -> str:
     if frame.empty:
         return "_No rows._"
@@ -822,11 +853,16 @@ def main() -> None:
     usage.to_csv(out_dir / "online_expert_usage.csv", index=False)
     latency.to_csv(out_dir / "online_selector_latency.csv", index=False)
     bins.to_csv(out_dir / "online_risk_bin_table.csv", index=False)
+    entry_forecast_path = None
+    if args.write_entry_forecast is not None:
+        entry_forecast_path = resolve_path(root, args.write_entry_forecast)
+        write_entry_forecast(selected, entry_forecast_path)
 
     metadata = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "detail_files": [str(path) for path in detail_paths],
         "out_dir": str(out_dir),
+        "entry_forecast": str(entry_forecast_path) if entry_forecast_path is not None else None,
         "detail_level": args.detail_level,
         "policies": args.policies,
         "activation_threshold": args.activation_threshold,
