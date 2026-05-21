@@ -30,6 +30,7 @@ from scipy.optimize import minimize
 from scipy.stats import poisson
 
 from .compare_stage_forecasts import build_count_series, forecast_from_series, load_split
+from .online_ml_wrappers import AutoArimaOnline, LightGBMOnline, LSTMOnline
 from ..workflow import load_workflow
 
 
@@ -225,6 +226,69 @@ def parse_args() -> argparse.Namespace:
         default=12,
         help="ACI warmup windows before emitting calibrated upper bound",
     )
+    p.add_argument(
+        "--enable-arima",
+        action="store_true",
+        help="add autoarima method (statsforecast.AutoARIMA, rolling refit)",
+    )
+    p.add_argument(
+        "--arima-refit-every",
+        type=int,
+        default=60,
+        help="refit AutoARIMA every N origin windows (5 min @ 5s windows)",
+    )
+    p.add_argument(
+        "--arima-season-length",
+        type=int,
+        default=60,
+        help="seasonal period in windows for AutoARIMA",
+    )
+    p.add_argument(
+        "--enable-lightgbm",
+        action="store_true",
+        help="add lightgbm-quantile method (rolling refit)",
+    )
+    p.add_argument(
+        "--lightgbm-refit-every",
+        type=int,
+        default=60,
+        help="refit LightGBM every N origin windows",
+    )
+    p.add_argument(
+        "--lightgbm-lags",
+        type=int,
+        default=20,
+        help="number of lag features for LightGBM",
+    )
+    p.add_argument(
+        "--enable-lstm",
+        action="store_true",
+        help="add lstm-residual method (pretrain on warmup, frozen + residual quantile)",
+    )
+    p.add_argument(
+        "--lstm-seq-len",
+        type=int,
+        default=30,
+        help="LSTM input sequence length",
+    )
+    p.add_argument(
+        "--lstm-hidden",
+        type=int,
+        default=32,
+        help="LSTM hidden size",
+    )
+    p.add_argument(
+        "--lstm-epochs",
+        type=int,
+        default=40,
+        help="LSTM pretrain epochs",
+    )
+    p.add_argument(
+        "--lstm-residual-window",
+        type=int,
+        default=60,
+        help="rolling window for LSTM residual quantile padding",
+    )
     p.add_argument("--out-dir", required=True)
     return p.parse_args()
 
@@ -340,6 +404,30 @@ def main() -> None:
     all_methods: list[str] = list(streaming_methods)
     if args.enable_hawkes:
         all_methods.append("hawkes-exp")
+
+    ml_wrappers: dict[str, object] = {}
+    if args.enable_arima:
+        ml_wrappers["autoarima"] = AutoArimaOnline(
+            season_length=args.arima_season_length,
+            refit_every=args.arima_refit_every,
+        )
+    if args.enable_lightgbm:
+        ml_wrappers["lightgbm-quantile"] = LightGBMOnline(
+            refit_every=args.lightgbm_refit_every,
+            n_lags=args.lightgbm_lags,
+            main_period=args.arima_season_length,
+        )
+    if args.enable_lstm:
+        ml_wrappers["lstm-residual"] = LSTMOnline(
+            seq_len=args.lstm_seq_len,
+            hidden=args.lstm_hidden,
+            epochs=args.lstm_epochs,
+            residual_window=args.lstm_residual_window,
+            main_period=args.arima_season_length,
+        )
+    for name in ml_wrappers:
+        all_methods.append(name)
+
     base_methods = list(all_methods)  # methods whose p50 we can wrap with ACI
     if args.enable_aci:
         all_methods.extend([f"{m}+aci" for m in base_methods])
@@ -498,6 +586,41 @@ def main() -> None:
                 )
                 loss_buf["hawkes-exp"][policy].append(pinball)
 
+        # ---- 2b. ML wrappers (AutoARIMA / LightGBM / LSTM) ----
+        for ml_name, wrapper in ml_wrappers.items():
+            try:
+                fc = wrapper.predict(counts, target_window)
+            except Exception:
+                mean = float(counts.mean()) if len(counts) else 0.0
+                fc = {"p50_count": mean, "p90_count": mean, "p95_count": mean}
+            per_method_point[ml_name] = float(fc.get("p50_count", 0.0))
+            per_method_upper[ml_name] = {p: float(fc.get(f"{p}_count", 0.0)) for p in POLICIES}
+            per_method_alloc[ml_name] = {
+                p: alloc_count(per_method_upper[ml_name][p], args.activation_threshold)
+                for p in POLICIES
+            }
+            for policy in POLICIES:
+                pinball = pinball_loss(
+                    POLICY_Q[policy], actual, per_method_upper[ml_name][policy]
+                )
+                detail_rows.append(
+                    {
+                        "workflow_name": workflow_name,
+                        "method": ml_name,
+                        "policy": policy,
+                        "origin_window": origin_window,
+                        "target_window": target_window,
+                        "actual_count": actual,
+                        "forecast_count": per_method_upper[ml_name][policy],
+                        "point_forecast": per_method_point[ml_name],
+                        "allocated_count": per_method_alloc[ml_name][policy],
+                        "under_count": max(0, actual - per_method_alloc[ml_name][policy]),
+                        "over_count": max(0, per_method_alloc[ml_name][policy] - actual),
+                        "pinball_loss": pinball,
+                    }
+                )
+                loss_buf[ml_name][policy].append(pinball)
+
         # ---- 3. ACI calibration on each base method's p50 (per-policy) ----
         if args.enable_aci:
             for m in base_methods:
@@ -596,6 +719,12 @@ def main() -> None:
                 for policy in POLICIES:
                     aci_states[m][policy].update(point, actual)
 
+        # ---- 7. Update ML wrappers that maintain online state (e.g. LSTM residuals) ----
+        for ml_name, wrapper in ml_wrappers.items():
+            if hasattr(wrapper, "observe"):
+                point = per_method_point.get(ml_name, 0.0)
+                wrapper.observe(point, actual)
+
     detail = pd.DataFrame(detail_rows)
     choices = pd.DataFrame(selector_choices)
 
@@ -666,6 +795,17 @@ def main() -> None:
         "aci_enabled": bool(args.enable_aci),
         "aci_gamma": args.aci_gamma if args.enable_aci else None,
         "aci_warmup": args.aci_warmup if args.enable_aci else None,
+        "arima_enabled": bool(args.enable_arima),
+        "arima_refit_every": args.arima_refit_every if args.enable_arima else None,
+        "arima_season_length": args.arima_season_length if args.enable_arima else None,
+        "lightgbm_enabled": bool(args.enable_lightgbm),
+        "lightgbm_refit_every": args.lightgbm_refit_every if args.enable_lightgbm else None,
+        "lightgbm_lags": args.lightgbm_lags if args.enable_lightgbm else None,
+        "lstm_enabled": bool(args.enable_lstm),
+        "lstm_seq_len": args.lstm_seq_len if args.enable_lstm else None,
+        "lstm_hidden": args.lstm_hidden if args.enable_lstm else None,
+        "lstm_epochs": args.lstm_epochs if args.enable_lstm else None,
+        "lstm_residual_window": args.lstm_residual_window if args.enable_lstm else None,
     }
     metadata_path.write_text(json.dumps(metadata, indent=2))
 
