@@ -56,6 +56,7 @@ from .plan_joint_control import (
     parse_memory_tiers,
     topological_nodes,
 )
+from .propagator import propagate_entry_to_stage
 
 
 POLICY_TO_QUANTILE = {"p50": 0.50, "p90": 0.90, "p95": 0.95}
@@ -69,7 +70,17 @@ def parse_args() -> argparse.Namespace:
         )
     )
     p.add_argument("--workflow-config", required=True)
-    p.add_argument("--forecast-detail", required=True)
+    p.add_argument("--forecast-detail", default=None)
+    p.add_argument(
+        "--entry-forecast",
+        default=None,
+        help="Entry-only forecast CSV for the new state-conditional propagation path.",
+    )
+    p.add_argument(
+        "--delay-kernel",
+        default=None,
+        help="Stage-3 delay_kernel.csv for the new state-conditional propagation path.",
+    )
     p.add_argument("--latency-samples", required=True)
     p.add_argument("--method", required=True)
     p.add_argument(
@@ -242,6 +253,31 @@ def filtered_forecast(
         if col in rows.columns:
             rows[col] = pd.to_numeric(rows[col], errors="coerce")
     rows = rows.dropna(subset=["target_window"]).copy()
+    rows["target_window"] = rows["target_window"].astype(int)
+    if max_plan_windows and max_plan_windows > 0:
+        windows = sorted(rows["target_window"].unique())[:max_plan_windows]
+        rows = rows[rows["target_window"].isin(windows)].copy()
+    return rows
+
+
+def filtered_entry_forecast(
+    entry_forecast: pd.DataFrame,
+    *,
+    workflow_name: str,
+    method: str,
+    max_plan_windows: int,
+) -> pd.DataFrame:
+    rows = entry_forecast[entry_forecast["workflow_name"].astype(str) == workflow_name].copy()
+    if "method" in rows.columns:
+        rows = rows[rows["method"].astype(str) == method].copy()
+    if rows.empty:
+        raise ValueError(
+            f"entry_forecast has no rows for workflow={workflow_name}, method={method}"
+        )
+    for col in ["target_window", "forecast_count", "allocated_count"]:
+        if col in rows.columns:
+            rows[col] = pd.to_numeric(rows[col], errors="coerce")
+    rows = rows.dropna(subset=["target_window", "forecast_count"]).copy()
     rows["target_window"] = rows["target_window"].astype(int)
     if max_plan_windows and max_plan_windows > 0:
         windows = sorted(rows["target_window"].unique())[:max_plan_windows]
@@ -518,8 +554,190 @@ def build_duet_plan(
     return plan, diag
 
 
+def duet_window_decision(
+    *,
+    demand_q: float,
+    demand_ref: float,
+    prev_warm_active: bool,
+    is_critical: bool,
+    warm_blend_beta: float,
+    warm_scale_multiplier: float,
+    min_keepalive_sec: float,
+    max_keepalive_sec: float,
+    uncertainty_gain_sec: float,
+    persistence_gain_sec: float,
+    critical_bonus_sec: float,
+    zero_demand_threshold: float,
+    keepalive_demand_floor: float,
+) -> tuple[int, float, str, float]:
+    spread = max(0.0, demand_q - demand_ref)
+    blended = demand_ref + warm_blend_beta * spread
+    scaled = warm_scale_multiplier * blended
+    if demand_ref < zero_demand_threshold and demand_q < zero_demand_threshold:
+        warm_count = 0
+    else:
+        warm_count = max(1, int(math.ceil(scaled))) if scaled > 0 else 0
+
+    base_ref = max(demand_ref, 1.0)
+    rel_spread = min(1.0, spread / base_ref)
+    spread_qualifies = spread >= keepalive_demand_floor
+    if warm_count <= 0:
+        return warm_count, 0.0, "scale-to-zero", spread
+
+    bonus_unc = uncertainty_gain_sec * rel_spread if spread_qualifies else 0.0
+    bonus_pers = persistence_gain_sec if prev_warm_active else 0.0
+    bonus_crit = critical_bonus_sec if is_critical else 0.0
+    ttl = min_keepalive_sec + bonus_unc + bonus_pers + bonus_crit
+    keepalive_sec = float(max(0.0, min(max_keepalive_sec, ttl)))
+    if keepalive_sec <= 0.0:
+        strategy = "warm-no-keepalive"
+    elif bonus_unc > 0 and bonus_pers > 0:
+        strategy = "persistent-uncertain-warm"
+    elif bonus_unc > 0:
+        strategy = "uncertain-spike-warm"
+    elif bonus_pers > 0:
+        strategy = "persistent-warm"
+    else:
+        strategy = "critical-warm"
+    return warm_count, keepalive_sec, strategy, spread
+
+
+def build_duet_plan_from_entry(
+    *,
+    workflow: WorkflowSpec,
+    ordered: list[str],
+    entry_forecast: pd.DataFrame,
+    delay_kernel: pd.DataFrame,
+    policy_q: str,
+    policy_ref: str,
+    memory_plan: pd.DataFrame,
+    window_sec: float,
+    min_keepalive_sec: float,
+    max_keepalive_sec: float,
+    warm_blend_beta: float,
+    warm_scale_multiplier: float,
+    uncertainty_gain_sec: float,
+    persistence_gain_sec: float,
+    critical_bonus_sec: float,
+    zero_demand_threshold: float,
+    keepalive_demand_floor: float,
+) -> tuple[ControlPlan, pd.DataFrame, pd.DataFrame]:
+    memory_lookup = memory_plan.set_index("stage_name").to_dict("index")
+    windows = sorted(entry_forecast["target_window"].astype(int).unique())
+    rows: list[PlanRow] = []
+    diag_rows: list[dict] = []
+    forecast_rows: list[dict] = []
+    prev_warm: dict[str, bool] = {stage: False for stage in ordered}
+
+    for window in windows:
+        next_prev = dict(prev_warm)
+        for stage_name in ordered:
+            mem_info = memory_lookup.get(str(stage_name), {})
+            memory_mb = int(mem_info.get("selected_memory_mb", 256))
+            is_critical = bool(mem_info.get("is_critical", False))
+            demand_q = propagate_entry_to_stage(
+                entry_forecast,
+                delay_kernel,
+                workflow_name=workflow.workflow_name,
+                stage_name=str(stage_name),
+                target_window=int(window),
+                policy=policy_q,
+                prev_warm=prev_warm.get(stage_name, False),
+            )
+            demand_ref = propagate_entry_to_stage(
+                entry_forecast,
+                delay_kernel,
+                workflow_name=workflow.workflow_name,
+                stage_name=str(stage_name),
+                target_window=int(window),
+                policy=policy_ref,
+                prev_warm=prev_warm.get(stage_name, False),
+            )
+            for policy, value in [(policy_ref, demand_ref), (policy_q, demand_q)]:
+                forecast_rows.append(
+                    {
+                        "workflow_name": workflow.workflow_name,
+                        "method": "entry-kernel",
+                        "stage_name": stage_name,
+                        "target_window": int(window),
+                        "policy": policy,
+                        "forecast_count": float(value),
+                        "allocated_count": int(math.ceil(max(0.0, float(value)))),
+                    }
+                )
+
+            warm_count, keepalive_sec, strategy, spread = duet_window_decision(
+                demand_q=max(0.0, float(demand_q)),
+                demand_ref=max(0.0, float(demand_ref)),
+                prev_warm_active=prev_warm.get(stage_name, False),
+                is_critical=is_critical,
+                warm_blend_beta=warm_blend_beta,
+                warm_scale_multiplier=warm_scale_multiplier,
+                min_keepalive_sec=min_keepalive_sec,
+                max_keepalive_sec=max_keepalive_sec,
+                uncertainty_gain_sec=uncertainty_gain_sec,
+                persistence_gain_sec=persistence_gain_sec,
+                critical_bonus_sec=critical_bonus_sec,
+                zero_demand_threshold=zero_demand_threshold,
+                keepalive_demand_floor=keepalive_demand_floor,
+            )
+            rows.append(
+                PlanRow(
+                    workflow_name=workflow.workflow_name,
+                    stage_name=str(stage_name),
+                    window=int(window),
+                    warm_count=float(warm_count),
+                    keepalive_ttl_sec=keepalive_sec,
+                    memory_mb=memory_mb,
+                    source="duet_planner",
+                    note=strategy,
+                )
+            )
+            diag_rows.append(
+                {
+                    "stage_name": stage_name,
+                    "target_window": int(window),
+                    "demand_ref": float(demand_ref),
+                    "demand_q": float(demand_q),
+                    "spread": float(spread),
+                    "warm_count": int(warm_count),
+                    "keepalive_ttl_sec": keepalive_sec,
+                    "memory_mb": memory_mb,
+                    "is_critical": is_critical,
+                    "strategy": strategy,
+                    "prev_warm_active": prev_warm.get(stage_name, False),
+                }
+            )
+            next_prev[stage_name] = bool(warm_count > 0 or keepalive_sec > 0.0)
+        prev_warm = next_prev
+
+    plan = ControlPlan(
+        rows=rows,
+        window_sec=window_sec,
+        metadata={
+            "workflow_name": workflow.workflow_name,
+            "planner": "duet_planner",
+            "input_mode": "entry_forecast_delay_kernel",
+            "policy_quantile": policy_q,
+            "policy_reference": policy_ref,
+            "warm_blend_beta": warm_blend_beta,
+            "warm_scale_multiplier": warm_scale_multiplier,
+        },
+    )
+    return plan, pd.DataFrame(diag_rows), pd.DataFrame(forecast_rows)
+
+
 def main() -> None:
     args = parse_args()
+    use_entry_kernel = args.entry_forecast is not None or args.delay_kernel is not None
+    if use_entry_kernel:
+        if args.forecast_detail is not None:
+            raise SystemExit("--entry-forecast/--delay-kernel and --forecast-detail are mutually exclusive")
+        if args.entry_forecast is None or args.delay_kernel is None:
+            raise SystemExit("--entry-forecast and --delay-kernel must be provided together")
+    elif args.forecast_detail is None:
+        raise SystemExit("one of --forecast-detail or --entry-forecast/--delay-kernel is required")
+
     root = project_root()
     out_dir = resolve_path(root, args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -529,14 +747,27 @@ def main() -> None:
     memory_tiers = parse_memory_tiers(args.memory_tiers_mb)
     quantile = POLICY_TO_QUANTILE[args.policy]
 
-    forecast_detail = pd.read_csv(resolve_path(root, args.forecast_detail))
-    forecast_rows = filtered_forecast(
-        forecast_detail,
-        workflow_name=workflow.workflow_name,
-        method=args.method,
-        fold_id=args.fold_id,
-        max_plan_windows=args.max_plan_windows,
-    )
+    forecast_rows: pd.DataFrame
+    entry_rows: pd.DataFrame | None = None
+    delay_kernel: pd.DataFrame | None = None
+    if use_entry_kernel:
+        entry_rows = filtered_entry_forecast(
+            pd.read_csv(resolve_path(root, args.entry_forecast)),
+            workflow_name=workflow.workflow_name,
+            method=args.method,
+            max_plan_windows=args.max_plan_windows,
+        )
+        delay_kernel = pd.read_csv(resolve_path(root, args.delay_kernel))
+        forecast_rows = pd.DataFrame()
+    else:
+        forecast_detail = pd.read_csv(resolve_path(root, args.forecast_detail))
+        forecast_rows = filtered_forecast(
+            forecast_detail,
+            workflow_name=workflow.workflow_name,
+            method=args.method,
+            fold_id=args.fold_id,
+            max_plan_windows=args.max_plan_windows,
+        )
 
     latency_samples = pd.read_csv(resolve_path(root, args.latency_samples))
     latency_profile = latency_quantiles(latency_samples, workflow.workflow_name, quantile)
@@ -557,23 +788,47 @@ def main() -> None:
     )
     memory_plan.to_csv(out_dir / "duet_memory_plan.csv", index=False)
 
-    plan, diag = build_duet_plan(
-        workflow=workflow,
-        forecast_rows=forecast_rows,
-        policy_q=args.policy,
-        policy_ref=args.reference_policy,
-        memory_plan=memory_plan,
-        window_sec=args.window_sec,
-        min_keepalive_sec=args.min_keepalive_sec,
-        max_keepalive_sec=args.platform_keepalive_sec,
-        warm_blend_beta=args.warm_blend_beta,
-        warm_scale_multiplier=args.warm_scale_multiplier,
-        uncertainty_gain_sec=args.uncertainty_gain_sec,
-        persistence_gain_sec=args.persistence_gain_sec,
-        critical_bonus_sec=args.critical_bonus_sec,
-        zero_demand_threshold=args.zero_demand_threshold,
-        keepalive_demand_floor=args.keepalive_demand_floor,
-    )
+    propagated_forecast_rows: pd.DataFrame | None = None
+    if use_entry_kernel:
+        assert entry_rows is not None and delay_kernel is not None
+        plan, diag, propagated_forecast_rows = build_duet_plan_from_entry(
+            workflow=workflow,
+            ordered=ordered,
+            entry_forecast=entry_rows,
+            delay_kernel=delay_kernel,
+            policy_q=args.policy,
+            policy_ref=args.reference_policy,
+            memory_plan=memory_plan,
+            window_sec=args.window_sec,
+            min_keepalive_sec=args.min_keepalive_sec,
+            max_keepalive_sec=args.platform_keepalive_sec,
+            warm_blend_beta=args.warm_blend_beta,
+            warm_scale_multiplier=args.warm_scale_multiplier,
+            uncertainty_gain_sec=args.uncertainty_gain_sec,
+            persistence_gain_sec=args.persistence_gain_sec,
+            critical_bonus_sec=args.critical_bonus_sec,
+            zero_demand_threshold=args.zero_demand_threshold,
+            keepalive_demand_floor=args.keepalive_demand_floor,
+        )
+        propagated_forecast_rows.to_csv(out_dir / "duet_propagated_stage_forecast.csv", index=False)
+    else:
+        plan, diag = build_duet_plan(
+            workflow=workflow,
+            forecast_rows=forecast_rows,
+            policy_q=args.policy,
+            policy_ref=args.reference_policy,
+            memory_plan=memory_plan,
+            window_sec=args.window_sec,
+            min_keepalive_sec=args.min_keepalive_sec,
+            max_keepalive_sec=args.platform_keepalive_sec,
+            warm_blend_beta=args.warm_blend_beta,
+            warm_scale_multiplier=args.warm_scale_multiplier,
+            uncertainty_gain_sec=args.uncertainty_gain_sec,
+            persistence_gain_sec=args.persistence_gain_sec,
+            critical_bonus_sec=args.critical_bonus_sec,
+            zero_demand_threshold=args.zero_demand_threshold,
+            keepalive_demand_floor=args.keepalive_demand_floor,
+        )
 
     save_control_plan(plan, out_dir / "duet_control_plan.json")
     frame = plan_to_frame(plan)
@@ -581,9 +836,15 @@ def main() -> None:
     diag.to_csv(out_dir / "duet_per_window_decisions.csv", index=False)
 
     # forecast frame for cost estimation (uses the chosen policy's forecast_count)
-    forecast_for_cost = forecast_rows[
-        forecast_rows["policy"].astype(str) == args.policy
-    ].copy()
+    if use_entry_kernel:
+        assert propagated_forecast_rows is not None
+        forecast_for_cost = propagated_forecast_rows[
+            propagated_forecast_rows["policy"].astype(str) == args.policy
+        ].copy()
+    else:
+        forecast_for_cost = forecast_rows[
+            forecast_rows["policy"].astype(str) == args.policy
+        ].copy()
     cost = estimate_control_plan_cost(
         plan,
         forecast_detail=forecast_for_cost,
@@ -600,6 +861,7 @@ def main() -> None:
     summary = {
         "planner": "duet_planner",
         "workflow_name": workflow.workflow_name,
+        "input_mode": "entry_forecast_delay_kernel" if use_entry_kernel else "forecast_detail",
         "policy_quantile": args.policy,
         "policy_reference": args.reference_policy,
         "warmup_mode": args.warmup_mode,
@@ -631,7 +893,9 @@ def main() -> None:
     metadata = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "workflow_config": str(resolve_path(root, args.workflow_config)),
-        "forecast_detail": str(resolve_path(root, args.forecast_detail)),
+        "forecast_detail": str(resolve_path(root, args.forecast_detail)) if args.forecast_detail is not None else None,
+        "entry_forecast": str(resolve_path(root, args.entry_forecast)) if args.entry_forecast is not None else None,
+        "delay_kernel": str(resolve_path(root, args.delay_kernel)) if args.delay_kernel is not None else None,
         "latency_samples": str(resolve_path(root, args.latency_samples)),
         "method": args.method,
         "policy": args.policy,
