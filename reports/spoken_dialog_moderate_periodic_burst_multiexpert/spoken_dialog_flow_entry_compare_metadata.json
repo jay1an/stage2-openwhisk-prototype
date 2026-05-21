@@ -1,0 +1,23 @@
+{
+  "workflow_name": "spoken_dialog_flow",
+  "trace": "data/stage_synthetic/moderate_periodic_burst/spoken_dialog_flow_moderate_periodic_burst_stage_trace.csv",
+  "workflow_config": "configs/spoken_dialog_flow.yaml",
+  "split_map": "data/stage_synthetic/moderate_periodic_burst/splits/spoken_dialog_flow_moderate_periodic_burst_stage_trace_split.csv",
+  "split_strategy": "provided-map",
+  "window_ms": 5000,
+  "methods": [
+    "ewma",
+    "burst-aware",
+    "hurdle-ewma",
+    "hazard-hurdle",
+    "burst-localized",
+    "fip-fourier"
+  ],
+  "train_requests": 3713,
+  "test_requests": 1625,
+  "train_end_window": 380001007,
+  "test_start_window": 380001008,
+  "test_end_window": 380001439,
+  "eval_start_window": 380001008,
+  "eval_end_window": 380001439
+}
