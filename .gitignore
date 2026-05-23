@@ -3,3 +3,16 @@ data/*.json
 __pycache__/
 *.pyc
 
+# Per user rule (2026-05-23): no Chinese docs or READMEs on GitHub.
+# Keep them locally, but don't push.
+README.md
+**/README.md
+*_CN.md
+*_cn.md
+**/REPORT_CN.md
+**/report_cn.md
+docs/STAGE_STATUS_AND_NEXT_PLAN.md
+docs/architecture_refactor.md
+reports/spoken_dialog_duet_comparison/duet_comparison_report.md
+reports/spoken_dialog_moderate_periodic_burst_online_eval_v2/
+reports/spoken_dialog_moderate_periodic_burst_online_eval_v3/
