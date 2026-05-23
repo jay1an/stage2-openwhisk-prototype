@@ -33,7 +33,7 @@ TRACE_COLUMNS = [
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--label", default="rich_periodic")
-    p.add_argument("--workflow-name", default="sebs_video")
+    p.add_argument("--workflow-name", default="civic_alert_flow")
     p.add_argument("--duration-sec", type=int, default=14400, help="4h by default")
     p.add_argument("--base-rate", type=float, default=2.0, help="mean requests per second")
     p.add_argument("--amp-main", type=float, default=1.6, help="amplitude of 60-min cycle (multiplicative)")

@@ -336,7 +336,7 @@ def write_command_templates(out_dir: Path, workflow: WorkflowSpec, memory_plan: 
         action = row["action"]
         memory = int(row["selected_memory_mb"])
         lines.append(f"# stage={row['stage_name']} reason={row['selection_reason']}")
-        lines.append(f"wsk action update {action} actions/sebs_mock.py --kind python:3 --memory {memory} -i")
+        lines.append(f"wsk action update {action} actions/workflow_action.py --kind python:3 --memory {memory} -i")
         lines.append("")
     (out_dir / "apply_memory_plan_template.sh").write_text("\n".join(lines), encoding="utf-8")
 

@@ -1,5 +1,6 @@
-data/*.csv
-data/*.json
+# Large local-generated data and report dirs — keep code only on GitHub.
+data/
+reports/
 __pycache__/
 *.pyc
 
@@ -9,6 +10,7 @@ README.md
 **/README.md
 *_CN.md
 *_cn.md
+*_cn.ipynb
 **/REPORT_CN.md
 **/report_cn.md
 docs/STAGE_STATUS_AND_NEXT_PLAN.md
@@ -16,3 +18,6 @@ docs/architecture_refactor.md
 reports/spoken_dialog_duet_comparison/duet_comparison_report.md
 reports/spoken_dialog_moderate_periodic_burst_online_eval_v2/
 reports/spoken_dialog_moderate_periodic_burst_online_eval_v3/
+
+# Local Chinese exploration notebook generator (references deleted SEBS workflows).
+notebooks/make_azure_trace_notebook.py

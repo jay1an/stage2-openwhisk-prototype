@@ -17,7 +17,7 @@ import pandas as pd
 
 
 APPS = {
-    "bursty_dense": "configs/sebs_video.yaml",
+    "bursty_dense": "configs/visual_qa_flow.yaml",
     "bursty_sparse": "configs/civic_alert_flow.yaml",
 }
 WINDOWS_SEC = [5, 2]

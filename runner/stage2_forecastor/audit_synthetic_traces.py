@@ -7,10 +7,9 @@ from ..workflow import load_workflow
 
 
 DEFAULT_CONFIG_MAP = {
-    "sebs_trip_booking": "configs/sebs_trip_booking.yaml",
-    "sebs_video": "configs/sebs_video.yaml",
-    "sebs_map_reduce": "configs/sebs_map_reduce.yaml",
-    "sebs_ml": "configs/sebs_ml.yaml",
+    "civic_alert_flow": "configs/civic_alert_flow.yaml",
+    "spoken_dialog_flow": "configs/spoken_dialog_flow.yaml",
+    "visual_qa_flow": "configs/visual_qa_flow.yaml",
 }
 
 

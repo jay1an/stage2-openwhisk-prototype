@@ -65,25 +65,6 @@ def resolve_path(root: Path, value: str | None) -> Path | None:
 def default_experiments() -> list[ExperimentSpec]:
     return [
         ExperimentSpec(
-            name="sebs_video_periodic_drift_p95",
-            workflow="sebs_video",
-            regime="azure_periodic_drift_scaled30",
-            workflow_config="configs/sebs_video.yaml",
-            trace="data/stage_synthetic/sebs_video_azure_periodic_drift_challenge_scaled30_stage_trace.csv",
-            schedule="data/azure_schedules_challenge/schedule_azure_periodic_drift_challenge_scaled30_sebs_video.csv",
-            forecast_detail="reports/online_adaptive_selector_azure_periodic_drift_scaled30_riskbudget/online_selected_detail.csv",
-            latency_samples="reports/stage3_latency_augmented_cold_sebs_video_periodic_drift/latency_samples_for_monte_carlo_augmented.csv",
-            method="online-adaptive-expert-bank",
-            policy="p95",
-            fold_id=3,
-            slo_ms=2500.0,
-            residual_cold_probability=0.01,
-            notes=(
-                "Uses the current Stage-2 risk-budget selector and augmented "
-                "sebs_video latency pool."
-            ),
-        ),
-        ExperimentSpec(
             name="civic_alert_periodic_drift_p95",
             workflow="civic_alert_flow",
             regime="profiled_periodic_drift",

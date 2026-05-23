@@ -55,7 +55,7 @@ Main outputs:
 Current augmented sample pool:
 
 ```bash
-reports/stage3_latency_augmented_cold_sebs_video_periodic_drift/latency_samples_for_monte_carlo_augmented.csv
+reports/stage3_latency_augmented_cold_visual_qa_flow_periodic_drift/latency_samples_for_monte_carlo_augmented.csv
 ```
 
 ### Stage 4: SLO Risk Estimator
@@ -79,10 +79,10 @@ Single scenario example:
 ```bash
 # Purpose: estimate workflow-level p95 SLO risk using the online selected forecast.
 python -m runner.stage4_risk.estimate_slo_risk \
-  --workflow-config configs/sebs_video.yaml \
-  --trace data/stage_synthetic/sebs_video_azure_periodic_drift_challenge_scaled30_stage_trace.csv \
+  --workflow-config configs/visual_qa_flow.yaml \
+  --trace data/stage_synthetic/visual_qa_flow_azure_periodic_drift_challenge_scaled30_stage_trace.csv \
   --forecast-detail reports/online_adaptive_selector_azure_periodic_drift_scaled30_riskbudget/online_selected_detail.csv \
-  --latency-samples reports/stage3_latency_augmented_cold_sebs_video_periodic_drift/latency_samples_for_monte_carlo_augmented.csv \
+  --latency-samples reports/stage3_latency_augmented_cold_visual_qa_flow_periodic_drift/latency_samples_for_monte_carlo_augmented.csv \
   --method online-adaptive-expert-bank \
   --policy p95 \
   --window-sec 5 \
@@ -97,10 +97,10 @@ Suite example:
 ```bash
 # Purpose: run several SLO and residual cold-risk settings in one reproducible suite.
 python -m runner.stage4_risk.run_stage4_monte_carlo_suite \
-  --workflow-config configs/sebs_video.yaml \
-  --trace data/stage_synthetic/sebs_video_azure_periodic_drift_challenge_scaled30_stage_trace.csv \
+  --workflow-config configs/visual_qa_flow.yaml \
+  --trace data/stage_synthetic/visual_qa_flow_azure_periodic_drift_challenge_scaled30_stage_trace.csv \
   --forecast-detail reports/online_adaptive_selector_azure_periodic_drift_scaled30_riskbudget/online_selected_detail.csv \
-  --latency-samples reports/stage3_latency_augmented_cold_sebs_video_periodic_drift/latency_samples_for_monte_carlo_augmented.csv \
+  --latency-samples reports/stage3_latency_augmented_cold_visual_qa_flow_periodic_drift/latency_samples_for_monte_carlo_augmented.csv \
   --method online-adaptive-expert-bank \
   --policies p90,p95 \
   --slo-ms 2000,2500,3000 \
@@ -129,9 +129,9 @@ Example:
 ```bash
 # Purpose: produce an offline joint control plan without invoking OpenWhisk.
 python -m runner.stage5_control.plan_joint_control \
-  --workflow-config configs/sebs_video.yaml \
+  --workflow-config configs/visual_qa_flow.yaml \
   --forecast-detail reports/online_adaptive_selector_azure_periodic_drift_scaled30_riskbudget/online_selected_detail.csv \
-  --latency-samples reports/stage3_latency_augmented_cold_sebs_video_periodic_drift/latency_samples_for_monte_carlo_augmented.csv \
+  --latency-samples reports/stage3_latency_augmented_cold_visual_qa_flow_periodic_drift/latency_samples_for_monte_carlo_augmented.csv \
   --method online-adaptive-expert-bank \
   --policy p95 \
   --slo-ms 2500 \
@@ -190,7 +190,7 @@ wsk -i --apihost "$APIHOST" --auth "$GUEST_AUTH" action list
 ### 3. Deploy Actions
 
 ```bash
-# Purpose: deploy SeBS-style mock workflow actions.
+# Purpose: deploy profile-driven workflow actions (civic_alert / spoken_dialog / visual_qa).
 ./scripts/deploy_actions.sh
 ```
 
@@ -202,8 +202,8 @@ replay.
 ```bash
 # Purpose: run one workflow entry to validate action deployment and trace schema.
 python -m runner.replay_schedule \
-  --workflow configs/sebs_video.yaml \
-  --schedule data/azure_schedules_scaled/schedule_azure_periodic_drift_challenge_scaled30_sebs_video.csv \
+  --workflow configs/visual_qa_flow.yaml \
+  --schedule data/azure_schedules_scaled/schedule_azure_periodic_drift_challenge_scaled30_visual_qa_flow.csv \
   --limit 1 \
   --time-scale 1 \
   --min-gap-ms 500 \
@@ -211,8 +211,8 @@ python -m runner.replay_schedule \
   --max-inflight 1 \
   --stage-max-workers 2 \
   --invoke-timeout-sec 60 \
-  --trace data/real_traces/server_probe_sebs_video_l1.csv \
-  --schedule-out data/real_schedules/server_probe_sebs_video_l1.csv \
+  --trace data/real_traces/server_probe_visual_qa_flow_l1.csv \
+  --schedule-out data/real_schedules/server_probe_visual_qa_flow_l1.csv \
   --apihost "$APIHOST" \
   --auth "$GUEST_AUTH"
 ```

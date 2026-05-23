@@ -19,19 +19,6 @@ DEFAULT_PROFILE = {
 
 
 PROFILES = {
-    ("sebs_trip_booking", "reserve_hotel"): {"cpu_iters": 60_000, "memory_kb": 96, "output_items": 2},
-    ("sebs_trip_booking", "reserve_rental"): {"cpu_iters": 65_000, "memory_kb": 96, "output_items": 2},
-    ("sebs_trip_booking", "reserve_flight"): {"cpu_iters": 75_000, "memory_kb": 128, "output_items": 2},
-    ("sebs_trip_booking", "confirm"): {"cpu_iters": 45_000, "memory_kb": 64, "output_items": 1},
-    ("sebs_video", "decode"): {"cpu_iters": 150_000, "memory_kb": 512, "output_items": 4},
-    ("sebs_video", "analyse"): {"cpu_iters": 180_000, "memory_kb": 384, "output_items": 2},
-    ("sebs_video", "summarize"): {"cpu_iters": 80_000, "memory_kb": 192, "output_items": 1},
-    ("sebs_map_reduce", "split"): {"cpu_iters": 70_000, "memory_kb": 128, "output_items": 5},
-    ("sebs_map_reduce", "map"): {"cpu_iters": 130_000, "memory_kb": 256, "output_items": 2},
-    ("sebs_map_reduce", "shuffle"): {"cpu_iters": 90_000, "memory_kb": 192, "output_items": 3},
-    ("sebs_map_reduce", "reduce"): {"cpu_iters": 120_000, "memory_kb": 256, "output_items": 1},
-    ("sebs_ml", "generate"): {"cpu_iters": 100_000, "memory_kb": 256, "output_items": 4},
-    ("sebs_ml", "train"): {"cpu_iters": 260_000, "memory_kb": 768, "output_items": 1},
     ("civic_alert_flow", "detect_object"): {
         "cpu_iters": 4_800_000,
         "memory_kb": 8_192,

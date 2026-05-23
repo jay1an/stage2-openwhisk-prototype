@@ -14,7 +14,7 @@ import pandas as pd
 
 
 APPS = ["bursty_dense", "bursty_sparse"]
-WORKFLOWS = {"bursty_dense": "sebs_video", "bursty_sparse": "civic_alert_flow"}
+WORKFLOWS = {"bursty_dense": "visual_qa_flow", "bursty_sparse": "civic_alert_flow"}
 WINDOWS = [5, 2]
 SUFFIXES = ["classical", "pointprocess", "cp_classical", "cp_pp", "hedge"]
 DETAIL_PATTERN = {

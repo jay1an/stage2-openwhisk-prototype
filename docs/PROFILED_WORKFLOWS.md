@@ -45,8 +45,8 @@ Each node specifies:
 - `memory_kb`, `memory_passes`, `memory_stride`: memory allocation/touch work.
 - `warm_overhead_ms`, `cold_overhead_ms`: offline trace simulation overhead priors.
 
-Real OpenWhisk replay uses `actions/sebs_mock.py`, which now reads the CPU and
-memory profile fields. Offline trace generation uses:
+Real OpenWhisk replay uses `actions/workflow_action.py`, which now reads the CPU
+and memory profile fields. Offline trace generation uses:
 
 ```bash
 python -m runner.stage2_forecastor.simulate_profiled_stage_trace --help

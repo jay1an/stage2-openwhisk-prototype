@@ -12,7 +12,7 @@
       "policy": "p95",
       "slo_ms": 4000.0,
       "residual_cold_probability": 0.0,
-      "schedule": "data/azure_schedules_challenge/schedule_azure_periodic_drift_challenge_scaled30_sebs_video.csv",
+      "schedule": "data/azure_schedules_challenge/schedule_azure_periodic_drift_challenge_scaled30_civic_alert_flow.csv",
       "notes": "Profiled synthetic civic-alert workflow driven by the Azure periodic-drift entry schedule."
     },
     {

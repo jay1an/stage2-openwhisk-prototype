@@ -10,11 +10,10 @@ import pandas as pd
 from .profile_latency import LATENCY_COLUMNS, grouped_summary, load_trace
 
 
-DEFAULT_CALIBRATION_TRACES = [
-    "data/real_traces/traces_sparse1_sebs_trip_booking_probe5.csv",
-    "data/real_traces/traces_sparse1_sebs_trip_booking_l20.csv",
-    "data/real_traces/traces_sparse1_sebs_trip_booking_l20_mi4.csv",
-]
+# Optional calibration pilot traces (pass via --calibration-traces).
+# Historically defaulted to SeBS trip-booking pilots that have since been
+# removed from this repo; on a real server, pass your own pilot CSVs.
+DEFAULT_CALIBRATION_TRACES: list[str] = []
 
 
 def parse_args() -> argparse.Namespace:

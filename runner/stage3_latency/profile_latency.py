@@ -418,8 +418,8 @@ def write_readme(
             "",
             "## Interpretation Guardrails",
             "",
-            "- Real OpenWhisk pilot traces are small and currently mainly cover `sebs_trip_booking`.",
-            "- The `sebs_video` continuous-moderate trace is synthetic-stage data calibrated from pilot traces.",
+            "- Real OpenWhisk pilot traces should be captured per workflow on the deployment cluster.",
+            "- Synthetic stage traces are profile-driven (see simulate_profiled_stage_trace.py) and serve as a calibration baseline only.",
             "- Use this pack to design Stage-4 risk estimation, but do not present it as final real-cluster latency evidence.",
             "",
         ]

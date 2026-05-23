@@ -52,7 +52,7 @@ def parse_args() -> argparse.Namespace:
         "--candidate-minute-counts",
         default="notebooks/data/azure_analysis/azure2021_candidate_minute_counts.csv",
     )
-    parser.add_argument("--workflow-config", default="configs/sebs_video.yaml")
+    parser.add_argument("--workflow-config", default="configs/civic_alert_flow.yaml")
     parser.add_argument("--key", default=DEFAULT_KEY)
     parser.add_argument("--source-label", default="azure_periodic_drift_challenge_scaled30")
     parser.add_argument("--source-span-minutes", type=int, default=3600)

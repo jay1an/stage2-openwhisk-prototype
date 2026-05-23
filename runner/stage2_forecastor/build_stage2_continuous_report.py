@@ -199,7 +199,7 @@ def write_report(
         "",
         "## Scope",
         "",
-        "- Workflow: `sebs_video`.",
+        "- Workflow: `visual_qa_flow` (default profile-driven DAG).",
         "- Arrival source: Azure-derived `continuous_moderate`.",
         "- Time compression: one Azure minute to two seconds.",
         "- Evaluation window: 5 seconds.",

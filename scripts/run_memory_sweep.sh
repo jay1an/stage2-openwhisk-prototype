@@ -8,11 +8,17 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-# Workflow under test. sebs_video is the current main paper-facing workflow.
-WORKFLOW="${WORKFLOW:-configs/sebs_video.yaml}"
+# Workflow under test. Must be one of the supported DAGs:
+#   configs/civic_alert_flow.yaml
+#   configs/spoken_dialog_flow.yaml
+#   configs/visual_qa_flow.yaml
+# Override via WORKFLOW=configs/<name>.yaml.
+WORKFLOW="${WORKFLOW:-configs/civic_alert_flow.yaml}"
 
-# OpenWhisk endpoint and auth. Override APIHOST/AUTH if your cluster differs.
-APIHOST="${APIHOST:-https://192.168.137.128:31001}"
+# OpenWhisk endpoint and auth. APIHOST MUST be set for your real cluster, e.g.
+#   APIHOST=https://<your-openwhisk-host>:31001
+# AUTH is normally read from the cluster's Kubernetes secret below.
+APIHOST="${APIHOST:?APIHOST must be set, e.g. https://<openwhisk-host>:31001}"
 AUTH="${AUTH:-}"
 if [[ -z "$AUTH" ]]; then
   # Read the current OpenWhisk guest auth from the Kubernetes secret.
@@ -21,7 +27,7 @@ fi
 
 # OpenWhisk runtime/action settings.
 OW_KIND="${OW_KIND:-python:3}"
-ACTION_FILE="${ACTION_FILE:-actions/sebs_mock.py}"
+ACTION_FILE="${ACTION_FILE:-actions/workflow_action.py}"
 ACTION_TIMEOUT_MS="${ACTION_TIMEOUT_MS:-60000}"
 PYTHON="${PYTHON:-python3}"
 WSK_CLI="${WSK_CLI:-wsk}"

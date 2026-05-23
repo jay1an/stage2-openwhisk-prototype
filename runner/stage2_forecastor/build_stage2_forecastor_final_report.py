@@ -235,7 +235,7 @@ def write_report(
         "",
         "## Scope",
         "",
-        "- Workload: Azure-derived `sebs_video` periodic/drift challenge trace, scaled to 5s windows.",
+        "- Workload: Azure-derived periodic/drift challenge trace (default: `visual_qa_flow`), scaled to 5s windows.",
         "- Evaluation summary here uses warm-up-excluded rows where available.",
         "- Compared methods include raw LSTM, rolling conformal LSTM, LightGBM, and online risk-budget selector.",
         "- `empirical_quantile_coverage` is the strict p90/p95 calibration check.",

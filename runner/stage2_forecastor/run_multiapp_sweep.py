@@ -14,9 +14,9 @@ from pathlib import Path
 
 
 APPS: dict[str, str] = {
-    "periodic_dense": "configs/sebs_video.yaml",
+    "periodic_dense": "configs/visual_qa_flow.yaml",
     "periodic_sparse": "configs/civic_alert_flow.yaml",
-    "bursty_dense": "configs/sebs_video.yaml",
+    "bursty_dense": "configs/visual_qa_flow.yaml",
     "bursty_sparse": "configs/civic_alert_flow.yaml",
     "drift": "configs/spoken_dialog_flow.yaml",
 }

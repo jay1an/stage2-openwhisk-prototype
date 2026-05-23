@@ -18,9 +18,9 @@ from pathlib import Path
 
 APPS = ["periodic_dense", "periodic_sparse", "bursty_dense", "bursty_sparse", "drift"]
 WORKFLOWS = {
-    "periodic_dense": "sebs_video",
+    "periodic_dense": "visual_qa_flow",
     "periodic_sparse": "civic_alert_flow",
-    "bursty_dense": "sebs_video",
+    "bursty_dense": "visual_qa_flow",
     "bursty_sparse": "civic_alert_flow",
     "drift": "spoken_dialog_flow",
 }
