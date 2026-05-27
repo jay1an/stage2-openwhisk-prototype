@@ -40,6 +40,7 @@ WARM_COUNT="${WARM_COUNT:-25}"
 COLD_INTERVAL_MS="${COLD_INTERVAL_MS:-1000}"
 WARM_INTERVAL_MS="${WARM_INTERVAL_MS:-250}"
 MAX_WORKERS="${MAX_WORKERS:-8}"
+CPU_PROFILE="${CPU_PROFILE:-huawei_functiongraph}"
 
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 TRACE_DIR="${TRACE_DIR:-data/traces/memory_sweep_${RUN_ID}}"
@@ -98,7 +99,9 @@ for memory_mb in ${MEMORY_TIERS}; do
     --trace "$trace_file" \
     --count "$COLD_COUNT" \
     --interval-ms "$COLD_INTERVAL_MS" \
-    --max-workers "$MAX_WORKERS"
+    --max-workers "$MAX_WORKERS" \
+    --allocated-memory-mb "$memory_mb" \
+    --cpu-profile "$CPU_PROFILE"
 
   # Warm sample block. Consecutive calls should mostly reuse containers.
   "$PYTHON" -m runner.run_workflow \
@@ -108,7 +111,9 @@ for memory_mb in ${MEMORY_TIERS}; do
     --trace "$trace_file" \
     --count "$WARM_COUNT" \
     --interval-ms "$WARM_INTERVAL_MS" \
-    --max-workers "$MAX_WORKERS"
+    --max-workers "$MAX_WORKERS" \
+    --allocated-memory-mb "$memory_mb" \
+    --cpu-profile "$CPU_PROFILE"
 
   trace_args+=("$trace_file")
   label_args+=("mem_${memory_mb}mb")
