@@ -432,6 +432,63 @@ Estimated 2-3 weeks after path 2 completes.
 
 ---
 
+## 12. P4 Findings: Cold Sample Structure (Added 2026-05-27)
+
+### What we tried
+
+Attempted to bucket the `cold_like` sample pool into:
+- `clean_cold`: workflow has 1 cold stage AND ow_wait_ms < 200
+- `cold_with_contention`: workflow has 1 cold stage AND ow_wait_ms >= 200
+- `partial_cold_cascade`: workflow has >= 2 cold stages
+
+### What we found
+
+The `clean_cold` bucket is EMPTY. Reason: OpenWhisk's `ow_wait_ms` is not
+pure queuing time; it includes container creation, image pull, and runtime
+init. Even a no-contention cold start has ow_wait_ms in the range
+1000-2000 ms. The 200 ms threshold was based on a wrong assumption.
+
+The 14 real all-cold workflows (5 stages each = 70 samples) are all
+classified as `partial_cold_cascade` per the workflow_cold_count rule.
+
+### Implication
+
+We do not need MC to estimate Scale-To-Zero and Always-Warm bounds:
+- Scale-To-Zero bound = empirical distribution of the 14 all_cold
+  workflows (mean=28.9s, p95=29.8s, max=30.1s)
+- Always-Warm bound = empirical distribution of the 3632 all_warm
+  workflows (mean=18.0s, p95=20.1s)
+
+MC may still under- or over-estimate these because of the
+independent-sampling assumption (sampling 5 stages independently
+explodes the tail).
+
+### Correct method for future MC bounds
+
+If MC is needed (e.g., for plans not directly measured), use
+WORKFLOW-LEVEL joint resampling, not stage-level independent sampling:
+- Pick a real workflow at random, use its 5 stage latencies as a unit
+- This preserves within-workflow correlation (which is large in practice)
+
+### Lesson for path 2
+
+Path 2 (closed-form risk model) requires fitting cold/warm latency
+distributions per stage. When fitting cold distributions:
+- Use samples from full-cascade workflows (workflow_cold_count == 5)
+  to capture clean cold behavior, OR
+- Use the full cold pool with explicit correlation modeling
+- Do NOT fit a single distribution to mixed clean/contended samples
+  and then sample independently — this is what MC was effectively doing
+  in P3/P4 and it produces tail explosion
+
+P4 deliverables:
+- `scripts/run_p4_rebucketed_bounds.py`: bucketing wrapper (kept for
+  reference even though clean_cold turned out empty)
+- `reports/stage3_cold_bucketed/`: v2 sample pool, MC bounds attempt,
+  comparison report
+
+---
+
 ## Changelog
 
 - 2026-05-26: Initial document created, aligning all decisions made in
@@ -439,3 +496,8 @@ Estimated 2-3 weeks after path 2 completes.
 - 2026-05-27: Added Section 10 on dynamic plan adjustment. P3 first-pass
   validation completed (see reports/stage4_p3_first_pass/); identified
   Stage 3 cold sample bucketing as next priority before path 2.
+- 2026-05-27 (later): Added Section 12 documenting P4 findings. The
+  `clean_cold` bucket is empty due to OpenWhisk's ow_wait_ms including
+  container creation. Decision: skip P4b, use empirical bounds for
+  Scale-To-Zero / Always-Warm, proceed to path 2 with proper joint
+  sampling or parametric fitting.
