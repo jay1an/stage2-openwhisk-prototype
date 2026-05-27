@@ -116,6 +116,34 @@ The "active sleep" approach (warmup action sleeps for hold duration) was
 considered but rejected: during sleep the container is Busy, so it cannot
 accept the real request anyway, leading to either queueing or new cold start.
 
+### Precise JIT Fire Timing (aligned 2026-05-27)
+
+To minimize "warm but idle" container time while keeping high JIT success
+rate, the optimal JIT fire time is:
+
+```
+JIT_fire_time = T_upstream_start + D_upstream_predicted
+              - C_downstream_cold_overhead
+              - safety_margin
+```
+
+Where:
+- `T_upstream_start`: observed time when upstream stage begins execution
+- `D_upstream_predicted`: predicted warm duration of upstream stage
+  (from latency model)
+- `C_downstream_cold_overhead`: cold start overhead of the downstream stage
+  (~2s for civic_alert stages)
+- `safety_margin`: 2σ of upstream warm duration variance, ~500ms for
+  civic_alert stages
+
+The 2σ margin trades ~500ms of paused container time per JIT for ~97.5%
+JIT success rate. Higher margin (3σ) reduces failure to ~0.15% but wastes
+more paused time; lower margin (1σ) saves time but increases JIT failures
+to ~16%.
+
+The safety margin is independent per stage and can be tuned later based
+on observed upstream duration variance.
+
 ### Race Condition Analysis
 
 Real race exists when upstream execution time has variance σ_D:
@@ -432,6 +460,96 @@ Estimated 2-3 weeks after path 2 completes.
 
 ---
 
+## 13. JIT's Asymmetric Impact on Cold Starts and Simplified Risk Model (2026-05-27)
+
+### Asymmetric impact
+
+JIT prewarming hides downstream cold starts inside the upstream execution
+window. This creates an asymmetry:
+
+- **Entry stage**: no upstream available to hide cold start. Cold start
+  is fully visible to workflow E2E latency.
+- **Downstream stages**: cold start happens in parallel with upstream
+  execution and completes before downstream is needed. **Invisible to
+  workflow E2E**, assuming JIT timing works.
+
+Consequence: P(stage cold) only matters for the entry stage. Downstream
+P(cold) is effectively zero in the risk model.
+
+### Implications for the cold-start view
+
+In the real 45-min trace (without JIT):
+- 14 all_cold workflows: E2E mean = 28.9s (all 5 stages cold)
+- 365 partial_cold workflows: E2E mean = 22.2s
+- 3632 all_warm: E2E mean = 18.0s
+
+With our JIT in place, all-cold scenarios become "entry-cold + downstream-warm":
+- Predicted E2E = entry_cold (~5.5s) + downstream_warm (~14.5s) ≈ 20s
+- This is the **realistic worst case under our system** for any single
+  workflow whose entry was not pre-warmed
+
+So our system reduces the "worst-case cold" from 28.9s to ~20s purely
+through JIT, not counting entry prewarming. With entry prewarming on top,
+even this 20s is rare.
+
+### Simplified risk model (replaces earlier multi-stage cold model)
+
+Workflow E2E has only two scenarios:
+
+1. **Entry warm**: E2E = sum of all 5 warm stage durations
+2. **Entry cold**: E2E = entry cold duration + downstream warm stages
+
+Risk:
+```
+P(E2E > SLO) = (1 - p_entry_cold) * P(E2E_all_warm > SLO)
+             +      p_entry_cold  * P(E2E_with_cold_entry > SLO)
+```
+
+p_entry_cold is determined by entry prewarm strategy vs actual arrival
+pattern. p_downstream_cold ≈ 0 (assumed).
+
+### Simplified planner decision variables
+
+```
+plan = {
+    memory_tier_per_stage,            # resource decision (slow)
+    entry_prewarm_count_per_window,   # entry prewarming (medium)
+}
+
+dynamic_plan_policy = {
+    upgrade_trigger_threshold,        # slack budget threshold
+    upgrade_target_memory_tier,       # tier to switch downstream to
+}
+```
+
+No more "p_cold per stage" complexity. No more "downstream extra prewarm
+defense". The system relies on:
+- Entry prewarm to make P(entry cold) small in expected conditions
+- JIT to hide downstream cold starts
+- Dynamic plan adjustment to recover slack when entry happens to be cold
+
+### Recovery via dynamic plan
+
+When entry happens to be cold (e.g., burst not predicted by Stage 2),
+the dynamic adjustment layer detects this:
+- Observes actual entry completion time vs predicted
+- Computes new E2E estimate including downstream warm execution
+- If estimate exceeds SLO budget, upgrades downstream stage memory tier
+- Faster downstream warm execution recovers the slack
+
+This is the core paper narrative: forecast handles expected behavior,
+JIT handles cold start cost, dynamic plan handles forecast misses.
+
+### Baseline comparison (simplified)
+
+Only two baselines for the paper:
+- **Scale-To-Zero**: default OpenWhisk behavior, no prewarm, short keepalive
+- **Always-Warm**: peak-prewarmed for every stage
+
+"Scale-To-Zero with JIT" is NOT a separate baseline; JIT is part of "Ours".
+
+---
+
 ## 12. P4 Findings: Cold Sample Structure (Added 2026-05-27)
 
 ### What we tried
@@ -501,3 +619,11 @@ P4 deliverables:
   container creation. Decision: skip P4b, use empirical bounds for
   Scale-To-Zero / Always-Warm, proceed to path 2 with proper joint
   sampling or parametric fitting.
+- 2026-05-27 (final): Added Section 13 on JIT's asymmetric cold-start
+  impact and simplified risk model. Major simplifications:
+    * Plan variables reduced to: memory_tier + entry_prewarm_count
+    * Risk model is 2-scenario mixture (entry warm vs entry cold)
+    * p_downstream_cold assumed 0 (JIT hides it)
+    * No "downstream extra prewarm" defense (rely on JIT)
+    * Dynamic plan as recovery mechanism for entry cold events
+  Created `docs/ANALYTICAL_RISK_MODEL.md` with closed-form math details.
