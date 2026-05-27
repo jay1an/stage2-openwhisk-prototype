@@ -29,6 +29,7 @@ STAGE_ORDER = [
     "translate_alert",
 ]
 PERCENTILES = [0.50, 0.75, 0.90, 0.95, 0.99]
+CIVIC_ALERT_CRITICAL_PATH_EDGES = 4
 DEFAULT_PARAMS = (
     Path(__file__).resolve().parents[2]
     / "reports"
@@ -135,11 +136,39 @@ def clark_max(a: LogNormalParams, b: LogNormalParams, rho: float = 0.0) -> LogNo
     return LogNormalParams(mu=float(mean_log_max), sigma=math.sqrt(var_log_max))
 
 
-def aggregate_civic_alert(stage_dists: dict[str, LogNormalParams]) -> LogNormalParams:
-    """Compute civic_alert workflow E2E distribution from per-stage dists."""
+def add_deterministic_shift(dist: LogNormalParams, shift_ms: float) -> LogNormalParams:
+    """Approximate L + constant as lognormal by preserving variance."""
+    if shift_ms < 0.0 or not math.isfinite(shift_ms):
+        raise ValueError(f"shift_ms must be finite and non-negative, got {shift_ms}")
+    if shift_ms == 0.0:
+        return dist
+
+    new_mean = dist.mean + float(shift_ms)
+    new_var = dist.variance
+    if new_var == 0.0:
+        return LogNormalParams(mu=math.log(new_mean), sigma=0.0)
+    sigma_sq = math.log1p(new_var / (new_mean**2))
+    mu = math.log(new_mean) - sigma_sq / 2.0
+    return LogNormalParams(mu=mu, sigma=math.sqrt(max(0.0, sigma_sq)))
+
+
+def aggregate_civic_alert(
+    stage_dists: dict[str, LogNormalParams],
+    transition_overhead_ms: float = 0.0,
+) -> LogNormalParams:
+    """Compute civic_alert workflow E2E distribution from per-stage dists.
+
+    transition_overhead_ms is a deterministic delay per critical-path DAG edge.
+    civic_alert has four critical-path transitions, so the final distribution
+    is shifted by 4 * transition_overhead_ms with variance preserved.
+    """
     missing = sorted(set(STAGE_ORDER).difference(stage_dists))
     if missing:
         raise ValueError(f"missing stage distributions: {missing}")
+    if transition_overhead_ms < 0.0 or not math.isfinite(transition_overhead_ms):
+        raise ValueError(
+            f"transition_overhead_ms must be finite and non-negative, got {transition_overhead_ms}"
+        )
 
     detect = stage_dists["detect_object"]
     estimate = stage_dists["estimate_pose"]
@@ -151,7 +180,9 @@ def aggregate_civic_alert(stage_dists: dict[str, LogNormalParams]) -> LogNormalP
     path2_partial = detect
     classify_scene_start = clark_max(path1_partial, path2_partial, rho=0.0)
     classify_scene_end = fenton_wilkinson_sum([classify_scene_start, classify])
-    return fenton_wilkinson_sum([classify_scene_end, translate])
+    e2e = fenton_wilkinson_sum([classify_scene_end, translate])
+    shift_ms = CIVIC_ALERT_CRITICAL_PATH_EDGES * float(transition_overhead_ms)
+    return add_deterministic_shift(e2e, shift_ms)
 
 
 def _load_stage_params(params_csv: str | Path, scenario: str) -> dict[str, LogNormalParams]:
@@ -325,12 +356,16 @@ def _write_report(
     e2e: pd.DataFrame,
     validation: pd.DataFrame,
     sanity_rows: pd.DataFrame,
+    transition_overhead_ms: float,
 ) -> None:
     accepted = _with_acceptance(validation)
     verdict = bool(accepted["passes"].all())
     all_within_5pct = bool((validation["rel_error_pct"] <= 5.0).all())
     lines = [
         "# Path 2 DAG Aggregation Validation",
+        "",
+        f"- Transition overhead per edge: `{transition_overhead_ms:.6f} ms`.",
+        f"- Total deterministic E2E shift: `{CIVIC_ALERT_CRITICAL_PATH_EDGES * transition_overhead_ms:.6f} ms`.",
         "",
         "## Analytical E2E Distributions",
         "",
@@ -356,7 +391,7 @@ def _write_report(
         "",
         "- Stage distributions are independent.",
         "- The Clark fan-in step treats the long path and direct branch as independent even though they share `detect_object`; this first version intentionally overestimates variance for safety.",
-        "- Validation MC draws from the fitted per-stage lognormal distributions and aggregates the raw samples through the real civic_alert max/sum DAG.",
+        "- Validation MC draws from the fitted per-stage lognormal distributions, aggregates the raw samples through the real civic_alert max/sum DAG, and applies the same deterministic transition shift.",
     ]
     out_path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -368,9 +403,12 @@ def run_validation(
     out_dir: str | Path,
     mc_samples: int,
     seed: int,
+    transition_overhead_ms: float = 0.0,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if mc_samples <= 0:
         raise ValueError("mc_samples must be positive")
+    if transition_overhead_ms < 0.0 or not math.isfinite(transition_overhead_ms):
+        raise ValueError("transition_overhead_ms must be finite and non-negative")
 
     workflow = load_workflow(str(workflow_config))
     _validate_civic_workflow(workflow)
@@ -387,12 +425,16 @@ def run_validation(
 
     for scenario in ["entry_warm", "entry_cold"]:
         stage_dists = _load_stage_params(lognormal_params, scenario)
-        e2e_dist = aggregate_civic_alert(stage_dists)
+        e2e_dist = aggregate_civic_alert(
+            stage_dists,
+            transition_overhead_ms=transition_overhead_ms,
+        )
         analytical[scenario] = e2e_dist
         e2e_rows.append(_distribution_row(scenario, e2e_dist))
 
         stage_samples = _draw_stage_samples(stage_dists, mc_samples, rng)
         mc_values = _aggregate_civic_alert_samples(stage_samples)
+        mc_values = mc_values + CIVIC_ALERT_CRITICAL_PATH_EDGES * float(transition_overhead_ms)
         mc_by_scenario[scenario] = mc_values
         validation_frames.append(_validate_scenario(scenario, e2e_dist, mc_values))
 
@@ -407,7 +449,7 @@ def run_validation(
     validation.to_csv(out / "mc_validation.csv", index=False)
     sanity_df.to_csv(out / "clark_sanity.csv", index=False)
     _write_cdf_plot(out / "cdf_comparison.png", analytical, mc_by_scenario)
-    _write_report(out / "aggregation_report.md", e2e, validation, sanity_df)
+    _write_report(out / "aggregation_report.md", e2e, validation, sanity_df, transition_overhead_ms)
     return e2e, validation, sanity_df
 
 
@@ -418,6 +460,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
     parser.add_argument("--mc-samples", type=int, default=100_000)
     parser.add_argument("--seed", type=int, default=20260527)
+    parser.add_argument("--transition-overhead-ms", type=float, default=0.0)
     return parser.parse_args()
 
 
@@ -429,6 +472,7 @@ def main() -> None:
         out_dir=args.out_dir,
         mc_samples=args.mc_samples,
         seed=args.seed,
+        transition_overhead_ms=args.transition_overhead_ms,
     )
     accepted = _with_acceptance(validation)
     print("Analytical E2E distributions:")

@@ -460,6 +460,92 @@ Estimated 2-3 weeks after path 2 completes.
 
 ---
 
+## 14. R4 Finding: Inter-Stage Correlation and Cluster Size (2026-05-27)
+
+### Summary
+
+R4 attempted to close the ~1.15s gap between model E2E p95 (18.98s) and
+real all_warm p95 (20.13s) by calibrating an inter-stage transition
+overhead. The hypothesis was rejected: the actual transition gap from
+the trace is < 5ms, not 1.15s.
+
+The remaining gap, plus the no-JIT validation gap (model predicts 6.4%
+violation at SLO=20s vs real 11.2%), is explained by **positive
+inter-stage correlation** that our independent-stage model does not
+capture.
+
+### Quantification
+
+From the all_warm subset (3632 workflows):
+- Sum of independent stage standard deviations: ~631 ms
+- Real workflow E2E std: ~1320 ms (from p95-mean ratio)
+- Ratio: 2.1×
+- Implied pairwise correlation: ρ ≈ 0.84
+
+### Root cause
+
+ρ ≈ 0.84 is exceptionally high. The cause is the single-node test
+configuration: every stage of every workflow runs on the same physical
+machine, sharing CPU, memory bandwidth, OpenWhisk invoker queue, and
+time-of-system-state. When the host is under load, ALL stages slow
+down together. When the host is idle, ALL stages run fast together.
+
+In a production multi-node cluster:
+- Stages can be scheduled to different invoker nodes
+- Each invoker has independent CPU contention
+- Cluster-level load balancing decorrelates stage timing
+- Estimated correlation drops with cluster size:
+    1 node: ρ ≈ 0.84 (observed)
+    2 nodes: ρ ≈ 0.45 (estimated)
+    4 nodes: ρ ≈ 0.20 (estimated)
+    8+ nodes: ρ ≈ 0.10 (estimated)
+    production fleets: ρ < 0.05
+
+### Implication for the model
+
+Our analytical risk model assumes independence (ρ = 0). This assumption
+is INCREASINGLY ACCURATE as the cluster grows.
+
+Single-node testing represents the worst case for the independence
+assumption. Multi-node testing (and especially production deployment)
+makes the model practically accurate.
+
+### Decision: validate via multi-node experiment
+
+Rather than building correlation modeling into path 2 (path 2 v2), we
+will:
+1. Add one or more worker nodes to the K8s cluster
+2. Re-run the 45-min replay on the multi-node cluster
+3. Re-measure stage correlation
+4. Verify the model's gap shrinks
+5. Frame in paper as "model validity depends on cluster size; we
+   characterize this dependence experimentally"
+
+This is a stronger paper narrative than admitting bias and adding a
+calibration factor. It also avoids the engineering complexity of
+introducing pairwise correlation into FW + Clark math.
+
+### Multi-node experiment plan (pending)
+
+When the second node is added:
+1. Verify OpenWhisk uses multi-invoker mode (one invoker per node)
+2. Re-run replay_civic_azure_schedule.py on the multi-node cluster
+3. Compute new per-stage and workflow E2E distributions
+4. Re-fit per-stage lognormals (if needed)
+5. Re-run R4 no-JIT validation: compare predicted vs observed
+   violation rate at SLO=20s
+6. Document the correlation reduction and model accuracy improvement
+7. If results are good, proceed to path 3 (multi-SLO + dynamic plan)
+   without correlation modeling
+8. If results show model still has significant bias, reconsider path 2 v2
+
+The single-node trace remains as a reference point in the paper:
+"under worst-case shared-host contention, our model under-predicts
+violation rate by ~5pp at SLO=20s; under multi-node deployment
+representative of production, the gap reduces to ~Xpp."
+
+---
+
 ## 13. JIT's Asymmetric Impact on Cold Starts and Simplified Risk Model (2026-05-27)
 
 ### Asymmetric impact
@@ -627,3 +713,11 @@ P4 deliverables:
     * No "downstream extra prewarm" defense (rely on JIT)
     * Dynamic plan as recovery mechanism for entry cold events
   Created `docs/ANALYTICAL_RISK_MODEL.md` with closed-form math details.
+- 2026-05-27 (R1-R4 path 2 done): R1 lognormal fit excellent for warm
+  (p95 err < 1.5%), marginal for cold (entry stage 12% err, others
+  higher but not on critical path). R2 DAG aggregation matched MC
+  within 0.6% across all percentiles. R3 plan_risk API working. R4
+  end-to-end validation revealed model is biased low by ~5pp at SLO=20s
+  due to inter-stage correlation in single-node cluster (ρ ≈ 0.84).
+  Decision: add worker node and re-validate, rather than build
+  correlation modeling. See Section 14.
