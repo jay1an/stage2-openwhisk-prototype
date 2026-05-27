@@ -1,5 +1,5 @@
 workflow_name: visual_qa_flow
-namespace: guest
+namespace: _
 entry: image_embed
 nodes:
   - name: image_embed

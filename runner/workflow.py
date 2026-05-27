@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, Iterable, List
 
@@ -12,6 +12,12 @@ class NodeSpec:
     parents: List[str]
     sleep_ms: int = 0
     cpu_iters: int | None = None
+    serial_cpu_iters: int | None = None
+    parallel_cpu_iters: int | None = None
+    serial_fraction: float | None = None
+    io_wait_ms: int | None = None
+    parallel_workers: str | None = None
+    max_parallel_workers: int | None = None
     memory_kb: int | None = None
     memory_passes: int | None = None
     memory_stride: int | None = None
@@ -60,6 +66,34 @@ def load_workflow(path: str) -> WorkflowSpec:
             cpu_iters=(
                 int(item["cpu_iters"]) if item.get("cpu_iters") is not None else None
             ),
+            serial_cpu_iters=(
+                int(item["serial_cpu_iters"])
+                if item.get("serial_cpu_iters") is not None
+                else None
+            ),
+            parallel_cpu_iters=(
+                int(item["parallel_cpu_iters"])
+                if item.get("parallel_cpu_iters") is not None
+                else None
+            ),
+            serial_fraction=(
+                float(item["serial_fraction"])
+                if item.get("serial_fraction") is not None
+                else None
+            ),
+            io_wait_ms=(
+                int(item["io_wait_ms"]) if item.get("io_wait_ms") is not None else None
+            ),
+            parallel_workers=(
+                str(item["parallel_workers"])
+                if item.get("parallel_workers") is not None
+                else None
+            ),
+            max_parallel_workers=(
+                int(item["max_parallel_workers"])
+                if item.get("max_parallel_workers") is not None
+                else None
+            ),
             memory_kb=(
                 int(item["memory_kb"]) if item.get("memory_kb") is not None else None
             ),
@@ -89,4 +123,27 @@ def load_workflow(path: str) -> WorkflowSpec:
         namespace=raw.get("namespace", "guest"),
         entry=raw["entry"],
         nodes=nodes,
+    )
+
+
+def suffix_action_name(action: str, suffix: str) -> str:
+    if not suffix:
+        return action
+    if "/" not in action:
+        return f"{action}{suffix}"
+    prefix, name = action.rsplit("/", 1)
+    return f"{prefix}/{name}{suffix}"
+
+
+def with_action_suffix(workflow: WorkflowSpec, suffix: str) -> WorkflowSpec:
+    if not suffix:
+        return workflow
+    return WorkflowSpec(
+        workflow_name=workflow.workflow_name,
+        namespace=workflow.namespace,
+        entry=workflow.entry,
+        nodes={
+            name: replace(node, action=suffix_action_name(node.action, suffix))
+            for name, node in workflow.nodes.items()
+        },
     )

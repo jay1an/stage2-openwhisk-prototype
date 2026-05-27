@@ -1,12 +1,16 @@
 workflow_name: civic_alert_flow
-namespace: guest
+namespace: _
 entry: detect_object
 nodes:
   - name: detect_object
     action: wf_civic_detect_object
     parents: []
-    cpu_iters: 4800000
-    memory_kb: 8192
+    cpu_iters: 21000000
+    serial_fraction: 0.20
+    io_wait_ms: 800
+    parallel_workers: auto
+    max_parallel_workers: 8
+    memory_kb: 16384
     memory_passes: 2
     memory_stride: 256
     output_items: 8
@@ -15,8 +19,12 @@ nodes:
   - name: estimate_pose
     action: wf_civic_estimate_pose
     parents: [detect_object]
-    cpu_iters: 3500000
-    memory_kb: 6144
+    cpu_iters: 18800000
+    serial_fraction: 0.25
+    io_wait_ms: 700
+    parallel_workers: auto
+    max_parallel_workers: 8
+    memory_kb: 12288
     memory_passes: 2
     memory_stride: 256
     output_items: 6
@@ -25,8 +33,12 @@ nodes:
   - name: match_face
     action: wf_civic_match_face
     parents: [estimate_pose]
-    cpu_iters: 5200000
-    memory_kb: 12288
+    cpu_iters: 24100000
+    serial_fraction: 0.25
+    io_wait_ms: 900
+    parallel_workers: auto
+    max_parallel_workers: 8
+    memory_kb: 24576
     memory_passes: 2
     memory_stride: 256
     output_items: 4
@@ -35,8 +47,12 @@ nodes:
   - name: classify_scene
     action: wf_civic_classify_scene
     parents: [detect_object, match_face]
-    cpu_iters: 4000000
-    memory_kb: 10240
+    cpu_iters: 20800000
+    serial_fraction: 0.20
+    io_wait_ms: 800
+    parallel_workers: auto
+    max_parallel_workers: 8
+    memory_kb: 16384
     memory_passes: 2
     memory_stride: 256
     output_items: 5
@@ -45,8 +61,12 @@ nodes:
   - name: translate_alert
     action: wf_civic_translate_alert
     parents: [classify_scene]
-    cpu_iters: 2400000
-    memory_kb: 4096
+    cpu_iters: 19300000
+    serial_fraction: 0.35
+    io_wait_ms: 750
+    parallel_workers: auto
+    max_parallel_workers: 8
+    memory_kb: 8192
     memory_passes: 1
     memory_stride: 256
     output_items: 2
