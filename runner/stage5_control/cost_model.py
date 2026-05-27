@@ -3,12 +3,13 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 
 from .control_plan import ControlPlan, expand_control_plan, load_control_plan
 from .dag_warmup_scheduler import cold_overhead_lead_times_ms, warm_interval_start_sec
+from ..resource_profiles import memory_to_cpu_cores
 from ..workflow import WorkflowSpec, load_workflow
 
 
@@ -17,6 +18,14 @@ class CostBreakdown:
     total_gb_seconds: float
     execution_gb_seconds: float
     warm_gb_seconds: float
+    total_vcpu_seconds: float
+    execution_vcpu_seconds: float
+    warm_vcpu_seconds: float
+    memory_cost: float
+    cpu_cost: float
+    request_cost: float
+    total_cost: float
+    request_count: float
     reconfiguration_penalty: float
     expanded_plan: pd.DataFrame
     execution_detail: pd.DataFrame
@@ -67,10 +76,11 @@ def _forecast_demand(
     )
 
 
-def _warm_cost_from_intervals(
+def _warm_resource_seconds_from_intervals(
     expanded_plan: pd.DataFrame,
     *,
     window_sec: float,
+    resource_units: Callable[[dict[str, Any]], float],
     demand: pd.DataFrame | None = None,
     warmup_mode: str = "window",
     workflow: WorkflowSpec | None = None,
@@ -91,7 +101,7 @@ def _warm_cost_from_intervals(
         events: list[tuple[float, float]] = []
         for row in stage_rows.to_dict(orient="records"):
             warm_count = max(0.0, float(row["warm_count"]))
-            memory_gb = max(0.0, float(row["memory_mb"]) / 1024.0)
+            units = max(0.0, float(resource_units(row)))
             window_start = float(row["window"]) * window_sec
             window_end = (float(row["window"]) + 1.0) * window_sec
             lead_sec = 0.0
@@ -113,7 +123,7 @@ def _warm_cost_from_intervals(
             keepalive_ttl = max(0.0, float(row["keepalive_ttl_sec"]))
             end = window_end + keepalive_ttl
             if warm_count > 0:
-                weighted_capacity = warm_count * memory_gb
+                weighted_capacity = warm_count * units
                 events.append((start, weighted_capacity))
                 events.append((end, -weighted_capacity))
 
@@ -122,7 +132,7 @@ def _warm_cost_from_intervals(
             demand_count = max(0.0, float(row.get("demand", 0.0) or 0.0))
             extra_invocation_born = max(0.0, demand_count - warm_count)
             if keepalive_ttl > 0 and extra_invocation_born > 0:
-                weighted_capacity = extra_invocation_born * memory_gb
+                weighted_capacity = extra_invocation_born * units
                 events.append((window_end, weighted_capacity))
                 events.append((end, -weighted_capacity))
 
@@ -139,6 +149,26 @@ def _warm_cost_from_intervals(
     return total
 
 
+def _memory_gb_units(row: dict[str, Any]) -> float:
+    return max(0.0, float(row["memory_mb"]) / 1024.0)
+
+
+def _cpu_units_for_profile(
+    *,
+    cpu_profile: str,
+    cpu_per_memory_mb: float | None,
+) -> Callable[[dict[str, Any]], float]:
+    def units(row: dict[str, Any]) -> float:
+        cores = memory_to_cpu_cores(
+            row["memory_mb"],
+            profile=cpu_profile,
+            cpu_per_memory_mb=cpu_per_memory_mb,
+        )
+        return max(0.0, float(cores or 0.0))
+
+    return units
+
+
 def _execution_cost(
     expanded_plan: pd.DataFrame,
     demand: pd.DataFrame,
@@ -146,9 +176,11 @@ def _execution_cost(
     *,
     base_memory_mb: int,
     cpu_alpha: float,
-) -> tuple[float, pd.DataFrame]:
+    cpu_profile: str,
+    cpu_per_memory_mb: float | None,
+) -> tuple[float, float, float, pd.DataFrame]:
     if expanded_plan.empty or demand.empty:
-        return 0.0, pd.DataFrame()
+        return 0.0, 0.0, 0.0, pd.DataFrame()
 
     merged = demand.merge(expanded_plan, on=["stage_name", "window"], how="left")
     if merged["memory_mb"].isna().any():
@@ -158,18 +190,47 @@ def _execution_cost(
             f"{missing.head(10).to_dict(orient='records')}"
         )
 
+    base_cpu_cores = memory_to_cpu_cores(
+        base_memory_mb,
+        profile=cpu_profile,
+        cpu_per_memory_mb=cpu_per_memory_mb,
+    )
+    base_cpu_cores = max(1e-9, float(base_cpu_cores or 0.0))
+
     durations = []
+    cpu_cores = []
     for row in merged.to_dict(orient="records"):
         base_duration = action_duration_sec.get(row["stage_name"], action_duration_sec.get("*", 0.0))
-        ratio = max(1.0, float(row["memory_mb"])) / max(1.0, float(base_memory_mb))
+        row_cpu_cores = memory_to_cpu_cores(
+            row["memory_mb"],
+            profile=cpu_profile,
+            cpu_per_memory_mb=cpu_per_memory_mb,
+        )
+        row_cpu_cores = max(1e-9, float(row_cpu_cores or 0.0))
+        ratio = row_cpu_cores / base_cpu_cores
+        cpu_cores.append(row_cpu_cores)
         durations.append(base_duration / (ratio ** float(cpu_alpha)))
+
+    merged["memory_gb"] = merged["memory_mb"].astype(float) / 1024.0
+    merged["cpu_cores"] = cpu_cores
     merged["mean_action_duration_sec"] = durations
     merged["execution_gb_seconds"] = (
         merged["demand"].astype(float)
-        * (merged["memory_mb"].astype(float) / 1024.0)
+        * merged["memory_gb"].astype(float)
         * merged["mean_action_duration_sec"].astype(float)
     )
-    return float(merged["execution_gb_seconds"].sum()), merged
+    merged["execution_vcpu_seconds"] = (
+        merged["demand"].astype(float)
+        * merged["cpu_cores"].astype(float)
+        * merged["mean_action_duration_sec"].astype(float)
+    )
+    request_count = float(merged["demand"].astype(float).sum())
+    return (
+        float(merged["execution_gb_seconds"].sum()),
+        float(merged["execution_vcpu_seconds"].sum()),
+        request_count,
+        merged,
+    )
 
 
 def estimate_control_plan_cost(
@@ -185,6 +246,11 @@ def estimate_control_plan_cost(
     base_memory_mb: int = 256,
     cpu_alpha: float = 1.0,
     warmup_mode: str = "window",
+    cpu_profile: str = "huawei_functiongraph",
+    cpu_per_memory_mb: float | None = None,
+    price_per_vcpu_second: float = 0.0,
+    price_per_gb_second: float = 0.0,
+    price_per_request: float = 0.0,
 ) -> CostBreakdown:
     effective_window_sec = float(window_sec or plan.window_sec)
     demand = _forecast_demand(forecast_detail, demand_column=demand_column)
@@ -202,30 +268,63 @@ def estimate_control_plan_cost(
         expanded["workflow_name"] = expanded["workflow_name"].fillna(workflow_name)
 
     action_duration_sec = _mean_action_duration_sec(latency_samples)
-    execution_gb_seconds, execution_detail = _execution_cost(
+    (
+        execution_gb_seconds,
+        execution_vcpu_seconds,
+        request_count,
+        execution_detail,
+    ) = _execution_cost(
         expanded,
         demand,
         action_duration_sec,
         base_memory_mb=base_memory_mb,
         cpu_alpha=cpu_alpha,
+        cpu_profile=cpu_profile,
+        cpu_per_memory_mb=cpu_per_memory_mb,
     )
     lead_ms_by_stage = cold_overhead_lead_times_ms(latency_samples, workflow_name)
     lead_sec_by_stage = {
         stage: float(value) / 1000.0 for stage, value in lead_ms_by_stage.items()
     }
-    warm_gb_seconds = _warm_cost_from_intervals(
+    warm_gb_seconds = _warm_resource_seconds_from_intervals(
         expanded,
         window_sec=effective_window_sec,
+        resource_units=_memory_gb_units,
+        demand=demand,
+        warmup_mode=warmup_mode,
+        workflow=workflow,
+        prewarm_lead_sec_by_stage=lead_sec_by_stage,
+    )
+    warm_vcpu_seconds = _warm_resource_seconds_from_intervals(
+        expanded,
+        window_sec=effective_window_sec,
+        resource_units=_cpu_units_for_profile(
+            cpu_profile=cpu_profile,
+            cpu_per_memory_mb=cpu_per_memory_mb,
+        ),
         demand=demand,
         warmup_mode=warmup_mode,
         workflow=workflow,
         prewarm_lead_sec_by_stage=lead_sec_by_stage,
     )
     total = execution_gb_seconds + warm_gb_seconds + float(reconfiguration_penalty)
+    total_vcpu_seconds = execution_vcpu_seconds + warm_vcpu_seconds
+    memory_cost = (execution_gb_seconds + warm_gb_seconds) * float(price_per_gb_second)
+    cpu_cost = total_vcpu_seconds * float(price_per_vcpu_second)
+    request_cost = request_count * float(price_per_request)
+    total_cost = memory_cost + cpu_cost + request_cost + float(reconfiguration_penalty)
     return CostBreakdown(
         total_gb_seconds=total,
         execution_gb_seconds=execution_gb_seconds,
         warm_gb_seconds=warm_gb_seconds,
+        total_vcpu_seconds=total_vcpu_seconds,
+        execution_vcpu_seconds=execution_vcpu_seconds,
+        warm_vcpu_seconds=warm_vcpu_seconds,
+        memory_cost=memory_cost,
+        cpu_cost=cpu_cost,
+        request_cost=request_cost,
+        total_cost=total_cost,
+        request_count=request_count,
         reconfiguration_penalty=float(reconfiguration_penalty),
         expanded_plan=expanded,
         execution_detail=execution_detail,
@@ -245,6 +344,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-memory-mb", type=int, default=256)
     parser.add_argument("--cpu-alpha", type=float, default=1.0)
     parser.add_argument("--warmup-mode", choices=["window", "dag_jit"], default="window")
+    parser.add_argument(
+        "--cpu-profile",
+        default="huawei_functiongraph",
+        choices=[
+            "huawei_functiongraph",
+            "huawei",
+            "functiongraph",
+            "legacy_256mb_250m",
+            "openwhisk_256mb_250m",
+            "custom",
+        ],
+    )
+    parser.add_argument("--cpu-per-memory-mb", type=float, default=None)
+    parser.add_argument("--price-per-vcpu-second", type=float, default=0.0)
+    parser.add_argument("--price-per-gb-second", type=float, default=0.0)
+    parser.add_argument("--price-per-request", type=float, default=0.0)
     parser.add_argument("--out-dir", required=True)
     return parser.parse_args()
 
@@ -271,6 +386,11 @@ def main() -> None:
         base_memory_mb=args.base_memory_mb,
         cpu_alpha=args.cpu_alpha,
         warmup_mode=args.warmup_mode,
+        cpu_profile=args.cpu_profile,
+        cpu_per_memory_mb=args.cpu_per_memory_mb,
+        price_per_vcpu_second=args.price_per_vcpu_second,
+        price_per_gb_second=args.price_per_gb_second,
+        price_per_request=args.price_per_request,
     )
 
     out_dir = Path(args.out_dir)
@@ -281,6 +401,14 @@ def main() -> None:
                 "total_gb_seconds": breakdown.total_gb_seconds,
                 "execution_gb_seconds": breakdown.execution_gb_seconds,
                 "warm_gb_seconds": breakdown.warm_gb_seconds,
+                "total_vcpu_seconds": breakdown.total_vcpu_seconds,
+                "execution_vcpu_seconds": breakdown.execution_vcpu_seconds,
+                "warm_vcpu_seconds": breakdown.warm_vcpu_seconds,
+                "memory_cost": breakdown.memory_cost,
+                "cpu_cost": breakdown.cpu_cost,
+                "request_cost": breakdown.request_cost,
+                "total_cost": breakdown.total_cost,
+                "request_count": breakdown.request_count,
                 "reconfiguration_penalty": breakdown.reconfiguration_penalty,
             }
         ]

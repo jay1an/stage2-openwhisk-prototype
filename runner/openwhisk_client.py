@@ -18,14 +18,27 @@ class OpenWhiskClient:
         if ":" not in self.auth:
             raise ValueError("OpenWhisk auth must use the format UUID:SECRET")
         self.uuid, self.secret = self.auth.split(":", 1)
+        if not self.apihost:
+            raise ValueError(
+                "OpenWhisk apihost is empty; export APIHOST or pass --apihost "
+                "with a value like https://192.168.123.17:31001"
+            )
+        if not self.apihost.startswith(("http://", "https://")):
+            self.apihost = f"https://{self.apihost}"
         self.apihost = self.apihost.rstrip("/")
         if not self.verify_tls:
             requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
 
-    def invoke_action(self, action: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    def _invoke(
+        self,
+        action: str,
+        params: Dict[str, Any],
+        result_only: bool,
+    ) -> Dict[str, Any]:
+        query = "blocking=true&result=true" if result_only else "blocking=true"
         url = (
             f"{self.apihost}/api/v1/namespaces/{self.namespace}/actions/"
-            f"{action}?blocking=true&result=true"
+            f"{action}?{query}"
         )
         resp = requests.post(
             url,
@@ -39,3 +52,10 @@ class OpenWhiskClient:
                 f"OpenWhisk invoke failed: status={resp.status_code}, body={resp.text[:500]}"
             )
         return resp.json()
+
+    def invoke_action(self, action: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        return self._invoke(action, params, result_only=True)
+
+    def invoke_activation(self, action: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Invoke synchronously and return the activation envelope and annotations."""
+        return self._invoke(action, params, result_only=False)
