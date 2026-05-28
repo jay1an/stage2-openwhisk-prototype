@@ -318,6 +318,87 @@ Path 3 subtasks (in execution order):
 - If validation fails: fit piecewise segmented model
 - Output: `reports/stage6_amdahl_model_extended/`
 
+### Subtask P3.1-retry: Three-model resource scaling fit (2026-05-28)
+
+P3.1 attempt 1 failed: simple Amdahl RMS = 5-10% per stage on 9-tier
+multi-node sweep, piecewise improved only 2 of 5 stages. The wider
+CPU range (0.4-3.0 vCPU) exposes that simple Amdahl with continuous
+W_eff is too rigid.
+
+Decision: fit THREE models in parallel and pick the one passing
+acceptance per stage. Outputs a comparison table for owner review.
+
+#### Cold overhead pre-cleansing
+
+Before model fitting, clean cold overhead measurements:
+1. For each stage independently, compute mean and std of cold_overhead
+   across all 9 tiers (cold_overhead = cold_dispatch - warm_dispatch
+   for that stage at that tier)
+2. Identify outlier tiers: tiers where the stage's cold_overhead is
+   more than 2 standard deviations from the per-stage mean
+3. Replace outlier values with the MEDIAN of the non-outlier tiers
+   for that stage
+4. Use the cleansed cold_overhead in subsequent modeling
+
+Paper write-up: per-stage outlier replacement is a standard data
+cleansing step, justified by the small per-tier sample size (n=10).
+Do NOT mention that all stages share the same runtime image.
+
+#### Three candidate models
+
+**D1: Power law (3 parameters per stage)**
+```
+T(cpu) = a · cpu^(-alpha) + c
+```
+- a: total CPU-bound work magnitude
+- alpha: scaling exponent (0 < alpha < 1 means sublinear)
+- c: CPU-independent constant (IO + memory + overhead)
+- No breakpoints, smooth function
+
+**D2: Amdahl with observed workers (3 parameters per stage)**
+```
+T(cpu) = S / min(cpu, 1) + P / w_observed(cpu) + C
+```
+- w_observed(cpu): the actual parallel_workers_used from sweep data
+  at that tier (NOT a fitted parameter; taken directly from
+  trace.csv's parallel_workers_used column)
+- S: serial CPU work
+- P: parallel CPU work
+- C: fixed overhead
+
+By using observed workers count (a step function from data) instead
+of a fitted continuous W_eff, this model accurately captures the
+worker transition discontinuities.
+
+**D3: Cubic spline interpolation (nonparametric)**
+
+Cubic spline through the 9 measured points per stage. No global
+parameters; uses local cubic fits with continuity constraints.
+Fallback if D1 and D2 fail.
+
+#### Acceptance criteria
+
+Per stage:
+- RMS relative error across 9 tiers < 3%
+- Max per-tier relative error < 8%
+
+A model PASSES if BOTH criteria are met. Per-stage, the model
+selection is independent: stage X may use D1 while stage Y uses D2.
+
+If all three models fail for a stage, the comparison report flags it
+for review.
+
+#### Outputs
+
+`reports/stage6_resource_models_v2/`:
+- `cold_overhead_cleansed.csv`: original + cleansed values per stage per tier
+- `d1_power_law_params.csv`: a, alpha, c per stage
+- `d2_amdahl_observed_params.csv`: S, P, C per stage
+- `d3_spline_coeffs.csv`: spline knots and coefficients
+- `model_comparison.csv`: RMS, max error, pass/fail per (stage, model)
+- `recommended_model_per_stage.csv`: which model to use per stage
+- `comparison_report.md`: summary + recommendations
+
 ### Subtask P3.2: SLO targets
 - Assistant proposes SLO numbers based on Amdahl + sweep data
 - Owner confirms
