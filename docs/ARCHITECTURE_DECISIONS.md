@@ -818,6 +818,17 @@ P4 deliverables:
     * No "downstream extra prewarm" defense (rely on JIT)
     * Dynamic plan as recovery mechanism for entry cold events
   Created `docs/ANALYTICAL_RISK_MODEL.md` with closed-form math details.
+- 2026-05-28 (P3.1-retry, resource model selection): Tested three
+  candidate models on the 9-tier multi-node sweep. D1 (power law)
+  RMS 4.8-7.0% per stage; D2 (Amdahl with observed workers) RMS
+  12-26%; D3 (cubic spline) RMS = 0 by construction at measured
+  points. Selected D3 for all 5 stages. D2 formula contained a bug
+  (P/w_obs instead of P/min(cpu, w_obs)); hand-calculation with the
+  corrected formula shows it would still fail the 3% RMS criterion
+  (RMS ≈ 5-6%, max ≈ 8.3%), so the bug does not change the
+  conclusion. Cold overhead cleansing detected 1 outlier
+  (classify_scene @ 768 MB). Detailed in PATH3_PLANNER_DESIGN.md
+  Subtask P3.1-retry result section.
 - 2026-05-28 (path 3 design alignment): Aligned 9 key design decisions
   for path 3 multi-SLO planner: (A1) Amdahl RMS < 3% validation,
   (A2) piecewise segmented fallback, (A3) max 3 vCPU tier (3840 MB),
