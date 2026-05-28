@@ -7,6 +7,8 @@ discussions.
 
 Companion documents:
 - `RELATED_WORK_AND_INNOVATION.md` - paper-by-paper analysis and innovation framing
+- `ANALYTICAL_RISK_MODEL.md` - path 2 closed-form risk model math
+- `PATH3_PLANNER_DESIGN.md` - path 3 multi-SLO planner + dynamic plan design
 - `STAGE_PIPELINE_AND_SERVER_MIGRATION.md` - operational/runtime notes
 - `CODE_STRUCTURE.md` - code layout
 
@@ -333,6 +335,37 @@ cold overhead is dominated by:
 - Runtime init
 None of these scale with the action's allocated CPU.
 
+### Extended sweep plan (2026-05-28)
+
+The original sweep (4 tiers: 768/1280/2048/2560) was on single-node and
+covered only the middle of the design space. Path 3 multi-SLO planner
+needs predictions across the full memory range used by both premium
+(high tier) and free (low tier) SLO classes.
+
+Extended sweep specification:
+- 9 memory tiers: 512, 768, 1024, 1280, 1536, 2048, 2560, 3072, 3840 MB
+- Maps to CPU: 0.4, 0.6, 0.8, 1.0, 1.2, 1.6, 2.0, 2.4, 3.0 vCPU
+- Maximum tier 3840 MB (3.0 vCPU); 4096 MB not tested (same 3.2 vCPU
+  cap, no information gain)
+- 10 paired (cold + warm) cycles per tier
+- Run on multi-node cluster (matches our production-like environment)
+
+### Amdahl validation criteria (after extended sweep)
+
+The Amdahl fit must meet:
+- Per-stage warm RMS relative error < 3% across all 9 tiers
+- Cold overhead is roughly constant across tiers (stays within ±20%
+  of overall mean)
+
+If the fit does not meet this criterion:
+- Fallback to a piecewise-segmented model with break points at
+  cpu = 1.0 (workers=1 cap) and cpu = 2.0 (workers=2 transition)
+- Each segment fits its own (S, P, C) parameters
+- The C term may legitimately be non-zero in segments where one
+  component (e.g., IO) becomes dominant
+
+This validation is mandatory before path 3 planning begins.
+
 ---
 
 ## 8. Delay Kernel: Demoted Role
@@ -565,20 +598,39 @@ We can now state with empirical backing:
 Path 2 closed-form risk model is validated for use in path 3 (multi-SLO
 planning and dynamic plan adjustment).
 
-### SLO target recalibration
+### SLO target recalibration (process, 2026-05-28)
 
 The original SLO targets (premium=20s, free=25s) were calibrated against
 single-node performance. Multi-node + lower keepalive makes the workflow
 faster overall, so these SLOs are now too lax to differentiate plans.
 
-New SLO target ranges (to be finalized in path 3):
-- Premium (strict): ~17s (covers all_warm p95 ~17.5s)
-- Free (lax): ~19-20s (tolerates partial_cold)
+**SLO decision process (locked in):**
+1. Run extended sweep (9 tiers) on multi-node cluster
+2. Re-fit Amdahl model on full data; verify RMS < 3% per stage
+3. List per-tier warm/cold E2E mean and p95 from sweep
+4. Estimate partial_cold E2E per tier (warm path + ~2s entry cold overhead)
+5. Assistant proposes premium and free SLO targets with target violation
+   rates, based on which tier each class should run at
+6. Owner reviews and confirms SLO numbers
+7. SLO numbers are written into this document (replacing the old 20s/25s)
+8. Path 3 implementation begins
 
-Workflow latency distribution under multi-node:
+Constraints on SLO selection:
+- Premium uses a higher memory tier than free (more cost, faster)
+- Free uses a lower memory tier (cheaper, possibly slower)
+- Both must be achievable with the planner's mechanisms (resource sizing
+  + entry prewarm + JIT)
+- SLO targets must NOT be so loose that any baseline trivially passes
+  (would erase planning benefit)
+- SLO targets must NOT be so tight that even the most expensive tier
+  fails (would make problem infeasible)
+
+Initial workflow latency distribution under multi-node (1280 MB, keepalive=10s):
 - all_warm: mean 15.18s, p95 17.52s, p99 17.94s
 - partial_cold: mean 17.85s, p95 21.86s
 - all_cold: mean 25.63s
+
+These will be updated with multi-tier data after the extended sweep.
 
 When the second node is added:
 1. Verify OpenWhisk uses multi-invoker mode (one invoker per node)
@@ -766,6 +818,14 @@ P4 deliverables:
     * No "downstream extra prewarm" defense (rely on JIT)
     * Dynamic plan as recovery mechanism for entry cold events
   Created `docs/ANALYTICAL_RISK_MODEL.md` with closed-form math details.
+- 2026-05-28 (path 3 design alignment): Aligned 9 key design decisions
+  for path 3 multi-SLO planner: (A1) Amdahl RMS < 3% validation,
+  (A2) piecewise segmented fallback, (A3) max 3 vCPU tier (3840 MB),
+  (A4) sweep→Amdahl→SLO flow, (A5) brute force time test first,
+  (A6) per-class action tiers, (A7) greedy start cheap climb up,
+  (A8) stop at SLO target, (A9) incremental greedy for dynamic plan.
+  Extended sweep specification: 9 tiers (512-3840 MB). Created
+  docs/PATH3_PLANNER_DESIGN.md.
 - 2026-05-28 (R5 path 2 validated on multi-node): Added 2 worker
   nodes, re-ran 60-min trace with keepalive=10s. Stage correlation
   ρ dropped from 0.66 (single-node) to 0.002 (multi-node), confirming

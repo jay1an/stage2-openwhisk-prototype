@@ -1,0 +1,390 @@
+# Path 3: Multi-SLO Planner + Dynamic Plan Design
+
+This document specifies the design for path 3: multi-SLO offline planner,
+dynamic plan adjustment, JIT prewarm daemon, and entry prewarm daemon.
+
+Companion documents:
+- `ARCHITECTURE_DECISIONS.md` - high-level alignment
+- `ANALYTICAL_RISK_MODEL.md` - path 2 closed-form risk model (used by planner)
+
+---
+
+## 1. Multi-SLO Architecture
+
+### SLO classes
+
+For first version: two classes.
+- **Premium**: tight SLO target, higher memory tier per stage, aggressive
+  entry prewarm
+- **Free**: looser SLO target, lower memory tier per stage, lazy entry
+  prewarm
+
+Exact SLO numbers TBD after extended sweep + Amdahl validation.
+
+### Resource isolation per SLO class
+
+Decision (locked in 2026-05-28): **Different SLO classes use different
+memory tiers**, requiring **per-tier action variants**.
+
+OpenWhisk action variants are deployed per memory tier:
+```
+wf_civic_detect_object_512, wf_civic_detect_object_768, ...,
+wf_civic_detect_object_3840
+(× 5 stages × 9 tiers = 45 action variants)
+```
+
+The planner outputs:
+- For premium class: which tier variant each stage uses
+- For free class: which tier variant each stage uses
+
+At dispatch time, client routes a workflow request to the variant
+corresponding to its SLO class's plan.
+
+### Why per-class tiers (vs single shared tier)
+
+Pros of per-class tiers:
+- Premium can have higher resource without forcing free to overpay
+- Cost differentiation is meaningful
+- Matches real multi-tenant FaaS billing models
+
+Cons:
+- More action variants to deploy (45 instead of 5)
+- More complex dispatching
+
+Decision: per-class tiers is worth the complexity for the differentiation.
+
+---
+
+## 2. Planner Decision Space (per SLO class)
+
+### Decision variables
+
+Per SLO class, the planner outputs:
+```
+plan = {
+    memory_tier_per_stage: dict[stage_name, int],   # 9 tiers possible
+    entry_prewarm_safety_factor: float,             # 5 values: 0, 0.5, 1.0, 1.5, 2.0
+}
+```
+
+The `entry_prewarm_safety_factor` is the multiplier on the predicted
+entry arrivals to determine how many warm containers to prepare:
+```
+prewarm_count(t) = ceil(safety_factor × predicted_arrivals(t))
+```
+
+The arrival prediction itself comes from Stage 2 forecaster, NOT the
+planner. The planner only decides the safety_factor.
+
+### Search space size
+
+- Memory tiers: 9 options per stage, 5 stages → 9^5 = 59049 combinations
+- Safety factor: 5 values
+- Per SLO class: 59049 × 5 = **295,245 candidate plans**
+
+For 2 SLO classes (independent search), total = 590,490 plans.
+
+### Plan evaluation
+
+Each plan evaluation uses path 2's `compute_plan_risk()`:
+- Input: plan, predicted arrival rate, SLO target
+- Output: predicted P(E2E > SLO), expected cost
+- Time: ~microseconds per evaluation
+
+Total brute force time per SLO class:
+- 295,245 plans × ~10 µs/plan ≈ 3 seconds
+
+**Plan to start by trial-running a small subset** (say 1000 plans) to
+measure actual eval time, then estimate full brute force runtime.
+
+---
+
+## 3. Algorithm: Risk-Budgeted Greedy with Marginal Analysis
+
+This is the core algorithm for path 3, both for offline planning and
+online dynamic plan recovery.
+
+### Offline mode (initial plan per SLO class)
+
+```python
+def risk_budgeted_greedy(
+    slo_ms: float,
+    target_violation_rate: float,
+    initial_plan: Plan = None,
+) -> Plan:
+    """
+    Find the cheapest plan that achieves P(E2E > SLO) <= target_violation.
+    Start from the cheapest plan, greedily upgrade to reduce risk.
+    """
+    if initial_plan is None:
+        # Cheapest starting point: all stages at minimum tier, no prewarm
+        plan = Plan(
+            memory_tier_per_stage={s: 512 for s in stages},
+            entry_prewarm_safety_factor=0.0,
+        )
+    else:
+        plan = initial_plan  # For dynamic plan: start from current
+    
+    while True:
+        current_risk = compute_plan_risk(plan, slo_ms).p_violation_total
+        if current_risk <= target_violation_rate:
+            return plan   # SLO met, stop (A8: 达到 SLO 就停)
+        
+        # Generate all single-step upgrade candidates
+        candidates = []
+        for stage in stages:
+            next_tier = next_higher_tier(plan.memory_tier_per_stage[stage])
+            if next_tier is not None:
+                new_plan = plan.with_tier(stage, next_tier)
+                candidates.append(new_plan)
+        if plan.entry_prewarm_safety_factor < MAX_SAFETY_FACTOR:
+            new_plan = plan.with_higher_safety_factor()
+            candidates.append(new_plan)
+        
+        if not candidates:
+            # No more upgrades possible, plan infeasible
+            return plan  # caller checks risk vs target
+        
+        # Score each candidate by marginal efficiency
+        best_candidate = None
+        best_efficiency = -1
+        for cand in candidates:
+            new_risk = compute_plan_risk(cand, slo_ms).p_violation_total
+            new_cost = compute_plan_cost(cand)
+            old_cost = compute_plan_cost(plan)
+            
+            risk_reduction = current_risk - new_risk
+            cost_increase = new_cost - old_cost
+            
+            if cost_increase > 0:
+                efficiency = risk_reduction / cost_increase
+            else:
+                efficiency = float('inf')  # Free upgrade
+            
+            if efficiency > best_efficiency:
+                best_efficiency = efficiency
+                best_candidate = cand
+        
+        # Apply the best single-step upgrade
+        plan = best_candidate
+    # Loop continues until SLO met or no more upgrades
+```
+
+Greedy direction: **start cheap, climb up** (A7 confirmed).
+
+Stop condition: **risk <= target_violation_rate** (A8 confirmed).
+
+### Online mode (dynamic plan recovery)
+
+When a workflow's entry stage completes and the observed actual latency
+suggests SLO is at risk, the planner runs INCREMENTALLY from the current
+plan:
+
+```python
+def dynamic_plan_recovery(
+    current_plan: Plan,
+    workflow_state: WorkflowState,  # observed times so far
+    slo_ms: float,
+    target_violation_rate: float,
+) -> Plan | None:
+    # Compute remaining SLO budget given observed times so far
+    remaining_budget_ms = slo_ms - workflow_state.elapsed_ms
+    
+    # Estimate residual risk under current plan + observed state
+    residual_risk = estimate_residual_risk(current_plan, workflow_state)
+    
+    if residual_risk <= target_violation_rate:
+        return None   # No change needed
+    
+    # Run greedy starting from CURRENT plan (incremental, A9 confirmed)
+    upgraded_plan = risk_budgeted_greedy(
+        slo_ms=remaining_budget_ms + workflow_state.elapsed_ms,
+        target_violation_rate=target_violation_rate,
+        initial_plan=current_plan,
+    )
+    
+    # Only return changes for stages that haven't started yet
+    return diff_plan(current_plan, upgraded_plan,
+                     only_stages=workflow_state.pending_stages)
+```
+
+Incremental greedy means: start from the current plan and only consider
+upgrades. This is faster than re-planning from scratch (~few iterations
+instead of full convergence).
+
+### Complexity
+
+Offline greedy:
+- Iterations: bounded by total decision variable steps
+  - Per stage tier upgrades: 8 tiers - 1 = 8 max iterations
+  - Safety factor: 4 max iterations
+  - Total iterations: <= 8 × 5 + 4 = 44
+- Candidates per iteration: 5 tier upgrades + 1 safety upgrade = 6
+- Risk evaluations per iteration: 6 × ~10 µs = 60 µs
+- **Total time per SLO class: ~3 ms**
+
+Online dynamic recovery:
+- Starts from current plan, typically 1-3 iterations
+- Total time: <1 ms
+
+---
+
+## 4. Brute Force Baseline (for validation)
+
+To verify the greedy algorithm's optimality, run a brute force baseline
+that enumerates all 295k plans:
+
+For each plan:
+- Evaluate risk via path 2
+- Record cost
+Identify the cheapest plan with risk <= target.
+
+Compare brute force result to greedy result:
+- If greedy plan == brute force plan: greedy is optimal for this case
+- If greedy cost > brute force cost: report the gap
+
+Decision (A5): **First measure actual eval time on a small subset before
+committing to full brute force**. If brute force takes too long, scale
+back to a sampled grid (e.g., 10k random plans) and use that as the
+oracle.
+
+---
+
+## 5. Action Variant Deployment (required infrastructure)
+
+The per-class tier strategy requires action variants to be deployed.
+
+### Deployment plan
+
+For each of 5 stages × 9 tiers = **45 action variants**:
+```
+wf_civic_detect_object_{512,768,1024,1280,1536,2048,2560,3072,3840}
+wf_civic_estimate_pose_{...}
+wf_civic_match_face_{...}
+wf_civic_classify_scene_{...}
+wf_civic_translate_alert_{...}
+```
+
+Existing `scripts/deploy_workflow_action_variants.py` may handle this;
+verify before sweep starts.
+
+### Dispatching
+
+Client-side workflow runner (in path 3) must route invocations to the
+correct variant based on:
+- The SLO class of the request
+- The plan's memory tier for this stage in this class
+
+This is a small extension to `runner/workflow.py` and `runner/run_workflow.py`.
+
+---
+
+## 6. Validation Strategy
+
+Path 3 validation has three layers:
+
+### Layer 1: Algorithm correctness (offline)
+- Greedy returns a plan with predicted risk <= target
+- Brute force comparison: greedy is at most X% more expensive than optimal
+- Sanity: as target_violation_rate decreases, plan cost increases monotonically
+
+### Layer 2: Multi-SLO interaction (offline)
+- Premium and free plans are independently computed
+- No constraint violation between classes (since they use different action
+  variants, no resource conflict)
+- Cost ratio premium/free should be > 1 (premium pays more)
+
+### Layer 3: End-to-end real-cluster (online, later)
+- Run multi-SLO trace replay with computed plans
+- Measure actual violation rates per class
+- Compare to predicted (target ±2pp acceptance)
+
+Layer 3 requires JIT prewarm daemon + entry prewarm daemon + client SLO
+queue, all of which come in later subtasks of path 3.
+
+---
+
+## 7. Implementation Plan (codex tasks)
+
+Path 3 subtasks (in execution order):
+
+### Subtask P3.0: Extended sweep
+- Run sweep across 9 tiers on multi-node cluster
+- Output: `reports/civic_memory_cpu_sweep_multinode_9tier/`
+
+### Subtask P3.1: Amdahl re-fit
+- Re-fit Amdahl model on extended sweep data
+- Validate: RMS < 3% per stage warm
+- If validation fails: fit piecewise segmented model
+- Output: `reports/stage6_amdahl_model_extended/`
+
+### Subtask P3.2: SLO targets
+- Assistant proposes SLO numbers based on Amdahl + sweep data
+- Owner confirms
+- Update `ARCHITECTURE_DECISIONS.md` Section 9
+
+### Subtask P3.3: Action variants
+- Verify `scripts/deploy_workflow_action_variants.py` deploys all 45 variants
+- Or extend it to do so
+- Smoke test: invoke one variant per tier
+
+### Subtask P3.4: Multi-SLO planner (greedy)
+- Implement `runner/stage5_control/multi_slo_planner.py`
+  with risk_budgeted_greedy() function
+- Smoke test: produce premium and free plans, print summary
+- Output: `reports/path3_planner/`
+
+### Subtask P3.5: Brute force baseline
+- Implement enumeration baseline
+- Compare greedy vs brute force on representative SLO targets
+- Report greedy optimality gap
+
+### Subtask P3.6: Dynamic plan recovery (offline simulation)
+- Implement incremental greedy for dynamic recovery
+- Simulate "entry cold detected → trigger recovery" scenarios
+- Measure recovery effectiveness vs do-nothing baseline
+
+### Subtask P3.7: JIT prewarm daemon
+- Implement online JIT warmup trigger
+- Uses per-stage warm duration prediction + 2σ safety margin
+- Tested on cluster
+
+### Subtask P3.8: Entry prewarm daemon
+- Implement window-based entry prewarming
+- Uses Stage 2 forecaster output
+- Tested on cluster
+
+### Subtask P3.9: Client SLO priority queue
+- Implement slack-based reordering at client
+- Optional for first paper version
+
+### Subtask P3.10: End-to-end multi-SLO evaluation
+- Run multi-SLO trace replay
+- Measure violation rates and costs
+- Compare against baselines (Scale-To-Zero, Always-Warm)
+
+Each subtask is 1-3 days codex work + verification.
+
+---
+
+## 8. Open Questions (still pending owner input)
+
+None at the moment. All key decisions aligned 2026-05-28.
+
+Decisions reference:
+- A1: Amdahl validation RMS < 3% ✓
+- A2: Fallback to piecewise segmented model ✓
+- A3: Max 3 vCPU (3840 MB max tier) ✓
+- A4: Sweep → Amdahl → SLO proposal → confirm → doc flow ✓
+- A5: Test brute force timing before committing ✓
+- A6: Per-class tiers, requires action variants ✓
+- A7: Greedy starts cheap, climbs up ✓
+- A8: Stop at SLO violation rate target ✓
+- A9: Dynamic plan reuses greedy incrementally ✓
+
+---
+
+## Changelog
+
+- 2026-05-28: Initial document. All design decisions for path 3 captured
+  here pending extended sweep results and SLO finalization.
