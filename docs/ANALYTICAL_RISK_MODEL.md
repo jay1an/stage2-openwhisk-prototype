@@ -411,6 +411,77 @@ Each task is 1-2 days of codex work, with verification.
 
 ---
 
+## 9.5 Two Risk Computation Modes (IMPORTANT: do not conflate)
+
+There are two distinct risk computation modes in the codebase. They
+model DIFFERENT systems and produce DIFFERENT numbers. Conflating them
+causes confusion (as happened during P3.1-apply review).
+
+### Mode 1: no-JIT validation mode
+
+Used by R4/R5 validation scripts (run_r4_path2_validation.py,
+run_r5_multinode_validation.py).
+
+- Models the CURRENT real system, which has NO JIT prewarming
+- Each workflow's actual cold/warm pattern is taken from the trace
+- Downstream stages CAN be cold (full partial_cold cascades happen)
+- Aggregates per-workflow E2E from the observed cold/warm bits
+- This is what we VALIDATE against real measured violation rates
+
+R5 result at SLO=20s, 1280 MB multi-node:
+- observed violation: 1.84%
+- predicted violation: 2.74%
+- error 0.89pp (PASS, validates the model math)
+
+### Mode 2: JIT plan-risk mode
+
+Used by compute_plan_risk() in plan_risk.py, consumed by the path 3
+planner.
+
+- Models the SYSTEM WE WILL DEPLOY, which HAS JIT prewarming
+- Assumes JIT hides downstream cold starts (p_downstream_cold ≈ 0)
+- Only the entry stage can be cold (p_entry_cold)
+- Two-scenario mixture: entry-warm vs entry-cold (downstream always warm)
+
+compute_plan_risk result at SLO=20s, 1280 MB:
+- R5 multi-node params: 0.41% violation
+- This is LOWER than the no-JIT 1.84% BECAUSE JIT eliminates downstream
+  cold starts. This is the expected benefit of JIT.
+
+### Why they differ and why that is correct
+
+```
+no-JIT (Mode 1):  P(violation) higher because downstream cold cascades
+                  occur and inflate E2E latency
+with-JIT (Mode 2): P(violation) lower because JIT hides downstream cold,
+                   leaving only entry cold as a risk source
+```
+
+The difference 1.84% → 0.41% quantifies the JIT benefit at the modeling
+level. Mode 1 validates that our distributions and aggregation math are
+correct (vs real measurements). Mode 2 uses those validated distributions
+to predict the deployed system's performance.
+
+### Rule for using these modes
+
+- For VALIDATION against real (no-JIT) traces: use Mode 1
+- For PLANNING the deployed (with-JIT) system: use Mode 2
+- NEVER compare a Mode 2 number directly to a Mode 1 measurement
+- The path 3 planner uses Mode 2 exclusively
+- The R4/R5 validation reports use Mode 1 exclusively
+
+### Always use R5 multi-node params, not R1 single-node params
+
+R1 fitted lognormal sigma ≈ 0.033 (single-node, low variance).
+R5 refitted sigma ≈ 0.108 (multi-node, node-assignment variance).
+
+The deployed system is multi-node, so the planner MUST use the R5
+multi-node lognormal parameters
+(reports/path2_lognormal_fit_multinode/). Using R1 single-node params
+would drastically underestimate variance (and thus risk).
+
+---
+
 ## 10. Out of scope (deferred to v2)
 
 - Bayesian state inference (decided: closed-form is sufficient)

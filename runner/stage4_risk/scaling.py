@@ -1,12 +1,37 @@
-"""Resource scaling helpers for analytical plan-risk evaluation."""
+"""Resource scaling helpers for path-2 risk estimates.
+
+The current production scaling path uses the D3 cubic-spline model selected in
+P3.1-retry.  The spline predicts per-stage warm action duration from the
+extended 9-tier sweep.  Cold dispatch latency is modeled as warm action time
+plus the cleansed per-tier cold overhead.
+"""
 
 from __future__ import annotations
 
 import math
+import pickle
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
-from runner.stage4_risk.dag_aggregation import LogNormalParams
+from .dag_aggregation import LogNormalParams
+
+
+DEFAULT_WARM_SPLINES = "reports/stage6_resource_models_v2/per_stage_warm_splines.pkl"
+DEFAULT_COLD_OVERHEAD = "reports/stage6_resource_models_v2/cold_overhead_cleansed.csv"
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _resolve_path(path: str | Path) -> Path:
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate
+    return _project_root() / candidate
 
 
 def memory_to_cpu_cores(
@@ -16,86 +41,203 @@ def memory_to_cpu_cores(
     max_millicpus: int = 3200,
 ) -> float:
     """OpenWhisk CPU scaling: cpu = min(max, base * ceil(memory/step)) / 1000."""
+
     if memory_mb <= 0:
         raise ValueError(f"memory_mb must be positive, got {memory_mb}")
     if base_millicpus <= 0 or step_memory_mb <= 0 or max_millicpus <= 0:
         raise ValueError("CPU scaling constants must be positive")
-    steps = math.ceil(float(memory_mb) / float(step_memory_mb))
-    millicpus = min(int(max_millicpus), int(base_millicpus) * steps)
-    return float(millicpus) / 1000.0
+
+    steps = math.ceil(memory_mb / step_memory_mb)
+    millicpus = min(max_millicpus, base_millicpus * steps)
+    return millicpus / 1000.0
 
 
-def amdahl_predict_mean(stage_name: str, cpu_cores: float, amdahl_params: pd.DataFrame) -> float:
-    """Predict mean action_duration_ms at a CPU tier using fitted Amdahl params."""
-    if cpu_cores <= 0.0 or not math.isfinite(cpu_cores):
-        raise ValueError(f"cpu_cores must be positive and finite, got {cpu_cores}")
-    required = {"stage_name", "S_ms", "P_ms", "C_ms"}
-    missing = sorted(required.difference(amdahl_params.columns))
+@lru_cache(maxsize=None)
+def load_warm_splines(path: str | Path = DEFAULT_WARM_SPLINES) -> dict[str, Any]:
+    """Load per-stage warm CubicSpline objects from the P3.1-retry artifact."""
+
+    resolved = _resolve_path(path)
+    with resolved.open("rb") as f:
+        payload = pickle.load(f)
+    if isinstance(payload, dict) and "splines" in payload:
+        return payload["splines"]
+    if isinstance(payload, dict):
+        return payload
+    raise ValueError(f"Unsupported warm spline artifact format: {resolved}")
+
+
+@lru_cache(maxsize=None)
+def load_cleansed_cold_overhead(
+    path: str | Path = DEFAULT_COLD_OVERHEAD,
+) -> dict[tuple[str, int], float]:
+    """Load cleansed cold overhead values keyed by ``(stage_name, tier_mb)``."""
+
+    resolved = _resolve_path(path)
+    df = pd.read_csv(resolved)
+    required = {"stage_name", "tier_mb", "cleansed_cold_overhead_ms"}
+    missing = required - set(df.columns)
     if missing:
-        raise ValueError(f"amdahl_params missing required columns: {missing}")
+        raise ValueError(f"{resolved} is missing columns: {sorted(missing)}")
+    return {
+        (str(row["stage_name"]), int(row["tier_mb"])): float(
+            row["cleansed_cold_overhead_ms"]
+        )
+        for _, row in df.iterrows()
+    }
 
-    row = amdahl_params[amdahl_params["stage_name"] == stage_name]
+
+def spline_predict_warm_mean(
+    stage_name: str,
+    cpu_cores: float,
+    splines: dict[str, Any],
+) -> float:
+    """Predict warm action duration in ms using the selected D3 spline."""
+
+    if stage_name not in splines:
+        raise KeyError(f"No warm spline found for stage {stage_name!r}")
+    spline = splines[stage_name]
+    if hasattr(spline, "x"):
+        min_cpu = float(spline.x[0])
+        max_cpu = float(spline.x[-1])
+        if cpu_cores < min_cpu or cpu_cores > max_cpu:
+            raise ValueError(
+                f"cpu_cores={cpu_cores:.3f} for {stage_name} is outside "
+                f"the fitted spline range [{min_cpu:.3f}, {max_cpu:.3f}]"
+            )
+    prediction = float(spline(cpu_cores))
+    if prediction <= 0:
+        raise ValueError(
+            f"Spline predicted non-positive warm mean for {stage_name}: {prediction}"
+        )
+    return prediction
+
+
+def cold_overhead_for_tier(
+    stage_name: str,
+    memory_mb: int,
+    cold_overhead_table: dict[tuple[str, int], float],
+) -> float:
+    """Look up cleansed cold overhead in ms for the exact stage/tier pair."""
+
+    key = (stage_name, int(memory_mb))
+    if key not in cold_overhead_table:
+        available = sorted(tier for stage, tier in cold_overhead_table if stage == stage_name)
+        raise KeyError(
+            f"No cleansed cold overhead for {stage_name!r} at {memory_mb} MB; "
+            f"available tiers: {available}"
+        )
+    value = float(cold_overhead_table[key])
+    if value < 0:
+        raise ValueError(f"Cold overhead for {stage_name} at {memory_mb} MB is negative")
+    return value
+
+
+def amdahl_predict_mean(
+    stage_name: str,
+    cpu_cores: float,
+    amdahl_params: pd.DataFrame,
+) -> float:
+    """Deprecated: use :func:`spline_predict_warm_mean` instead."""
+
+    row = amdahl_params.loc[amdahl_params["stage_name"] == stage_name]
     if row.empty:
-        raise ValueError(f"missing Amdahl params for stage={stage_name}")
-    if len(row) > 1:
-        raise ValueError(f"duplicate Amdahl params for stage={stage_name}")
+        raise KeyError(f"No Amdahl params found for stage {stage_name!r}")
+    params = row.iloc[0]
+    s_ms = float(params["S_ms"])
+    p_ms = float(params["P_ms"])
+    c_ms = float(params["C_ms"])
+    w_eff = float(params.get("W_eff_breakpoint", params.get("W_eff", 1.0)))
+    return s_ms / min(cpu_cores, 1.0) + p_ms / min(cpu_cores, w_eff) + c_ms
 
-    row0 = row.iloc[0]
-    s_ms = float(row0["S_ms"])
-    p_ms = float(row0["P_ms"])
-    c_ms = float(row0["C_ms"])
-    if "W_eff_breakpoint" in amdahl_params.columns:
-        w_eff = float(row0["W_eff_breakpoint"])
-    elif "W_eff" in amdahl_params.columns:
-        w_eff = float(row0["W_eff"])
-    else:
-        w_eff = max(1.0, math.floor(cpu_cores))
-    w_eff = max(1.0, w_eff)
 
-    serial_divisor = min(cpu_cores, 1.0)
-    parallel_divisor = min(cpu_cores, w_eff)
-    predicted = s_ms / serial_divisor + p_ms / parallel_divisor + c_ms
-    if predicted <= 0.0 or not math.isfinite(predicted):
-        raise ValueError(f"invalid Amdahl prediction for stage={stage_name}: {predicted}")
-    return float(predicted)
+def scale_lognormal_warm(
+    base_params: LogNormalParams,
+    target_warm_mean: float,
+) -> LogNormalParams:
+    """Scale a lognormal to a target mean while keeping CV constant."""
+
+    if target_warm_mean <= 0:
+        raise ValueError(f"target_warm_mean must be positive, got {target_warm_mean}")
+    sigma = float(base_params.sigma)
+    mu_new = math.log(target_warm_mean) - sigma**2 / 2.0
+    return LogNormalParams(mu=mu_new, sigma=sigma)
 
 
 def scale_lognormal(base_params: LogNormalParams, target_mean: float) -> LogNormalParams:
-    """Scale a lognormal to a target mean while keeping CV constant."""
-    if target_mean <= 0.0 or not math.isfinite(target_mean):
-        raise ValueError(f"target_mean must be positive and finite, got {target_mean}")
-    sigma = base_params.sigma
-    mu = math.log(float(target_mean)) - (sigma**2) / 2.0
-    return LogNormalParams(mu=mu, sigma=sigma)
+    """Backward-compatible alias for CV-constant lognormal scaling."""
+
+    return scale_lognormal_warm(base_params, target_mean)
+
+
+def _require_params(
+    *,
+    stage_name: str,
+    latency_class: str,
+    base_params: LogNormalParams | None,
+    base_params_warm: LogNormalParams | None,
+    base_params_cold: LogNormalParams | None,
+) -> LogNormalParams:
+    if latency_class == "warm":
+        params = base_params_warm or base_params
+    else:
+        params = base_params_cold or base_params
+    if params is None:
+        raise ValueError(
+            f"Missing base lognormal params for {stage_name!r} latency class "
+            f"{latency_class!r}"
+        )
+    return params
 
 
 def scale_stage_for_memory_tier(
     stage_name: str,
     latency_class: str,
     target_memory_mb: int,
-    base_memory_mb: int,
-    base_params: LogNormalParams,
-    amdahl_params: pd.DataFrame,
+    base_memory_mb: int = 1280,
+    base_params: LogNormalParams | None = None,
+    amdahl_params: pd.DataFrame | None = None,
     cold_overhead_ms: float | None = None,
+    *,
+    base_params_warm: LogNormalParams | None = None,
+    base_params_cold: LogNormalParams | None = None,
+    splines: dict[str, Any] | None = None,
+    cold_overhead_table: dict[tuple[str, int], float] | None = None,
 ) -> LogNormalParams:
-    """Scale a stage lognormal from base memory to target memory.
+    """Produce a stage lognormal at ``target_memory_mb`` using D3 scaling.
 
-    Warm dispatch latency is scaled by the action-duration Amdahl ratio.
-    Cold dispatch latency is split into a CPU-scaled action component and a
-    CPU-independent cold-overhead component when cold_overhead_ms is supplied.
+    ``latency_class`` accepts ``warm``, ``cold``, or ``cold_like``.  The legacy
+    Amdahl arguments are retained for callers that still pass the old R3 API;
+    they are intentionally ignored by the D3 path.
     """
-    base_cpu = memory_to_cpu_cores(base_memory_mb)
-    target_cpu = memory_to_cpu_cores(target_memory_mb)
-    base_action_mean = amdahl_predict_mean(stage_name, base_cpu, amdahl_params)
-    target_action_mean = amdahl_predict_mean(stage_name, target_cpu, amdahl_params)
-    ratio = target_action_mean / base_action_mean
 
-    base_dispatch_mean = base_params.mean
-    if str(latency_class) == "warm" or cold_overhead_ms is None:
-        target_dispatch_mean = base_dispatch_mean * ratio
-    else:
-        overhead = max(0.0, float(cold_overhead_ms))
-        overhead = min(overhead, base_dispatch_mean * 0.95)
-        base_action_part = max(1e-9, base_dispatch_mean - overhead)
-        target_dispatch_mean = overhead + base_action_part * ratio
-    return scale_lognormal(base_params, target_dispatch_mean)
+    del base_memory_mb, amdahl_params, cold_overhead_ms
+
+    class_key = "cold" if latency_class == "cold_like" else latency_class
+    if class_key not in {"warm", "cold"}:
+        raise ValueError(f"Unknown latency_class: {latency_class}")
+
+    splines = splines or load_warm_splines()
+    cold_overhead_table = cold_overhead_table or load_cleansed_cold_overhead()
+
+    target_cpu = memory_to_cpu_cores(target_memory_mb)
+    target_warm_mean = spline_predict_warm_mean(stage_name, target_cpu, splines)
+
+    if class_key == "warm":
+        params = _require_params(
+            stage_name=stage_name,
+            latency_class=class_key,
+            base_params=base_params,
+            base_params_warm=base_params_warm,
+            base_params_cold=base_params_cold,
+        )
+        return scale_lognormal_warm(params, target_warm_mean)
+
+    params = _require_params(
+        stage_name=stage_name,
+        latency_class=class_key,
+        base_params=base_params,
+        base_params_warm=base_params_warm,
+        base_params_cold=base_params_cold,
+    )
+    cold_oh = cold_overhead_for_tier(stage_name, target_memory_mb, cold_overhead_table)
+    return scale_lognormal_warm(params, target_warm_mean + cold_oh)
