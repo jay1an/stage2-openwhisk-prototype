@@ -818,6 +818,13 @@ P4 deliverables:
     * No "downstream extra prewarm" defense (rely on JIT)
     * Dynamic plan as recovery mechanism for entry cold events
   Created `docs/ANALYTICAL_RISK_MODEL.md` with closed-form math details.
+- 2026-05-29 (path 3+ Bayesian adaptive risk design captured): Discussed
+  adding online Bayesian belief tracking as a path 3+ extension. Design
+  decisions: (1) sliding window 5s aggregate updates, (2) per-stage
+  independent Normal-in-log-space posteriors, (3) exponentially weighted
+  effective sample size (~100 effective observations). Captured in
+  PATH3_PLANNER_DESIGN.md Section 7.5. Deferred to after path 3 main
+  contributions are established; not a blocker.
 - 2026-05-28 (P3.1-retry, resource model selection): Tested three
   candidate models on the 9-tier multi-node sweep. D1 (power law)
   RMS 4.8-7.0% per stage; D2 (Amdahl with observed workers) RMS

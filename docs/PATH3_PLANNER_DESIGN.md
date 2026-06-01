@@ -535,6 +535,94 @@ Each subtask is 1-3 days codex work + verification.
 
 ---
 
+## 7.5 Path 3+: Bayesian Adaptive Risk Update (deferred, design captured)
+
+### Motivation
+
+Path 2's lognormal parameters (μ, σ) are fitted ONCE offline from a
+trace snapshot. The path 3 planner uses these static parameters for all
+future decisions.
+
+In production:
+- Stage latency distributions drift across hours / days (time-of-day,
+  network state, neighbor workload variance)
+- Static distributions may become inaccurate over long-running
+  deployments
+- Dynamic plan adjustment (P3.6) would benefit from current beliefs
+  about system state
+
+### Approach
+
+Treat per-stage warm latency as a Bayesian-tracked Normal in log-space
+(equivalent to lognormal tracking). Update belief online from observed
+stage completions.
+
+Mathematical foundation:
+- ln(L_stage) ~ Normal(μ, σ²) is conjugate to Normal observations
+- Closed-form posterior update for μ given new observations
+- σ² assumed fixed in v1 (could be Bayesian too, via Inverse-Gamma)
+
+### Design parameters (locked in 2026-05-29 discussion)
+
+**Update frequency**: sliding window of 5 seconds
+- All stage observations within the past 5s window are aggregated
+- One posterior update per stage per 5s window
+- Avoids per-observation overhead while staying reactive
+
+**Independence**: per-stage independent posteriors
+- 5 stages × 5 SLO classes = 25 independent Normal belief states
+- No cross-stage coupling needed (multi-node ρ ≈ 0 confirmed in R5)
+- Simplifies math significantly
+
+**Memory decay**: exponentially weighted posterior
+- Effective sample size capped to avoid the posterior becoming too
+  rigid against drift
+- Use a decay parameter λ such that observations from > N windows
+  ago have negligible influence
+- Concrete value of λ to be tuned; suggested initial: equivalent to
+  effective N = 100 observations (~8 minutes of sliding window)
+
+### Where it plugs into the system
+
+```
+Dynamic plan recovery (P3.6) currently uses:
+  static_lognormal_params -> predict residual risk -> trigger recovery
+
+With Bayesian update:
+  current_belief_params (updated online) -> predict residual risk
+  -> trigger recovery
+  Belief tracking happens cross-workflow, independent of any single
+  workflow's dynamic plan logic.
+```
+
+### Implementation order (Path 3+)
+
+Phase 1 (after path 3 is functionally complete):
+- Implement Bayesian belief tracker (per-stage Normal posterior)
+- Wire updates from observed stage completions
+- Replace static lognormal with current belief in risk evaluation
+- Keep static lognormal as fallback / oracle
+
+Phase 2 (research extension):
+- Validate that belief tracking improves SLO satisfaction under drift
+- Compare against static lognormal baseline on long-running traces
+- Paper contribution: "Online Bayesian belief tracking for serverless
+  adaptive risk planning"
+
+### Why this is deferred
+
+Path 3 currently aims to:
+- Validate the multi-SLO planning architecture
+- Show benefit of dynamic plan adjustment vs static plans
+- Establish baseline performance vs Scale-To-Zero / Always-Warm
+
+Bayesian belief tracking is orthogonal to all of the above. It can be
+added as a separate research increment after path 3's main results are
+established. Including it in path 3 would complicate the experimental
+setup without providing necessary value for the core contributions.
+
+---
+
 ## 8. Open Questions (still pending owner input)
 
 None at the moment. All key decisions aligned 2026-05-28.
