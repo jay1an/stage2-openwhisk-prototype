@@ -14,12 +14,18 @@ Companion documents:
 ### SLO classes
 
 For first version: two classes.
-- **Premium**: tight SLO target, higher memory tier per stage, aggressive
-  entry prewarm
-- **Free**: looser SLO target, lower memory tier per stage, lazy entry
-  prewarm
+- **Premium**: P(E2E > 15s) ≤ 5%. Tighter latency target; planner
+  typically upgrades critical-path stages and/or uses entry prewarm.
+- **Free**: P(E2E > 20s) ≤ 5%. Looser latency target; planner can use
+  cheaper tiers.
 
-Exact SLO numbers TBD after extended sweep + Amdahl validation.
+SLO numbers FINALIZED 2026-05-29 (see ARCHITECTURE_DECISIONS.md
+Section 9). Both classes share a 5% violation budget; differentiation
+is in the latency target (15s vs 20s).
+
+IMPORTANT: SLO is a CONSTRAINT, not a tier assignment. The planner
+independently chooses each stage's tier to satisfy the constraint at
+minimum cost. Per-stage tiers within a workflow may be heterogeneous.
 
 ### Resource isolation per SLO class
 
