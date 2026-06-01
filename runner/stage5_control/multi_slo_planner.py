@@ -58,6 +58,7 @@ DEFAULT_BASELINE_TRACE = (
     / "raw_trace.csv"
 )
 DEFAULT_OUT_DIR = Path(__file__).resolve().parents[2] / "reports" / "path3_planner"
+TIE_EPSILON = 1e-9
 
 
 @dataclass(frozen=True)
@@ -230,6 +231,30 @@ def _trace_step(step: int, action: str, evaluation: PlanEvaluation) -> GreedyTra
     )
 
 
+def _efficiency(delta: float, cost_delta: float) -> float:
+    if cost_delta <= 0.0:
+        return math.inf
+    return float(delta) / float(cost_delta)
+
+
+def _efficiency_bucket(value: float, epsilon: float = TIE_EPSILON) -> float:
+    if math.isinf(value):
+        return math.inf
+    return round(float(value) / epsilon) * epsilon
+
+
+def _candidate_sort_key(candidate: dict[str, Any], primary_delta_key: str) -> tuple[float, float, int]:
+    efficiency = _efficiency(
+        delta=float(candidate[primary_delta_key]),
+        cost_delta=float(candidate["cost_delta"]),
+    )
+    return (
+        -_efficiency_bucket(efficiency),
+        abs(float(candidate["cost_delta"])),
+        int(candidate["dag_order_index"]),
+    )
+
+
 def risk_budgeted_greedy(config: PlannerConfig, ref_data: ReferenceData) -> PlanResult:
     """Greedily upgrade tier/prewarm until the SLO risk constraint is met."""
 
@@ -242,6 +267,8 @@ def risk_budgeted_greedy(config: PlannerConfig, ref_data: ReferenceData) -> Plan
     if sorted(config.safety_factors) != list(config.safety_factors):
         raise ValueError("safety_factors must be sorted ascending")
 
+    dag_order = {stage_name: idx for idx, stage_name in enumerate(config.stages)}
+    safety_dag_order = len(config.stages)
     tier_state = {stage_name: 0 for stage_name in config.stages}
     safety_index = 0
 
@@ -283,6 +310,7 @@ def risk_budgeted_greedy(config: PlannerConfig, ref_data: ReferenceData) -> Plan
                     "action": action,
                     "tier_state": next_state,
                     "safety_index": safety_index,
+                    "dag_order_index": dag_order[stage_name],
                     "evaluation": new_eval,
                 }
             )
@@ -313,6 +341,7 @@ def risk_budgeted_greedy(config: PlannerConfig, ref_data: ReferenceData) -> Plan
                     "action": action,
                     "tier_state": dict(tier_state),
                     "safety_index": next_safety_index,
+                    "dag_order_index": safety_dag_order,
                     "evaluation": new_eval,
                 }
             )
@@ -324,19 +353,7 @@ def risk_budgeted_greedy(config: PlannerConfig, ref_data: ReferenceData) -> Plan
             candidate for candidate in candidates if candidate["risk_delta"] > 1e-12
         ]
         if risk_improving:
-            for candidate in risk_improving:
-                cost_delta = float(candidate["cost_delta"])
-                risk_delta = float(candidate["risk_delta"])
-                candidate["score"] = math.inf if cost_delta <= 1e-12 else risk_delta / cost_delta
-            risk_improving.sort(
-                key=lambda item: (
-                    item["score"],
-                    item["risk_delta"],
-                    -item["evaluation"].cost_gbsec,
-                    item["action"],
-                ),
-                reverse=True,
-            )
+            risk_improving.sort(key=lambda item: _candidate_sort_key(item, "risk_delta"))
             chosen = risk_improving[0]
         else:
             # At very slow tiers the violation probability can saturate at 1.0.
@@ -350,18 +367,8 @@ def risk_budgeted_greedy(config: PlannerConfig, ref_data: ReferenceData) -> Plan
             ]
             if not progress_improving:
                 break
-            for candidate in progress_improving:
-                cost_delta = float(candidate["cost_delta"])
-                progress_delta = float(candidate["progress_delta"])
-                candidate["score"] = math.inf if cost_delta <= 1e-12 else progress_delta / cost_delta
             progress_improving.sort(
-                key=lambda item: (
-                    item["score"],
-                    item["progress_delta"],
-                    -item["evaluation"].cost_gbsec,
-                    item["action"],
-                ),
-                reverse=True,
+                key=lambda item: _candidate_sort_key(item, "progress_delta")
             )
             chosen = progress_improving[0]
 
@@ -524,10 +531,11 @@ def _write_report(
     ref_data: ReferenceData,
 ) -> None:
     lines: list[str] = []
-    lines.append("# P3.4 Offline Multi-SLO Planner Report")
+    lines.append("# P3.5 Deterministic Offline Multi-SLO Planner Report")
     lines.append("")
     lines.append("## Setup")
     lines.append("- Planner: risk-budgeted greedy over stage memory tiers and entry prewarm safety factor.")
+    lines.append("- Tie-break: highest marginal efficiency, then smallest absolute cost increase, then earliest DAG stage; safety-factor upgrades are ordered last.")
     lines.append("- Risk model: `runner.stage4_risk.plan_risk.compute_plan_risk` with D3 spline scaling.")
     lines.append("- Lognormal params: `reports/path2_lognormal_fit_multinode/per_stage_lognormal_params.csv`.")
     lines.append(f"- Calibrated entry cold baseline: `{ref_data.p_baseline:.6f}`.")
