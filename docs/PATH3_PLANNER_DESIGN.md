@@ -233,6 +233,48 @@ Online dynamic recovery:
 - Starts from current plan, typically 1-3 iterations
 - Total time: <1 ms
 
+### Deterministic tie-breaking (added 2026-05-29)
+
+When two candidate upgrades have equal marginal efficiency
+(risk_reduction / cost_increase), the greedy must break ties
+deterministically for reproducibility and clean brute-force comparison.
+
+Tie-break order:
+1. Highest marginal efficiency (primary objective)
+2. If tied: smallest absolute cost_increase
+3. If still tied: stage earliest in DAG topological order, then
+   safety-factor upgrade last
+
+Rationale:
+- A true tie (equal risk reduction AND equal cost) means the choices
+  are genuinely equivalent for the final solution; deterministic order
+  only ensures reproducibility.
+- A pseudo-tie (equal risk reduction, different cost) is already
+  resolved by marginal efficiency favoring the lower-cost option.
+- The remaining ambiguity (truly identical) is resolved by DAG order.
+
+This does NOT guarantee global optimality (greedy is greedy). The
+P3.5 brute-force comparison quantifies the optimality gap. If the gap
+is significant (>10%), tie-breaking will be upgraded to lookahead or
+beam search.
+
+### Known open issue: entry prewarm dimension unused (P3.4 observation)
+
+In P3.4 results, premium plans for typical (arrivals=5) and burst
+(arrivals=15) scenarios were IDENTICAL, with entry_prewarm_safety_factor
+stuck at 0. The greedy solved the SLO entirely by upgrading memory tiers,
+never using entry prewarm.
+
+This suggests either:
+- The risk model's sensitivity to entry prewarm is too weak relative to
+  tier upgrades, OR
+- Entry cold contribution to risk is small enough that tier upgrades
+  dominate the marginal efficiency ranking
+
+Deferred for later investigation (after P3.5). The plan search method
+itself will also be revisited in detail. Logged here so it is not
+forgotten.
+
 ---
 
 ## 4. Brute Force Baseline (for validation)
