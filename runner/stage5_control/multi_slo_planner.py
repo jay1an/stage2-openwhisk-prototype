@@ -111,6 +111,16 @@ class PlanResult:
     feasible: bool
     iterations: int
     trace: list[GreedyTraceStep]
+    states_expanded: int = 0
+
+
+@dataclass(frozen=True)
+class BeamNode:
+    state_key: tuple[int, ...]
+    evaluation: PlanEvaluation
+    trace: tuple[GreedyTraceStep, ...]
+    last_action_group: str
+    last_action_order: int
 
 
 def _resolve(path: str | Path) -> Path:
@@ -222,6 +232,25 @@ def _state_to_memory(state: dict[str, int], tiers: list[int]) -> dict[str, int]:
     return {stage_name: int(tiers[tier_index]) for stage_name, tier_index in state.items()}
 
 
+def _key_to_memory(state_key: tuple[int, ...], config: PlannerConfig) -> dict[str, int]:
+    return {
+        stage_name: int(config.tiers[state_key[index]])
+        for index, stage_name in enumerate(config.stages)
+    }
+
+
+def _key_safety_index(state_key: tuple[int, ...]) -> int:
+    return int(state_key[-1])
+
+
+def _key_safety_factor(state_key: tuple[int, ...], config: PlannerConfig) -> float:
+    return float(config.safety_factors[_key_safety_index(state_key)])
+
+
+def _initial_state_key(config: PlannerConfig) -> tuple[int, ...]:
+    return tuple([0] * len(config.stages) + [0])
+
+
 def _trace_step(step: int, action: str, evaluation: PlanEvaluation) -> GreedyTraceStep:
     return GreedyTraceStep(
         step=step,
@@ -271,6 +300,7 @@ def risk_budgeted_greedy(config: PlannerConfig, ref_data: ReferenceData) -> Plan
     safety_dag_order = len(config.stages)
     tier_state = {stage_name: 0 for stage_name in config.stages}
     safety_index = 0
+    states_evaluated = 1
 
     current = evaluate_plan(
         config=config,
@@ -295,6 +325,7 @@ def risk_budgeted_greedy(config: PlannerConfig, ref_data: ReferenceData) -> Plan
                 memory_tier_per_stage=_state_to_memory(next_state, config.tiers),
                 safety_factor=config.safety_factors[safety_index],
             )
+            states_evaluated += 1
             risk_delta = current.violation_rate - new_eval.violation_rate
             progress_delta = (
                 current.risk_result.expected_e2e_ms
@@ -323,6 +354,7 @@ def risk_budgeted_greedy(config: PlannerConfig, ref_data: ReferenceData) -> Plan
                 memory_tier_per_stage=_state_to_memory(tier_state, config.tiers),
                 safety_factor=config.safety_factors[next_safety_index],
             )
+            states_evaluated += 1
             risk_delta = current.violation_rate - new_eval.violation_rate
             progress_delta = (
                 current.risk_result.expected_e2e_ms
@@ -388,6 +420,226 @@ def risk_budgeted_greedy(config: PlannerConfig, ref_data: ReferenceData) -> Plan
         feasible=current.violation_rate <= config.max_violation_rate,
         iterations=step,
         trace=trace,
+        states_expanded=states_evaluated,
+    )
+
+
+def _evaluate_state_key(
+    *,
+    state_key: tuple[int, ...],
+    config: PlannerConfig,
+    ref_data: ReferenceData,
+    eval_cache: dict[tuple[int, ...], PlanEvaluation],
+) -> PlanEvaluation:
+    if state_key not in eval_cache:
+        eval_cache[state_key] = evaluate_plan(
+            config=config,
+            ref_data=ref_data,
+            memory_tier_per_stage=_key_to_memory(state_key, config),
+            safety_factor=_key_safety_factor(state_key, config),
+        )
+    return eval_cache[state_key]
+
+
+def _successor_nodes(
+    *,
+    node: BeamNode,
+    config: PlannerConfig,
+    ref_data: ReferenceData,
+    eval_cache: dict[tuple[int, ...], PlanEvaluation],
+    expanded: set[tuple[int, ...]],
+) -> list[BeamNode]:
+    successors: list[BeamNode] = []
+    next_step = len(node.trace)
+
+    for stage_index, stage_name in enumerate(config.stages):
+        tier_index = node.state_key[stage_index]
+        if tier_index >= len(config.tiers) - 1:
+            continue
+        next_key_list = list(node.state_key)
+        next_key_list[stage_index] += 1
+        next_key = tuple(next_key_list)
+        if next_key in expanded:
+            continue
+        evaluation = _evaluate_state_key(
+            state_key=next_key,
+            config=config,
+            ref_data=ref_data,
+            eval_cache=eval_cache,
+        )
+        action = (
+            f"upgrade {stage_name} "
+            f"{config.tiers[tier_index]}->{config.tiers[tier_index + 1]}"
+        )
+        successors.append(
+            BeamNode(
+                state_key=next_key,
+                evaluation=evaluation,
+                trace=node.trace + (_trace_step(next_step, action, evaluation),),
+                last_action_group=stage_name,
+                last_action_order=stage_index,
+            )
+        )
+
+    safety_index = _key_safety_index(node.state_key)
+    if safety_index < len(config.safety_factors) - 1:
+        next_key_list = list(node.state_key)
+        next_key_list[-1] += 1
+        next_key = tuple(next_key_list)
+        if next_key not in expanded:
+            evaluation = _evaluate_state_key(
+                state_key=next_key,
+                config=config,
+                ref_data=ref_data,
+                eval_cache=eval_cache,
+            )
+            action = (
+                "increase entry safety "
+                f"{config.safety_factors[safety_index]}->{config.safety_factors[safety_index + 1]}"
+            )
+            successors.append(
+                BeamNode(
+                    state_key=next_key,
+                    evaluation=evaluation,
+                    trace=node.trace + (_trace_step(next_step, action, evaluation),),
+                    last_action_group="__safety__",
+                    last_action_order=len(config.stages),
+                )
+            )
+
+    return successors
+
+
+def _beam_rank_key(node: BeamNode, config: PlannerConfig) -> tuple[float, float, float, int, tuple[int, ...]]:
+    feasible = node.evaluation.violation_rate <= config.max_violation_rate
+    if feasible:
+        return (
+            0.0,
+            node.evaluation.cost_gbsec,
+            node.evaluation.violation_rate,
+            node.last_action_order,
+            node.state_key,
+        )
+    return (
+        1.0,
+        node.evaluation.violation_rate,
+        node.evaluation.cost_gbsec,
+        node.last_action_order,
+        node.state_key,
+    )
+
+
+def _select_diverse_beam(nodes: list[BeamNode], config: PlannerConfig, beam_width: int) -> list[BeamNode]:
+    ordered = sorted(nodes, key=lambda node: _beam_rank_key(node, config))
+    selected: list[BeamNode] = []
+    used_groups: set[str] = set()
+    for node in ordered:
+        if len(selected) >= beam_width:
+            break
+        if node.last_action_group in used_groups:
+            continue
+        selected.append(node)
+        used_groups.add(node.last_action_group)
+    for node in ordered:
+        if len(selected) >= beam_width:
+            break
+        if node in selected:
+            continue
+        selected.append(node)
+    return selected
+
+
+def beam_search_plan(
+    config: PlannerConfig,
+    ref_data: ReferenceData,
+    beam_width: int = 3,
+    max_iterations: int | None = None,
+) -> PlanResult:
+    """Beam-search variant of the risk-budgeted planner."""
+
+    if beam_width <= 0:
+        raise ValueError(f"beam_width must be positive, got {beam_width}")
+    if sorted(config.tiers) != list(config.tiers):
+        raise ValueError("tiers must be sorted ascending")
+    if sorted(config.safety_factors) != list(config.safety_factors):
+        raise ValueError("safety_factors must be sorted ascending")
+
+    if max_iterations is None:
+        max_iterations = (len(config.tiers) - 1) * len(config.stages) + (
+            len(config.safety_factors) - 1
+        )
+
+    eval_cache: dict[tuple[int, ...], PlanEvaluation] = {}
+    initial_key = _initial_state_key(config)
+    initial_eval = _evaluate_state_key(
+        state_key=initial_key,
+        config=config,
+        ref_data=ref_data,
+        eval_cache=eval_cache,
+    )
+    initial_node = BeamNode(
+        state_key=initial_key,
+        evaluation=initial_eval,
+        trace=(_trace_step(0, "init", initial_eval),),
+        last_action_group="__init__",
+        last_action_order=len(config.stages) + 1,
+    )
+
+    beam = [initial_node]
+    expanded: set[tuple[int, ...]] = set()
+    best_feasible: BeamNode | None = None
+    iterations = 0
+
+    for iteration in range(1, max_iterations + 1):
+        pooled: dict[tuple[int, ...], BeamNode] = {}
+        for node in beam:
+            expanded.add(node.state_key)
+            for successor in _successor_nodes(
+                node=node,
+                config=config,
+                ref_data=ref_data,
+                eval_cache=eval_cache,
+                expanded=expanded,
+            ):
+                existing = pooled.get(successor.state_key)
+                if existing is None or _beam_rank_key(successor, config) < _beam_rank_key(existing, config):
+                    pooled[successor.state_key] = successor
+
+        if not pooled:
+            break
+
+        successors = list(pooled.values())
+        for node in successors:
+            if node.evaluation.violation_rate <= config.max_violation_rate:
+                if best_feasible is None or (
+                    node.evaluation.cost_gbsec,
+                    node.evaluation.violation_rate,
+                    node.state_key,
+                ) < (
+                    best_feasible.evaluation.cost_gbsec,
+                    best_feasible.evaluation.violation_rate,
+                    best_feasible.state_key,
+                ):
+                    best_feasible = node
+
+        beam = _select_diverse_beam(successors, config, beam_width)
+        iterations = iteration
+
+    if best_feasible is not None:
+        best = best_feasible
+    else:
+        best = sorted(beam, key=lambda node: _beam_rank_key(node, config))[0]
+
+    return PlanResult(
+        memory_tier_per_stage=dict(best.evaluation.memory_tier_per_stage),
+        entry_prewarm_safety_factor=best.evaluation.safety_factor,
+        entry_prewarm_count=best.evaluation.entry_prewarm_count,
+        achieved_violation_rate=best.evaluation.violation_rate,
+        achieved_cost_gbsec=best.evaluation.cost_gbsec,
+        feasible=best.evaluation.violation_rate <= config.max_violation_rate,
+        iterations=iterations,
+        trace=list(best.trace),
+        states_expanded=len(eval_cache),
     )
 
 
