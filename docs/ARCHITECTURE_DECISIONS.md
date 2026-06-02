@@ -9,6 +9,8 @@ Companion documents:
 - `RELATED_WORK_AND_INNOVATION.md` - paper-by-paper analysis and innovation framing
 - `ANALYTICAL_RISK_MODEL.md` - path 2 closed-form risk model math
 - `PATH3_PLANNER_DESIGN.md` - path 3 multi-SLO planner + dynamic plan design
+- `PATH3_SYSTEM_EXECUTION.md` - path 3 runtime execution architecture
+  (JIT scheduler, dynamic adjustment, entry prewarm, race handling)
 - `STAGE_PIPELINE_AND_SERVER_MIGRATION.md` - operational/runtime notes
 - `CODE_STRUCTURE.md` - code layout
 
@@ -875,6 +877,23 @@ P4 deliverables:
     * No "downstream extra prewarm" defense (rely on JIT)
     * Dynamic plan as recovery mechanism for entry cold events
   Created `docs/ANALYTICAL_RISK_MODEL.md` with closed-form math details.
+- 2026-05-30 (system execution architecture finalized): Created
+  PATH3_SYSTEM_EXECUTION.md after several rounds of alignment. Key
+  decisions: (1) unified stage-START trigger for both dynamic and JIT;
+  (2) dynamic computed immediately at stage start, JIT warmup fired at
+  precise later time (avoid early waste); (3) JIT for a downstream stage
+  scheduled only when ALL its upstreams have started (race fix for
+  multi-upstream join — avoids firing on incomplete info); (4) JIT
+  scheduler is a single priority-queue background thread with upsert
+  (method B, not threading.Timer); (5) __warmup fast-return branch added
+  to action (only action-side change; OpenWhisk native prewarm only
+  pre-creates empty containers, can't warm a specific action); (6) entry
+  prewarm is an independent component (oracle predictor first, advanced
+  LSTM/selector later); (7) margin-window race accepted in v1, mitigated
+  by small margin + self-compensation + multi-node dispersion, will
+  intrude into invoker only if measured impact > ~5%. Build order:
+  P3.A __warmup, P3.B scheduler, P3.C JIT integration, P3.D dynamic,
+  P3.E entry prewarm oracle, P3.G end-to-end, P3.F advanced predictor.
 - 2026-05-29 (paper positioning + search method aligned): P3.5-beam
   done — beam k=5 reaches global optimum on premium (gap 6.18% → 0%)
   using 889 states vs brute force's 295245 (0.3%). Aligned paper as
