@@ -8,6 +8,7 @@ TRACE_COLUMNS = [
     "request_id",
     "stage_name",
     "parent_stages",
+    "slo_class",
     "entry_ts_ms",
     "workflow_start_ms",
     "workflow_end_ms",
@@ -71,14 +72,21 @@ class CsvTraceStore:
     def __init__(self, path: str):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.path.exists():
+        self.fieldnames = TRACE_COLUMNS
+        if self.path.exists() and self.path.stat().st_size > 0:
+            with self.path.open("r", newline="", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                existing_header = next(reader, None)
+            if existing_header:
+                self.fieldnames = existing_header
+        else:
             with self.path.open("w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=TRACE_COLUMNS)
+                writer = csv.DictWriter(f, fieldnames=self.fieldnames)
                 writer.writeheader()
 
     def append_many(self, rows: Iterable[Dict[str, object]]) -> None:
         with self.path.open("a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=TRACE_COLUMNS)
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
             for row in rows:
-                normalized = {key: row.get(key, "") for key in TRACE_COLUMNS}
+                normalized = {key: row.get(key, "") for key in self.fieldnames}
                 writer.writerow(normalized)
