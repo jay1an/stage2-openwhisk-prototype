@@ -875,6 +875,17 @@ P4 deliverables:
     * No "downstream extra prewarm" defense (rely on JIT)
     * Dynamic plan as recovery mechanism for entry cold events
   Created `docs/ANALYTICAL_RISK_MODEL.md` with closed-form math details.
+- 2026-05-29 (paper positioning + search method aligned): P3.5-beam
+  done — beam k=5 reaches global optimum on premium (gap 6.18% → 0%)
+  using 889 states vs brute force's 295245 (0.3%). Aligned paper as
+  DUAL main contributions: (1) multi-SLO DAG serving system, (2)
+  efficient near-optimal beam search reused offline+online. Priority:
+  build system end-to-end on civic_alert FIRST (Path Y), then
+  strengthen algorithm with more/longer workflows where brute force is
+  infeasible. Deferred: more workflows, convex baseline, multi-workflow
+  joint planning. Larger tier space not feasible; search difficulty
+  will come from more STAGES not more tiers. Details in
+  PATH3_PLANNER_DESIGN.md Section 0.
 - 2026-05-29 (SLO finalized): Premium P(E2E > 15s) ≤ 5%, Free
   P(E2E > 20s) ≤ 5%. Both share 5% violation budget; differentiation
   is the latency target. KEY clarification: SLO is a constraint, NOT a

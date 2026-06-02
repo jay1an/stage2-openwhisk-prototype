@@ -9,6 +9,66 @@ Companion documents:
 
 ---
 
+## 0. Paper Positioning and Priority (aligned 2026-05-29)
+
+### Dual main contributions
+
+The paper has two parallel main contributions:
+
+1. **System contribution**: a multi-SLO DAG serving framework
+   - Per-stage heterogeneous memory tier assignment
+   - JIT downstream prewarming (hides downstream cold starts)
+   - Dynamic plan adjustment (reactive recovery per stage completion)
+   - Closed-form risk model driving all decisions
+
+2. **Algorithm contribution**: efficient near-optimal search
+   - Beam search + closed-form risk lookahead
+   - Same algorithm reused offline (initial plan) and online (dynamic
+     recovery)
+   - Near-optimal at scales where brute force is infeasible
+   - Compared against greedy (suboptimal) and brute force
+     (not scalable); future: Jolteon-style convex relaxation
+
+### Current priority: system end-to-end first (Path Y)
+
+Decision: build the system end-to-end on the civic_alert example
+workflow FIRST, proving the framework is usable. THEN strengthen the
+algorithm contribution with harder scenarios.
+
+Rationale:
+- The system is the paper's skeleton; the algorithm needs it to stand on
+- Search-method comparison experiments run within the same framework
+- Avoids premature deep-diving into algorithm details before the system
+  works end-to-end
+
+### Deferred to post-system-completion (NOT current tasks)
+
+These strengthen both system credibility and algorithm credibility, but
+come AFTER the system runs end-to-end:
+
+- **More workflows**: spoken_dialog, visual_qa (already have configs),
+  plus possibly constructed longer workflows (8-10 stages) where brute
+  force becomes infeasible and beam search's value shows
+- **Convex relaxation baseline** (Jolteon-style) for algorithm comparison
+- **Larger tier space**: NOT feasible (limited by OpenWhisk config /
+  physical resources); the algorithm difficulty will come from MORE
+  STAGES, not more tiers
+- **Multi-workflow joint planning + per-window time-varying plans**: the
+  hardest search scenario, ideal for showcasing the algorithm
+
+### Why more stages (not more tiers) makes search hard
+
+Search space scales as tiers^stages:
+- 5 stages × 9 tiers = 59,049 (brute force feasible, ~183s)
+- 8 stages × 9 tiers = 43M (brute force infeasible)
+- 10 stages × 9 tiers = 3.5e9 (brute force impossible)
+
+Constructing longer workflows lets us show beam search remaining fast
+and near-optimal where brute force fails. This is the key evidence for
+the algorithm contribution.
+
+---
+
 ## 1. Multi-SLO Architecture
 
 ### SLO classes
