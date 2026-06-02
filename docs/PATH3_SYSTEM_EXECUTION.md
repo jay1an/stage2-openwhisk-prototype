@@ -275,11 +275,73 @@ Mitigations:
 
 Measurement: during end-to-end replay, count how many requests are
 affected by the race. If the impact is large (e.g., >5% of requests),
-revisit by modifying the OpenWhisk invoker to add container reservation
-(future work / limitation discussion).
+revisit by modifying the OpenWhisk invoker.
 
 This limitation is logged; we will intrude into the invoker code later
 only if measured impact warrants it.
+
+### Options considered and their disposition (2026-05-30)
+
+We discussed three approaches to the race; all DEFERRED in favor of
+first fixing JIT timing and measuring actual race impact.
+
+**Option A: orchestrator warm-pool ledger (REJECTED)**
+- Idea: orchestrator keeps a local ledger of "which actions have warm
+  containers alive (within keepalive)" by recording every invocation it
+  issues, and predicts cold/warm before dispatching.
+- Rejected by owner: the ledger has too many accuracy problems (race it
+  can't see, OpenWhisk internal reclamation, multi-node placement), so
+  its predictions would be unreliable.
+
+**Option B: OpenWhisk container reservation (DEFERRED, heavy)**
+- Idea: warmup tags a container with a token; the real request with the
+  same token only matches that container. True reservation.
+- Cost: ~2-3 weeks. Changes ContainerPool.scala (token-filtered
+  matching), ContainerProxy.scala (token state), ActivationMessage
+  schema (token field), Controller routing (same-invoker affinity), plus
+  rebuild + redeploy OpenWhisk. High risk (deadlock, container leak,
+  perf regression) and ongoing merge burden on OW upgrades.
+- Problem: a reserved-but-unused container is locked from others — worse
+  waste than the race if prediction is wrong (needs timeout release).
+
+**Option C: warmup does not reuse free-pool containers (DEFERRED, lighter)**
+- Idea: when a request carries __warmup, skip the freePool lookup and
+  force a new container; normal requests reuse as usual. Only one branch
+  in ContainerPool.scala.
+- Cost: ~3-5 days (lighter than B; no token matching/binding/routing).
+  Still requires Scala change + OW rebuild + redeploy.
+- Problem: "always new container" OVER-CREATES. If the freePool already
+  has M warm containers, warmup blindly adds more, exceeding the needed
+  count; the surplus idles and is reclaimed. The correct behavior is
+  "top up to the deficit (N - M)", which again needs to know M (the
+  rejected ledger or an OpenWhisk state query).
+
+### Decision: fix timing first, measure, then decide
+
+Root cause of the P3.C race exposure was NOT free-pool reuse — it was
+JIT timing being computed with the WARM predicted duration for a COLD
+entry, so warmups fired far too early and sat paused for seconds
+(large exposure window).
+
+The fix (P3.C-fix) is to compute JIT timing with the CORRECT predicted
+completion time:
+- At this stage (no entry prewarm yet), the entry stage is ALWAYS cold,
+  so the orchestrator hard-assumes entry is cold and uses entry's
+  cold-start completion time (warm exec + cold overhead) when computing
+  downstream needed_at. No ledger needed — the answer is deterministic.
+- This shrinks the warmup exposure window to ~margin (e.g., 0.6s), which
+  makes the race small.
+
+Plan:
+1. P3.C-fix: correct timing (entry assumed cold) + speculative scheduling
+2. Measure race impact in end-to-end replay
+3. If race still > ~5%: implement Option C (warmup-no-reuse, lighter) as
+   the preferred invoker change; Option B (full reservation) only if C
+   proves insufficient
+
+When entry prewarm (P3.E) is added, the entry will mostly be warm; the
+hard "entry is cold" assumption is then replaced by "entry is warm
+unless prewarm missed", with dynamic plan recovering the misses.
 
 ---
 
@@ -305,6 +367,64 @@ only if measured impact warrants it.
 The entry stage is special: it has no upstream to hide its cold start,
 so it relies on the entry prewarm component. All downstream stages rely
 on JIT (cold hidden by upstream execution).
+
+---
+
+## 8.5 P3.C-fix: Speculative Absolute-Time JIT Scheduling (2026-05-30)
+
+P3.C (first version) scheduled a downstream's warmup when its upstream
+was SUBMITTED. Since a stage is submitted only after ALL its upstreams
+COMPLETED, and it used the WARM predicted duration even for a cold entry,
+short-upstream stages had fire_at in the past (late_jit) and the cold
+entry made downstream warmups fire far too early.
+
+P3.C results (N=10, every workflow forced cold baseline):
+- estimate_pose cold rate 100% -> 30% (entry cold gave it long cover)
+- match_face 100% -> 70%, classify_scene 100% -> 60%,
+  translate_alert 100% -> 50%
+- E2E 38.4s -> 18.9s (JIT clearly works)
+- late_jit_count 30/40 (timing too tight for short stages)
+
+### The fix: schedule all warmups up front (speculative), absolute time
+
+Instead of scheduling at upstream-submit time, at WORKFLOW START predict
+each stage's absolute needed_at via the DAG + latency model, and enqueue
+ALL warmups at their absolute fire_time. Then, as stages actually
+complete, upsert (correct) the still-pending warmups using the measured
+completion times.
+
+```
+at workflow start:
+  cold/warm pre-judgement:
+    - entry stage: assumed COLD (no entry prewarm yet) -> use cold-start
+      completion time (warm exec + cold overhead)
+    - downstream stages: assumed WARM (JIT will warm them) -> use warm
+      completion time
+  recursively predict each stage's absolute needed_at down the DAG
+  for each stage B (non-entry):
+    needed_at(B) = max over parents p of predicted_completion(p)
+    fire_at(B)   = needed_at(B) - C_B(cold overhead at B's tier) - margin
+    enqueue warmup(B) at fire_at(B)   (absolute monotonic time)
+
+as each stage completes (real time + real cold/warm known):
+  recompute predicted completion of pending downstream stages using the
+  measured upstream completion
+  upsert their warmup fire_times in the scheduler
+```
+
+Why this removes late_jit: warmups are enqueued at workflow start (well
+before any short upstream submits), so there is enough lead time. The
+absolute needed_at uses the correct (cold for entry) completion estimate,
+so downstream warmups are neither too early nor too late.
+
+This is still JIT-ONLY (no dynamic tier change). Tier comes from the
+fixed initial plan. Dynamic tier change + warmup cancel/upsert is P3.D.
+
+### Interface left for P3.D (dynamic)
+
+When P3.D later changes a downstream tier mid-execution, it must
+cancel the old-tier warmup and schedule the new-tier one. The JIT
+scheduler (P3.B) already supports cancel + upsert for this.
 
 ---
 

@@ -264,12 +264,33 @@ def run_one_workflow(
     raise_on_error: bool = True,
     plan: dict[str, int] | None = None,
     slo_class: str | None = None,
+    jit_scheduler: object | None = None,
+    enable_jit: bool = False,
+    jit_margin_ms: float = 600.0,
 ) -> List[dict]:
     normalized_plan = validate_stage_plan(workflow, plan) if plan is not None else None
+    jit_active = bool(enable_jit and jit_scheduler is not None and normalized_plan is not None)
+    warm_splines = None
+    cold_overhead_table = None
+    if jit_active:
+        from .stage4_risk.scaling import (
+            cold_overhead_for_tier,
+            load_cleansed_cold_overhead,
+            load_warm_splines,
+            spline_predict_warm_mean,
+        )
+        from .stage5_control.jit_scheduler import WarmupTask
+
+        warm_splines = load_warm_splines()
+        cold_overhead_table = load_cleansed_cold_overhead()
+
     request_id = str(uuid.uuid4())
     entry_ts_ms = now_ms()
     completed: Dict[str, dict] = {}
     running = {}
+    started_at: Dict[str, float] = {}
+    jit_scheduled_count = 0
+    jit_late_count = 0
     if normalized_plan is not None:
         entry_memory_mb = normalized_plan.get(workflow.entry, "")
     else:
@@ -296,10 +317,76 @@ def run_one_workflow(
             "platform_overhead_ms": "",
             "allocated_memory_mb": entry_memory_mb,
             "allocated_cpu_cores": entry_cpu_cores,
+            "jit_enabled": jit_active,
+            "jit_scheduled_count": 0,
+            "jit_late_count": 0,
             "status": "ok",
             "error": "",
         }
     ]
+
+    def predicted_warm_duration_ms(stage_name: str) -> float:
+        if normalized_plan is None or warm_splines is None:
+            raise RuntimeError("JIT warm duration requested without an active plan")
+        tier = normalized_plan[stage_name]
+        cpu = openwhisk_memory_to_cpu_cores(tier)
+        return float(spline_predict_warm_mean(stage_name, cpu, warm_splines))
+
+    def schedule_downstream_warmups(started_stage_name: str) -> None:
+        nonlocal jit_scheduled_count, jit_late_count
+        if not jit_active or normalized_plan is None or cold_overhead_table is None:
+            return
+
+        now = time.monotonic()
+        for downstream_name in workflow.children_of(started_stage_name):
+            downstream_node = workflow.nodes[downstream_name]
+            if not all(parent in started_at for parent in downstream_node.parents):
+                continue
+
+            parent_ready_times = [
+                started_at[parent] + predicted_warm_duration_ms(parent) / 1000.0
+                for parent in downstream_node.parents
+            ]
+            needed_at = max(parent_ready_times)
+            downstream_tier = normalized_plan[downstream_name]
+            cold_overhead_ms = float(
+                cold_overhead_for_tier(
+                    downstream_name,
+                    downstream_tier,
+                    cold_overhead_table,
+                )
+            )
+            raw_fire_time = needed_at - cold_overhead_ms / 1000.0 - jit_margin_ms / 1000.0
+            late_jit = raw_fire_time <= now
+            fire_time = now if late_jit else raw_fire_time
+            if late_jit:
+                jit_late_count += 1
+            jit_scheduled_count += 1
+
+            task = WarmupTask(
+                task_key=f"{request_id}:{downstream_name}",
+                fire_time=fire_time,
+                action_name=suffix_action_name(
+                    downstream_node.action,
+                    f"_{downstream_tier}",
+                ),
+                metadata={
+                    "request_id": request_id,
+                    "workflow_name": workflow.workflow_name,
+                    "stage_name": downstream_name,
+                    "tier_mb": downstream_tier,
+                    "slo_class": slo_class or "",
+                    "needed_at": needed_at,
+                    "raw_fire_time": raw_fire_time,
+                    "fire_time": fire_time,
+                    "late_jit": late_jit,
+                    "jit_margin_ms": jit_margin_ms,
+                    "cold_overhead_ms": cold_overhead_ms,
+                    "parents": list(downstream_node.parents),
+                    "scheduled_from_stage": started_stage_name,
+                },
+            )
+            jit_scheduler.schedule(task)
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         while len(completed) < len(workflow.nodes):
@@ -312,6 +399,9 @@ def run_one_workflow(
                     node_memory_mb = normalized_plan[node.name]
                     node_cpu_cores = openwhisk_memory_to_cpu_cores(node_memory_mb)
                     node_action_name = suffix_action_name(node.action, f"_{node_memory_mb}")
+
+                started_at[node.name] = time.monotonic()
+                schedule_downstream_warmups(node.name)
 
                 future = pool.submit(
                     invoke_node,
@@ -327,6 +417,9 @@ def run_one_workflow(
                     slo_class,
                 )
                 running[node.name] = future
+
+            trace_rows[0]["jit_scheduled_count"] = jit_scheduled_count
+            trace_rows[0]["jit_late_count"] = jit_late_count
 
             if not running:
                 missing = sorted(set(workflow.nodes) - set(completed))
@@ -346,6 +439,7 @@ def run_one_workflow(
             for future in done:
                 node_name = next(name for name, item in running.items() if item is future)
                 row = future.result()
+                row["stage_start_monotonic"] = started_at.get(node_name, "")
                 trace_rows.append({k: v for k, v in row.items() if not k.startswith("_")})
                 if row["status"] != "ok":
                     error = f"node {node_name} failed: {row['error']}"
@@ -370,6 +464,8 @@ def run_one_workflow(
     trace_rows[0]["workflow_e2e_ms"] = workflow_end_ms - entry_ts_ms
     trace_rows[0]["dispatch_end_ms"] = workflow_end_ms
     trace_rows[0]["dispatch_latency_ms"] = workflow_end_ms - entry_ts_ms
+    trace_rows[0]["jit_scheduled_count"] = jit_scheduled_count
+    trace_rows[0]["jit_late_count"] = jit_late_count
     return trace_rows
 
 
