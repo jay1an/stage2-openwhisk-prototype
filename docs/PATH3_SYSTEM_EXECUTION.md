@@ -140,6 +140,29 @@ This still leaves enough lead time as long as
 D_last_upstream > C_B + safety_margin (for civic_alert: upstream warm
 ~3s > cold ~2s + margin 0.5s, OK).
 
+### Container return-to-pool delay (P3.A finding)
+
+P3.A verification revealed: a container only becomes reusable after it
+enters the Paused state (Running -> Ready -> Pausing -> Paused). This
+takes a sub-second delay (pauseGrace ~50ms + transition overhead) after
+the warmup invocation's code finishes.
+
+Observed: invoking normal IMMEDIATELY (0.14s) after warmup did NOT reuse
+the container (it was still transitioning, not yet in the pool), so
+OpenWhisk spun up a second container. Waiting ~5s allowed reuse.
+
+Implication for the JIT lead-time condition: the precise requirement is
+  D_last_upstream > C_B + safety_margin + return_to_pool_delay
+where return_to_pool_delay is sub-second. For civic_alert this still
+holds comfortably (upstream ~3s >> cold ~2s + margin 0.5s + pool ~0.1s).
+
+This is NOT a problem for our JIT design because the real invoke of B
+happens only after the upstream completes (~3s after warmup fired), far
+longer than the return-to-pool delay. The concern only arises if an
+upstream stage executes faster than C_B + return_to_pool_delay, which
+does not occur for civic_alert. Future workflows with very fast upstream
+stages would need an alternative mechanism for those stages.
+
 Implementation: maintain the set of started stages (run_one_workflow
 already has a `running`/`completed` set). When stage X starts, for each
 downstream B, check if all B.parents are in started-set; only then

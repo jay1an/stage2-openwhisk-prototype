@@ -391,6 +391,7 @@ def main(args):
             "pod_name": pod_name,
             "pid": os.getpid(),
             "warmup": True,
+            "warmed": True,
             "warmup_hold_ms": warmup_hold_ms,
             "action_start_ns": start_ns,
             "action_end_ns": end_ns,
