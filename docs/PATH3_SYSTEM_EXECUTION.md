@@ -428,6 +428,95 @@ scheduler (P3.B) already supports cancel + upsert for this.
 
 ---
 
+## 8.6 Cold-start facts and the JIT-coverage / dynamic-upgrade tension (2026-05-30)
+
+### Cold start is a stable ~2s; no "first cold start is much longer"
+
+Verified from the 9-tier multi-node sweep (per stage, per tier):
+- Cold overhead (cold dispatch - warm action) is STABLE at ~1.6-2.3s
+  across ALL tiers and stages (mean ~2.0s). It does NOT scale with tier.
+- Components: ow_init_ms mean 202ms / p95 416ms (code load — small,
+  image is local), ow_wait_ms mean 1805ms / p50 2176ms (scheduling +
+  container create — the bulk).
+- Changing memory/cpu does NOT re-pull the image (it is cached locally);
+  ow_init ~200ms confirms code/image load is fast. The "seconds to tens
+  of seconds image pull" in the literature is the REMOTE-registry
+  first-pull case, which does not apply to this cluster.
+
+Correction: an earlier hypothesis that "first cold start after redeploy
+is 8-10s" was speculation with no data support and is WITHDRAWN. Cold
+start is ~2s steady-state here.
+
+### Per-tier warm execution times (sweep, action_duration_ms)
+
+| tier | detect | estimate | match | classify | translate |
+|---|---|---|---|---|---|
+| 512  | 8305 | 6132 | 9291 | 6978 | 6722 |
+| 768  | 4069 | 4105 | 5327 | 5111 | 4561 |
+| 1024 | 3595 | 3090 | 4193 | 3888 | 2986 |
+| 1280 | 2836 | 2533 | 3441 | 3223 | 2874 |
+| 1536 | 2358 | 2410 | 3466 | 3130 | 2791 |
+| 2048 | 2489 | 2046 | 2417 | 2440 | 2458 |
+| 2560 | 2245 | 1722 | 2517 | 2184 | 2178 |
+| 3072 | 2011 | 1986 | 2379 | 1694 | 2179 |
+| 3840 | 1896 | 1843 | 2079 | 1717 | 2064 |
+
+### The JIT-coverage vs dynamic-upgrade tension (核心设计约束 for P3.D)
+
+At the FASTEST tier (3840), warm execution is ~1700-2100ms, which is
+≈ the cold overhead (~2000ms). So at high tiers, a single upstream's
+execution time CANNOT cover a downstream's cold start:
+  single-hop needs D_upstream > C_downstream + margin
+  at 3840: ~1900ms < ~2000ms + 600ms = 2600ms  -> FAILS
+
+Implication: dynamic plan upgrading a stage to a high tier (to meet SLO
+faster) SHORTENS its execution, WEAKENING its ability to hide the
+downstream's cold start via JIT. The two mechanisms share execution time
+as a resource: it is both a latency cost AND a cold-start-hiding budget.
+
+Decisions (owner-aligned 2026-05-30):
+1. Keep CROSS-LEVEL speculative warmup (already in P3.C-fix). Do NOT
+   rely on single-hop coverage. Warmups are enqueued at workflow start
+   using the cumulative lead time of all preceding stages, so a fast
+   upstream alone need not cover the downstream cold start.
+2. Do NOT inflate action workload to force single-hop coverage
+   (rejected: requires re-sweep/re-model/re-deploy, slows E2E, less
+   natural). Cross-level speculative is preferred.
+3. Cross-level speculative has a physical bound:
+     C_downstream + margin  <  lead_time  <  keepalive
+   Lower bound: enough to cover cold start. Upper bound: a warmup fired
+   too early sits paused past keepalive and is reclaimed (wasted).
+   When a workflow is short or all stages are at high tiers, total lead
+   time may be < C_downstream for early stages — those stages then
+   cannot be JIT-covered.
+4. P3.D dynamic MUST model JIT coverage: when deciding to upgrade a
+   stage, account for the loss of its cold-hiding capability for
+   downstream. The closed-form risk model's Mode-2 assumption
+   (p_downstream_cold ≈ 0) breaks when an upstream is too fast; those
+   stages' cold must then be counted. A counter-intuitive but correct
+   strategy: dynamic may DELIBERATELY keep an upstream at a lower tier
+   (slower) to preserve its ability to hide a downstream cold start.
+
+This "execution time as a dual-purpose budget (latency + cold-hiding)"
+is a novel modeling angle vs ORION/Jolteon (static sizing, no JIT).
+
+### Open: estimate_pose anomaly (to diagnose before P3.E)
+
+P3.C-fix gave estimate_pose 90% cold (worse than P3.C's 30%), while
+match/classify/translate improved greatly. By the data, estimate's JIT
+timing should make it warm:
+  detect@1536 predicted completion = warm(2358) + cold(1815) = 4173ms
+    (matches measured cold dispatch 4174ms — prediction is near-perfect)
+  estimate fire_at = 4173 - C_est(1823) - margin(600) = 1750ms
+  estimate warmup container ~3750ms ready -> paused ~3800ms
+  detect completes 4174ms -> estimate needed 4174ms > 3800ms -> SHOULD be warm
+Yet measured 90% cold. There is an unexplained factor. Diagnose with a
+--skip-reset run and per-request timing trace (warmup fire time,
+container ready time, real invoke time, cold_like) BEFORE proceeding to
+P3.E. Do not carry an unexplained anomaly forward.
+
+---
+
 ## 9. Implementation Subtasks (revised order)
 
 Given this architecture, the path 3 system subtasks:

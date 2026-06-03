@@ -286,11 +286,17 @@ def run_one_workflow(
 
     request_id = str(uuid.uuid4())
     entry_ts_ms = now_ms()
+    workflow_start_monotonic = time.monotonic()
     completed: Dict[str, dict] = {}
     running = {}
     started_at: Dict[str, float] = {}
+    measured_completion_at: Dict[str, float] = {}
+    jit_current_fire_times: Dict[str, float] = {}
     jit_scheduled_count = 0
+    jit_upsert_count = 0
     jit_late_count = 0
+    jit_initial_late_count = 0
+    jit_upsert_late_count = 0
     if normalized_plan is not None:
         entry_memory_mb = normalized_plan.get(workflow.entry, "")
     else:
@@ -319,11 +325,34 @@ def run_one_workflow(
             "allocated_cpu_cores": entry_cpu_cores,
             "jit_enabled": jit_active,
             "jit_scheduled_count": 0,
+            "jit_upsert_count": 0,
             "jit_late_count": 0,
+            "jit_initial_late_count": 0,
+            "jit_upsert_late_count": 0,
             "status": "ok",
             "error": "",
         }
     ]
+
+    def topological_stage_names() -> list[str]:
+        remaining = list(workflow.nodes)
+        seen = set()
+        ordered: list[str] = []
+        while remaining:
+            progressed = False
+            for stage_name in list(remaining):
+                if all(parent in seen for parent in workflow.nodes[stage_name].parents):
+                    ordered.append(stage_name)
+                    seen.add(stage_name)
+                    remaining.remove(stage_name)
+                    progressed = True
+            if not progressed:
+                raise RuntimeError(
+                    f"workflow has a cycle or missing parent; remaining={remaining}"
+                )
+        return ordered
+
+    topo_order = topological_stage_names()
 
     def predicted_warm_duration_ms(stage_name: str) -> float:
         if normalized_plan is None or warm_splines is None:
@@ -332,61 +361,142 @@ def run_one_workflow(
         cpu = openwhisk_memory_to_cpu_cores(tier)
         return float(spline_predict_warm_mean(stage_name, cpu, warm_splines))
 
-    def schedule_downstream_warmups(started_stage_name: str) -> None:
-        nonlocal jit_scheduled_count, jit_late_count
+    def stage_cold_overhead_ms(stage_name: str) -> float:
+        if normalized_plan is None or cold_overhead_table is None:
+            raise RuntimeError("JIT cold overhead requested without an active plan")
+        return float(
+            cold_overhead_for_tier(
+                stage_name,
+                normalized_plan[stage_name],
+                cold_overhead_table,
+            )
+        )
+
+    def predicted_duration_seconds(stage_name: str) -> float:
+        duration_ms = predicted_warm_duration_ms(stage_name)
+        if stage_name == workflow.entry:
+            duration_ms += stage_cold_overhead_ms(stage_name)
+        return duration_ms / 1000.0
+
+    def compute_predicted_times() -> tuple[dict[str, float], dict[str, float]]:
+        predicted_start: dict[str, float] = {}
+        predicted_completion: dict[str, float] = {}
+        for stage_name in topo_order:
+            node = workflow.nodes[stage_name]
+            if node.parents:
+                start_at = max(predicted_completion[parent] for parent in node.parents)
+            else:
+                start_at = workflow_start_monotonic
+            if stage_name in started_at:
+                start_at = started_at[stage_name]
+            predicted_start[stage_name] = start_at
+
+            if stage_name in measured_completion_at:
+                predicted_completion[stage_name] = measured_completion_at[stage_name]
+            else:
+                predicted_completion[stage_name] = (
+                    start_at + predicted_duration_seconds(stage_name)
+                )
+        return predicted_start, predicted_completion
+
+    def schedule_stage_warmup(
+        stage_name: str,
+        needed_at: float,
+        schedule_phase: str,
+    ) -> None:
+        nonlocal jit_scheduled_count
+        nonlocal jit_upsert_count
+        nonlocal jit_late_count
+        nonlocal jit_initial_late_count
+        nonlocal jit_upsert_late_count
+
         if not jit_active or normalized_plan is None or cold_overhead_table is None:
             return
 
         now = time.monotonic()
-        for downstream_name in workflow.children_of(started_stage_name):
-            downstream_node = workflow.nodes[downstream_name]
-            if not all(parent in started_at for parent in downstream_node.parents):
-                continue
+        existing_fire_time = jit_current_fire_times.get(stage_name)
+        if schedule_phase == "upsert" and existing_fire_time is not None:
+            if existing_fire_time <= now:
+                return
 
-            parent_ready_times = [
-                started_at[parent] + predicted_warm_duration_ms(parent) / 1000.0
-                for parent in downstream_node.parents
-            ]
-            needed_at = max(parent_ready_times)
-            downstream_tier = normalized_plan[downstream_name]
-            cold_overhead_ms = float(
-                cold_overhead_for_tier(
-                    downstream_name,
-                    downstream_tier,
-                    cold_overhead_table,
-                )
-            )
-            raw_fire_time = needed_at - cold_overhead_ms / 1000.0 - jit_margin_ms / 1000.0
-            late_jit = raw_fire_time <= now
-            fire_time = now if late_jit else raw_fire_time
-            if late_jit:
-                jit_late_count += 1
+        node = workflow.nodes[stage_name]
+        stage_tier = normalized_plan[stage_name]
+        cold_overhead_ms = stage_cold_overhead_ms(stage_name)
+        raw_fire_time = needed_at - cold_overhead_ms / 1000.0 - jit_margin_ms / 1000.0
+        late_jit = raw_fire_time <= now
+        fire_time = now if late_jit else raw_fire_time
+        if late_jit:
+            jit_late_count += 1
+            if schedule_phase == "initial":
+                jit_initial_late_count += 1
+            else:
+                jit_upsert_late_count += 1
+
+        if schedule_phase == "initial":
             jit_scheduled_count += 1
+        else:
+            jit_upsert_count += 1
 
-            task = WarmupTask(
-                task_key=f"{request_id}:{downstream_name}",
-                fire_time=fire_time,
-                action_name=suffix_action_name(
-                    downstream_node.action,
-                    f"_{downstream_tier}",
-                ),
-                metadata={
-                    "request_id": request_id,
-                    "workflow_name": workflow.workflow_name,
-                    "stage_name": downstream_name,
-                    "tier_mb": downstream_tier,
-                    "slo_class": slo_class or "",
-                    "needed_at": needed_at,
-                    "raw_fire_time": raw_fire_time,
-                    "fire_time": fire_time,
-                    "late_jit": late_jit,
-                    "jit_margin_ms": jit_margin_ms,
-                    "cold_overhead_ms": cold_overhead_ms,
-                    "parents": list(downstream_node.parents),
-                    "scheduled_from_stage": started_stage_name,
-                },
+        task = WarmupTask(
+            task_key=f"{request_id}:{stage_name}",
+            fire_time=fire_time,
+            action_name=suffix_action_name(
+                node.action,
+                f"_{stage_tier}",
+            ),
+            metadata={
+                "request_id": request_id,
+                "workflow_name": workflow.workflow_name,
+                "stage_name": stage_name,
+                "tier_mb": stage_tier,
+                "slo_class": slo_class or "",
+                "needed_at": needed_at,
+                "raw_fire_time": raw_fire_time,
+                "fire_time": fire_time,
+                "late_jit": late_jit,
+                "jit_margin_ms": jit_margin_ms,
+                "cold_overhead_ms": cold_overhead_ms,
+                "parents": list(node.parents),
+                "schedule_phase": schedule_phase,
+            },
+        )
+        jit_current_fire_times[stage_name] = fire_time
+        jit_scheduler.schedule(task)
+
+    def enqueue_initial_jit_warmups() -> None:
+        if not jit_active:
+            return
+        predicted_start, _ = compute_predicted_times()
+        for stage_name in topo_order:
+            if stage_name == workflow.entry:
+                continue
+            schedule_stage_warmup(
+                stage_name,
+                predicted_start[stage_name],
+                schedule_phase="initial",
             )
-            jit_scheduler.schedule(task)
+
+    def upsert_pending_jit_warmups() -> None:
+        if not jit_active:
+            return
+        predicted_start, _ = compute_predicted_times()
+        for stage_name in topo_order:
+            if stage_name == workflow.entry:
+                continue
+            if stage_name in completed or stage_name in running or stage_name in started_at:
+                continue
+            schedule_stage_warmup(
+                stage_name,
+                predicted_start[stage_name],
+                schedule_phase="upsert",
+            )
+
+    enqueue_initial_jit_warmups()
+    trace_rows[0]["jit_scheduled_count"] = jit_scheduled_count
+    trace_rows[0]["jit_upsert_count"] = jit_upsert_count
+    trace_rows[0]["jit_late_count"] = jit_late_count
+    trace_rows[0]["jit_initial_late_count"] = jit_initial_late_count
+    trace_rows[0]["jit_upsert_late_count"] = jit_upsert_late_count
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         while len(completed) < len(workflow.nodes):
@@ -401,7 +511,6 @@ def run_one_workflow(
                     node_action_name = suffix_action_name(node.action, f"_{node_memory_mb}")
 
                 started_at[node.name] = time.monotonic()
-                schedule_downstream_warmups(node.name)
 
                 future = pool.submit(
                     invoke_node,
@@ -419,7 +528,10 @@ def run_one_workflow(
                 running[node.name] = future
 
             trace_rows[0]["jit_scheduled_count"] = jit_scheduled_count
+            trace_rows[0]["jit_upsert_count"] = jit_upsert_count
             trace_rows[0]["jit_late_count"] = jit_late_count
+            trace_rows[0]["jit_initial_late_count"] = jit_initial_late_count
+            trace_rows[0]["jit_upsert_late_count"] = jit_upsert_late_count
 
             if not running:
                 missing = sorted(set(workflow.nodes) - set(completed))
@@ -456,8 +568,10 @@ def run_one_workflow(
                     trace_rows[0]["status"] = "error"
                     trace_rows[0]["error"] = error
                     return trace_rows
+                measured_completion_at[node_name] = time.monotonic()
                 completed[node_name] = row["_result"]
                 del running[node_name]
+                upsert_pending_jit_warmups()
 
     workflow_end_ms = now_ms()
     trace_rows[0]["workflow_end_ms"] = workflow_end_ms
@@ -465,7 +579,10 @@ def run_one_workflow(
     trace_rows[0]["dispatch_end_ms"] = workflow_end_ms
     trace_rows[0]["dispatch_latency_ms"] = workflow_end_ms - entry_ts_ms
     trace_rows[0]["jit_scheduled_count"] = jit_scheduled_count
+    trace_rows[0]["jit_upsert_count"] = jit_upsert_count
     trace_rows[0]["jit_late_count"] = jit_late_count
+    trace_rows[0]["jit_initial_late_count"] = jit_initial_late_count
+    trace_rows[0]["jit_upsert_late_count"] = jit_upsert_late_count
     return trace_rows
 
 

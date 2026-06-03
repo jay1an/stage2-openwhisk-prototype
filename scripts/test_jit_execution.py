@@ -36,6 +36,17 @@ PREMIUM_PLAN = {
     "translate_alert": 1024,
 }
 
+P3C_COLD_RATES = {
+    "detect_object": 1.00,
+    "estimate_pose": 0.30,
+    "match_face": 0.70,
+    "classify_scene": 0.60,
+    "translate_alert": 0.50,
+}
+
+P3C_LATE_JIT_COUNT = 30
+P3C_WARMUP_COUNT = 40
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -152,6 +163,7 @@ class WarmupRecorder:
                     "raw_fire_time": task.metadata.get("raw_fire_time", ""),
                     "needed_at": task.metadata.get("needed_at", ""),
                     "late_jit": task.metadata.get("late_jit", ""),
+                    "schedule_phase": task.metadata.get("schedule_phase", ""),
                     "callback_start": callback_start,
                     "callback_end": callback_end,
                     "activation_duration_ms": activation.get("duration", ""),
@@ -238,6 +250,7 @@ def run_batch(
             f"[{idx}/{args.runs}] request_id={rows[0]['request_id']} "
             f"e2e_ms={workflow_e2e(rows):.1f} "
             f"jit_scheduled={rows[0].get('jit_scheduled_count', 0)} "
+            f"jit_upserts={rows[0].get('jit_upsert_count', 0)} "
             f"jit_late={rows[0].get('jit_late_count', 0)}",
             flush=True,
         )
@@ -286,8 +299,11 @@ def print_summary(off_rows: list[list[dict]], on_rows: list[list[dict]], warmups
     deltas = summarize_warmup_timing(on_rows, warmups)
 
     print("\nPer-stage cold rate comparison")
-    print("stage           | JIT off cold_rate | JIT on cold_rate | warmup_count | invoke_after_warmup_ms")
-    print("-" * 95)
+    print(
+        "stage           | JIT off cold_rate | P3.C cold_rate | "
+        "P3.C-fix cold_rate | warmup_count | invoke_after_warmup_ms"
+    )
+    print("-" * 118)
     for stage in STAGE_ORDER:
         stage_warmups = [record for record in warmups if record["stage_name"] == stage]
         stage_deltas = deltas.get(stage, [])
@@ -298,7 +314,8 @@ def print_summary(off_rows: list[list[dict]], on_rows: list[list[dict]], warmups
         )
         note = "entry" if stage == "detect_object" else ""
         print(
-            f"{stage:<15} | {off_rates[stage]:<17.2%} | {on_rates[stage]:<16.2%} | "
+            f"{stage:<15} | {off_rates[stage]:<17.2%} | "
+            f"{P3C_COLD_RATES[stage]:<14.2%} | {on_rates[stage]:<19.2%} | "
             f"{len(stage_warmups):<12} | {delta_text} {note}"
         )
 
@@ -313,7 +330,22 @@ def print_summary(off_rows: list[list[dict]], on_rows: list[list[dict]], warmups
     )
 
     late_count = sum(1 for record in warmups if record.get("late_jit"))
-    print(f"\nWarmups fired: {len(warmups)}; late_jit_count={late_count}")
+    initial_late_count = sum(
+        1
+        for record in warmups
+        if record.get("late_jit") and record.get("schedule_phase") == "initial"
+    )
+    upsert_late_count = sum(
+        1
+        for record in warmups
+        if record.get("late_jit") and record.get("schedule_phase") == "upsert"
+    )
+    print(
+        f"\nWarmups fired: {len(warmups)}; "
+        f"P3.C late_jit={P3C_LATE_JIT_COUNT}/{P3C_WARMUP_COUNT}; "
+        f"P3.C-fix late_jit={late_count}/{len(warmups)} "
+        f"(initial={initial_late_count}, upsert={upsert_late_count})"
+    )
 
 
 def main() -> None:
@@ -347,7 +379,7 @@ def main() -> None:
             recorder=None,
         )
         on_rows = run_batch(
-            label="JIT on treatment",
+            label="JIT on speculative treatment",
             enable_jit=True,
             args=args,
             auth=auth,
