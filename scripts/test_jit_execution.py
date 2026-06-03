@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import subprocess
 import sys
 import threading
@@ -63,6 +64,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout-sec", type=int, default=300)
     parser.add_argument("--jit-margin-ms", type=float, default=600.0)
     parser.add_argument("--skip-reset", action="store_true")
+    parser.add_argument("--jit-only", action="store_true")
+    parser.add_argument("--reset-once-before", action="store_true")
+    parser.add_argument("--experiment-label", default="jit_diag")
+    parser.add_argument(
+        "--diag-out-dir",
+        default=str(ROOT / "reports" / "path3_jit_diag"),
+    )
+    parser.add_argument("--diag-csv", default="")
     return parser.parse_args()
 
 
@@ -147,10 +156,18 @@ class WarmupRecorder:
             "stage_name": task.metadata.get("stage_name", ""),
             "allocated_memory_mb": task.metadata.get("tier_mb", ""),
         }
-        activation = self.client.invoke_activation(task.action_name, params)
+        warmup_sent_monotonic = time.monotonic()
+        activation = {}
+        result = {}
+        annotations = {}
+        error = ""
+        try:
+            activation = self.client.invoke_activation(task.action_name, params)
+            result = activation.get("response", {}).get("result", {})
+            annotations = activation_annotations(activation)
+        except Exception as exc:
+            error = str(exc)
         callback_end = time.monotonic()
-        result = activation.get("response", {}).get("result", {})
-        annotations = activation_annotations(activation)
         with self.condition:
             self.records.append(
                 {
@@ -165,13 +182,16 @@ class WarmupRecorder:
                     "late_jit": task.metadata.get("late_jit", ""),
                     "schedule_phase": task.metadata.get("schedule_phase", ""),
                     "callback_start": callback_start,
+                    "warmup_sent_monotonic": warmup_sent_monotonic,
                     "callback_end": callback_end,
+                    "activation_id": activation.get("activationId", ""),
                     "activation_duration_ms": activation.get("duration", ""),
                     "action_duration_ms": result.get("action_duration_ms", ""),
                     "cold_like": result.get("cold_like", ""),
                     "container_id": result.get("container_id", ""),
                     "initTime": annotations.get("initTime", ""),
                     "waitTime": annotations.get("waitTime", ""),
+                    "error": error,
                 }
             )
             self.condition.notify_all()
@@ -255,6 +275,157 @@ def run_batch(
             flush=True,
         )
     return results
+
+
+def build_timing_rows(
+    *,
+    experiment_label: str,
+    jit_rows: list[list[dict]],
+    warmups: list[dict],
+) -> list[dict]:
+    warmup_by_stage = {
+        (record.get("request_id"), record.get("stage_name")): record
+        for record in warmups
+    }
+    timing_rows: list[dict] = []
+    for run_index, workflow_rows in enumerate(jit_rows, start=1):
+        request_id = workflow_rows[0]["request_id"]
+        stage_rows = [
+            row
+            for row in workflow_rows
+            if row.get("stage_name") in STAGE_ORDER
+        ]
+        for row in stage_rows:
+            stage_name = row["stage_name"]
+            warmup = warmup_by_stage.get((request_id, stage_name), {})
+            warmup_ready = warmup.get("callback_end", "")
+            real_invoke = row.get("real_invoke_monotonic", "")
+            gap_ms = ""
+            if warmup_ready not in ("", None) and real_invoke not in ("", None):
+                gap_ms = (float(real_invoke) - float(warmup_ready)) * 1000.0
+            warmup_container = warmup.get("container_id", "")
+            real_container = row.get("container_id", "")
+            same_container = (
+                bool(warmup_container)
+                and bool(real_container)
+                and warmup_container == real_container
+            )
+            timing_rows.append(
+                {
+                    "experiment": experiment_label,
+                    "run_index": run_index,
+                    "request_id": request_id,
+                    "stage_name": stage_name,
+                    "tier": PREMIUM_PLAN[stage_name],
+                    "warmup_scheduled_fire_monotonic": warmup.get("scheduled_fire_time", ""),
+                    "warmup_fire_monotonic": warmup.get("callback_start", ""),
+                    "warmup_sent_monotonic": warmup.get("warmup_sent_monotonic", ""),
+                    "warmup_ready_monotonic": warmup_ready,
+                    "warmup_activation_id": warmup.get("activation_id", ""),
+                    "warmup_container_id": warmup_container,
+                    "warmup_cold_like": warmup.get("cold_like", ""),
+                    "warmup_wait_ms": warmup.get("waitTime", ""),
+                    "warmup_init_ms": warmup.get("initTime", ""),
+                    "warmup_duration_ms": warmup.get("activation_duration_ms", ""),
+                    "warmup_error": warmup.get("error", ""),
+                    "real_invoke_monotonic": real_invoke,
+                    "real_activation_id": row.get("activation_id", ""),
+                    "real_container_id": real_container,
+                    "real_ow_wait_ms": row.get("ow_wait_ms", ""),
+                    "real_ow_init_ms": row.get("ow_init_ms", ""),
+                    "real_ow_duration_ms": row.get("ow_duration_ms", ""),
+                    "same_container": same_container,
+                    "cold_like": row.get("cold_like", ""),
+                    "gap_warmup_ready_to_real_ms": gap_ms,
+                    "stage_start_monotonic": row.get("stage_start_monotonic", ""),
+                    "resolved_action_name": row.get("resolved_action_name", ""),
+                }
+            )
+    return timing_rows
+
+
+def write_timing_csv(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "experiment",
+        "run_index",
+        "request_id",
+        "stage_name",
+        "tier",
+        "warmup_scheduled_fire_monotonic",
+        "warmup_fire_monotonic",
+        "warmup_sent_monotonic",
+        "warmup_ready_monotonic",
+        "warmup_activation_id",
+        "warmup_container_id",
+        "warmup_cold_like",
+        "warmup_wait_ms",
+        "warmup_init_ms",
+        "warmup_duration_ms",
+        "warmup_error",
+        "real_invoke_monotonic",
+        "real_activation_id",
+        "real_container_id",
+        "real_ow_wait_ms",
+        "real_ow_init_ms",
+        "real_ow_duration_ms",
+        "same_container",
+        "cold_like",
+        "gap_warmup_ready_to_real_ms",
+        "stage_start_monotonic",
+        "resolved_action_name",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def print_estimate_progression(timing_rows: list[dict]) -> None:
+    print("\nestimate_pose per-run timing")
+    print(
+        "run | cold_like | same_container | gap_ready_to_real_ms | "
+        "warm_wait | warm_init | real_wait | real_init"
+    )
+    print("-" * 96)
+    for row in timing_rows:
+        if row["stage_name"] != "estimate_pose":
+            continue
+        gap = row["gap_warmup_ready_to_real_ms"]
+        gap_text = f"{float(gap):.1f}" if gap not in ("", None) else "n/a"
+        print(
+            f"{row['run_index']:<3} | {row['cold_like']!s:<9} | "
+            f"{row['same_container']!s:<14} | {gap_text:<20} | "
+            f"{row['warmup_wait_ms']!s:<9} | {row['warmup_init_ms']!s:<9} | "
+            f"{row['real_ow_wait_ms']!s:<9} | {row['real_ow_init_ms']!s:<9}"
+        )
+
+
+def print_jit_only_summary(on_rows: list[list[dict]], warmups: list[dict]) -> None:
+    on_rates = summarize_stage_cold_rates(on_rows)
+    on_e2e = [workflow_e2e(rows) for rows in on_rows]
+    deltas = summarize_warmup_timing(on_rows, warmups)
+    print("\nJIT-only cold rates")
+    print("stage           | cold_rate | warmup_count | invoke_after_warmup_ms")
+    print("-" * 78)
+    for stage in STAGE_ORDER:
+        stage_warmups = [record for record in warmups if record["stage_name"] == stage]
+        stage_deltas = deltas.get(stage, [])
+        delta_text = (
+            f"mean={sum(stage_deltas) / len(stage_deltas):.1f}, min={min(stage_deltas):.1f}"
+            if stage_deltas
+            else "n/a"
+        )
+        print(
+            f"{stage:<15} | {on_rates[stage]:<9.2%} | "
+            f"{len(stage_warmups):<12} | {delta_text}"
+        )
+    print(
+        f"\nJIT on: mean={sum(on_e2e) / len(on_e2e):.1f} ms, "
+        f"min={min(on_e2e):.1f}, max={max(on_e2e):.1f}, samples={on_e2e}"
+    )
+    late_count = sum(1 for record in warmups if record.get("late_jit"))
+    print(f"Warmups fired: {len(warmups)}; late_jit={late_count}/{len(warmups)}")
 
 
 def summarize_stage_cold_rates(rows_by_workflow: list[list[dict]]) -> dict[str, float]:
@@ -368,16 +539,21 @@ def main() -> None:
     scheduler = JitScheduler(recorder.callback)
     scheduler.start()
     try:
-        off_rows = run_batch(
-            label="JIT off baseline",
-            enable_jit=False,
-            args=args,
-            auth=auth,
-            workflow=workflow,
-            client=client,
-            scheduler=None,
-            recorder=None,
-        )
+        if args.reset_once_before:
+            reset_plan_variants(args, auth, workflow)
+
+        off_rows = []
+        if not args.jit_only:
+            off_rows = run_batch(
+                label="JIT off baseline",
+                enable_jit=False,
+                args=args,
+                auth=auth,
+                workflow=workflow,
+                client=client,
+                scheduler=None,
+                recorder=None,
+            )
         on_rows = run_batch(
             label="JIT on speculative treatment",
             enable_jit=True,
@@ -388,7 +564,25 @@ def main() -> None:
             scheduler=scheduler,
             recorder=recorder,
         )
-        print_summary(off_rows, on_rows, recorder.snapshot())
+        warmups = recorder.snapshot()
+        timing_rows = build_timing_rows(
+            experiment_label=args.experiment_label,
+            jit_rows=on_rows,
+            warmups=warmups,
+        )
+        diag_csv = (
+            Path(args.diag_csv)
+            if args.diag_csv
+            else Path(args.diag_out_dir) / f"{args.experiment_label}_per_request_timing.csv"
+        )
+        write_timing_csv(diag_csv, timing_rows)
+        print(f"\nDiagnostic timing CSV: {diag_csv}")
+        print_estimate_progression(timing_rows)
+
+        if off_rows:
+            print_summary(off_rows, on_rows, warmups)
+        else:
+            print_jit_only_summary(on_rows, warmups)
     finally:
         scheduler.stop()
 

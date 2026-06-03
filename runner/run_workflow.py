@@ -114,6 +114,7 @@ def invoke_node(
 ) -> dict:
     resolved_action_name = action_name or node.action
     dispatch_start_ms = now_ms()
+    real_invoke_monotonic = time.monotonic()
     try:
         activation = client.invoke_activation(
             resolved_action_name,
@@ -179,6 +180,8 @@ def invoke_node(
             "entry_ts_ms": entry_ts_ms,
             "dispatch_start_ms": dispatch_start_ms,
             "dispatch_end_ms": dispatch_end_ms,
+            "real_invoke_monotonic": real_invoke_monotonic,
+            "resolved_action_name": resolved_action_name,
             **latency_fields(
                 dispatch_start_ms,
                 dispatch_end_ms,
@@ -246,6 +249,8 @@ def invoke_node(
             "entry_ts_ms": entry_ts_ms,
             "dispatch_start_ms": dispatch_start_ms,
             "dispatch_end_ms": dispatch_end_ms,
+            "real_invoke_monotonic": real_invoke_monotonic,
+            "resolved_action_name": resolved_action_name,
             **latency_fields(dispatch_start_ms, dispatch_end_ms),
             "allocated_memory_mb": allocated_memory_mb or "",
             "allocated_cpu_cores": allocated_cpu_cores or "",

@@ -517,6 +517,118 @@ P3.E. Do not carry an unexplained anomaly forward.
 
 ---
 
+## 8.7 P3.C-diag findings + P3.C-sync design (2026-05-31)
+
+### Diagnosis verdict (per-request timing traces)
+
+JIT IS effective for far stages, and the estimate_pose anomaly is a
+return-to-pool settle issue, not a timing miscalculation.
+
+Evidence (Experiment B, per-run redeploy):
+| stage | cold | same_container | gap(warmup_ready->real_invoke) |
+|---|---|---|---|
+| detect_object | 10/10 | 0/10 | (entry, no warmup — expected cold) |
+| estimate_pose | 7/10 | 3/10 | gap_mean 1581ms, gap_MIN 317ms |
+| match_face | 1/10 | 9/10 | gap_mean 2640ms |
+| classify_scene | 4/10 | 6/10 | gap_min -533ms |
+| translate_alert | 0/10 | 10/10 | gap_mean 3619ms |
+
+- Cold rows are exactly the same_container=False rows; warm rows are
+  same_container=True. So when the real invoke hits the warmup's
+  container, it is warm; when it does not, it cold-starts a new one.
+- match/translate have LARGE gaps (2.6-3.6s) -> warmup container fully
+  settled into the Paused pool -> real invoke reliably hits it.
+- estimate (first hop) has a TINY gap (0.3s) because the warmup
+  invocation itself costs a full cold start (~2.3s = ow_wait 2.16s +
+  init 0.14s), consuming most of the first hop's lead time. The real
+  invoke arrives before the warmup container has settled into Paused ->
+  OpenWhisk creates a new (cold) container.
+- Experiment A (--skip-reset, near-real deployment): estimate cold only
+  on run 1, warm runs 2-10 (hits the warm container left by the previous
+  run). So the anomaly is amplified by per-run redeploy.
+
+Literature check: in real serverless, >50% of functions execute <100ms
+while cold starts are 0.1-2s. So single-hop execution generally CANNOT
+hide cold starts; this is exactly why prewarming is researched. Our mock
+actions (2-9s) are already far longer than real functions, so inflating
+action workload is the wrong direction.
+
+### The first-hop problem and why prewarm is NOT the answer
+
+The first hop (entry's direct downstream) is the hardest for JIT because:
+- Its lead time is just the entry stage's execution time.
+- A warmup invocation itself takes ~2.3s (a full cold start) to create
+  the container.
+- So the first hop needs entry_exec > 2.3s + settle, which may not hold,
+  especially once entry prewarm makes the entry stage fast.
+
+Owner's better idea (adopted): instead of handing the first hop to
+prewarm, the orchestrator should NOT blindly fire the real invoke and
+eat a cold start. It should wait (bounded) for its own warmup container
+to be ready, then dispatch -> hit warm.
+
+### P3.C-sync: warmup-synchronized dispatch
+
+Before issuing a stage's real invoke, the orchestrator checks the status
+of ITS OWN warmup for that stage (a known fact — the warmup is a
+blocking call it issued, so it knows when it returns):
+
+```
+before real invoke of stage X:
+  if X's warmup has COMPLETED (blocking call returned):
+      container is ready/warm -> dispatch immediately (no wait)
+  elif X's warmup is IN FLIGHT (issued, not yet returned):
+      ready_time = warmup_completion + pauseGrace
+      wait_needed = ready_time - now
+      if wait_needed < cold_overhead:   # waiting beats cold-starting
+          sleep(wait_needed); then dispatch -> hit warm
+      else:
+          dispatch now (waiting not worthwhile)
+  else (no warmup issued, e.g. entry):
+      dispatch now
+```
+
+Why bounded wait always beats blind cold start: the warmup was fired
+earlier (JIT lead), so the warmup container's creation started BEFORE a
+fresh cold start would. Waiting for it is always <= cold-starting anew.
+
+Why NOT query the global container pool: we considered letting the
+orchestrator query "does this action currently have a warm container"
+to skip waiting when already warm. Rejected as infeasible/not worth it:
+- Prometheus scrape interval is 15-30s; far too stale for ms-level
+  dispatch decisions (literature: Prometheus unsuitable for ms
+  granularity). OpenWhisk's pool metrics are also mostly aggregate, not
+  per-action warm count.
+- Adding a real-time OpenWhisk query interface means invoker source
+  changes + a network round trip per dispatch (slows dispatch) + still
+  a staleness gap.
+- The orchestrator's OWN warmup-completion status (a deterministic local
+  fact, NOT the rejected ledger's global inference) already answers
+  "is it warm?" for the common case. The only thing global-pool query
+  would add is avoiding an over-wait when ANOTHER request left a warm
+  container — and that over-wait costs only a little extra wait, never a
+  cold start. Not worth the cost.
+
+This is distinct from the rejected ledger: it uses only the certain
+return of a blocking warmup call this orchestrator issued, not a global
+inference subject to race/reclamation/multi-node blind spots.
+
+Note: bounded wait adds a little latency to that stage's start, but
+since wait < cold_overhead, net E2E is lower than blind cold start.
+Multi-workflow race can still let another request grab the container
+in the instant before dispatch; that is the accepted v1 race, measured
+later.
+
+### Division of labor (revised, owner-aligned)
+
+- entry stage (detect): has no upstream, cannot JIT -> entry prewarm
+  (P3.E) keeps it warm.
+- first hop and beyond (estimate, match, ...): JIT + warmup-synchronized
+  bounded-wait dispatch. NO prewarm coverage needed for the first hop;
+  the bounded wait makes first-hop JIT effective.
+
+---
+
 ## 9. Implementation Subtasks (revised order)
 
 Given this architecture, the path 3 system subtasks:
