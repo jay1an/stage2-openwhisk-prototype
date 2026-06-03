@@ -67,6 +67,36 @@ Constructing longer workflows lets us show beam search remaining fast
 and near-optimal where brute force fails. This is the key evidence for
 the algorithm contribution.
 
+### Paper narrative — DEFERRED until experiments complete (owner decision)
+
+The owner will design the paper story AFTER the system experiments are
+complete (not now). Brief notes captured so the framing is not lost:
+
+- This is a SYSTEMS paper, not "just engineering". Each design decision
+  is a paper insight: JIT timing, warmup-synchronized dispatch, execution
+  time as a dual-purpose budget (latency cost + cold-start-hiding budget),
+  the first-hop JIT physical limit (warmup itself costs a full cold
+  start), and OpenWhisk not guaranteeing warmup-container reuse.
+- Likely structure: a complete system (A) + a fast near-optimal planning
+  technique (closed-form risk + beam reused offline/online, B) + several
+  insights (cold-start cascade, execution-as-budget, JIT limits, C).
+- Differentiation one-liners to prepare: vs ORION/Jolteon (static,
+  one-shot) we are online + dynamic + time-varying; vs Aquatope (prewarm
+  and resource separate, no DAG joint) we do closed-form risk-driven DAG
+  joint planning; vs SMIless (keepalive=0, single SLO) we add multi-SLO
+  + JIT + dynamic; nobody treats execution time as a cold-hiding budget,
+  nobody does JIT + warmup-sync and characterizes the platform reuse
+  limit.
+- Remaining experiments the story will require (drives the backlog):
+  end-to-end SLO satisfaction vs baselines (P3.G), multi-SLO
+  differentiation, dynamic-plan recovery effect (after P3.D), end-to-end
+  cost, multi-workflow generalization (spoken_dialog/visual_qa), race
+  impact under true concurrency (P3.G).
+- Target venue not yet chosen; will influence framing and emphasis.
+
+Do NOT write a full PAPER_NARRATIVE.md yet — revisit after the system
+experiments produce evidence.
+
 ---
 
 ## 1. Multi-SLO Architecture
