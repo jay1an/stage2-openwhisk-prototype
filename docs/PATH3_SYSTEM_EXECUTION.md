@@ -629,6 +629,71 @@ later.
 
 ---
 
+## 8.8 P3.C-sync results + residual analysis (2026-05-31)
+
+Implemented warmup-synchronized bounded-wait dispatch. Results (N=10,
+per-run redeploy cold-stress):
+
+| stage | off | no-sync | sync | sync waited mean |
+|---|---|---|---|---|
+| detect_object | 100% | 100% | 100% | 0ms (entry) |
+| estimate_pose | 100% | 80% | 30% | 1251ms |
+| match_face | 100% | 30% | 0% | 52ms |
+| classify_scene | 100% | 10% | 0% | 392ms |
+| translate_alert | 100% | 20% | 0% | 112ms |
+
+- match/classify/translate: cold-stress cold rate -> 0% with small wait.
+- estimate_pose (first hop): 80% -> 30%, same_container 20% -> 70%.
+- E2E: off 23.1s, no-sync 18.0s, sync 18.0s (sync trims tail, mean ~same).
+- skip-reset sync E2E 14.4s.
+
+### Residual estimate_pose 30% root cause
+
+A diagnostic row showed: jit_sync_status=completed, waited 1772ms,
+gap(warmup_ready->real)=757ms, yet same_container=False, cold_like=True,
+real_ow_wait=2122ms. I.e. the orchestrator waited for its own warmup to
+COMPLETE, but OpenWhisk STILL routed the real invoke to a NEW container.
+
+So "wait for own warmup completion" does NOT guarantee the real invoke
+reuses that container — OpenWhisk's scheduling does not guarantee reuse.
+For far stages the warmup container settles into the Paused pool with a
+large buffer (gap 2.6-3.6s) so reuse is reliable; for the first hop the
+warmup completes only ~0.3-0.8s before the real invoke, and even a
+completed warmup may not be in the schedulable Paused pool yet, OR
+OpenWhisk independently chose a new container.
+
+This is NOT a logic bug and NOT a cross-workflow race (the test runs
+workflows strictly sequentially: run_one_workflow blocks, then
+wait_for_scheduler_empty, before the next workflow). It is the inherent
+"OpenWhisk does not guarantee warmup-container reuse" limitation, worst
+in the first hop where timing is tightest.
+
+### Concurrency / race status in current tests
+
+- Cross-workflow race: NONE (sequential test, one workflow fully
+  finishes before the next).
+- Within-workflow same-stage multiple warmups: NONE (JitScheduler
+  upsert dedups by task_key = request_id:stage_name; one warmup per
+  stage, only its fire_time updates).
+- Within-workflow different stages: different action variants, no shared
+  container.
+- TRUE multi-workflow concurrency race: NOT exercised yet; will appear
+  in P3.G end-to-end multi-workflow replay. That is where the accepted
+  v1 race gets measured (>5% -> reconsider invoker change).
+
+### Next: settle grace experiment
+
+Add a settle grace after warmup completion before dispatch, and test
+300ms vs 500ms, to see how low estimate_pose can go. Expectation: it may
+drop to ~15-20% but likely NOT zero, because part of the residual is
+OpenWhisk not guaranteeing reuse (a scheduling decision, not a settle
+delay). If added grace does not help beyond ~20-30%, accept the residual
+as a worst-case (cold-stress) bound; real deployment (skip-reset) is
+already much better, and entry prewarm (P3.E) will further help the
+first hop.
+
+---
+
 ## 9. Implementation Subtasks (revised order)
 
 Given this architecture, the path 3 system subtasks:

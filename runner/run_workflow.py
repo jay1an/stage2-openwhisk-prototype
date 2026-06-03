@@ -260,6 +260,12 @@ def invoke_node(
         }
 
 
+def status_value(status: object, key: str, default: object = "") -> object:
+    if isinstance(status, dict):
+        return status.get(key, default)
+    return getattr(status, key, default)
+
+
 def run_one_workflow(
     workflow: WorkflowSpec,
     client: OpenWhiskClient,
@@ -272,9 +278,13 @@ def run_one_workflow(
     jit_scheduler: object | None = None,
     enable_jit: bool = False,
     jit_margin_ms: float = 600.0,
+    jit_warmup_tracker: object | None = None,
+    enable_jit_sync: bool = False,
+    jit_sync_pause_grace_ms: float = 3000.0,
 ) -> List[dict]:
     normalized_plan = validate_stage_plan(workflow, plan) if plan is not None else None
     jit_active = bool(enable_jit and jit_scheduler is not None and normalized_plan is not None)
+    jit_sync_active = bool(jit_active and enable_jit_sync and jit_warmup_tracker is not None)
     warm_splines = None
     cold_overhead_table = None
     if jit_active:
@@ -496,6 +506,64 @@ def run_one_workflow(
                 schedule_phase="upsert",
             )
 
+    def wait_for_stage_warmup(stage_name: str) -> dict:
+        sync_info = {
+            "jit_sync_enabled": jit_sync_active,
+            "jit_sync_waited_ms": 0.0,
+            "jit_sync_dispatch_after_warmup": False,
+            "jit_sync_status": "not_applicable",
+            "jit_sync_warmup_issued_monotonic": "",
+            "jit_sync_warmup_completed_monotonic": "",
+        }
+        if not jit_sync_active or stage_name == workflow.entry:
+            return sync_info
+
+        start_wait = time.monotonic()
+        max_wait_s = max(0.0, stage_cold_overhead_ms(stage_name) / 1000.0)
+        pause_grace_s = max(0.0, jit_sync_pause_grace_ms / 1000.0)
+        deadline = start_wait + max_wait_s
+
+        status = {}
+        if hasattr(jit_warmup_tracker, "get_status"):
+            status = jit_warmup_tracker.get_status(request_id, stage_name)
+        issued = status_value(status, "issued_monotonic", "")
+        completed = status_value(status, "completed_monotonic", "")
+        if issued not in ("", None):
+            sync_info["jit_sync_warmup_issued_monotonic"] = issued
+            sync_info["jit_sync_status"] = "in_flight"
+        else:
+            sync_info["jit_sync_status"] = "not_issued"
+
+        if completed in ("", None) and hasattr(jit_warmup_tracker, "wait_until_completed"):
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining > 0.0:
+                status = jit_warmup_tracker.wait_until_completed(
+                    request_id,
+                    stage_name,
+                    remaining,
+                )
+                issued = status_value(status, "issued_monotonic", issued)
+                completed = status_value(status, "completed_monotonic", completed)
+
+        if issued not in ("", None):
+            sync_info["jit_sync_warmup_issued_monotonic"] = issued
+        if completed not in ("", None):
+            sync_info["jit_sync_warmup_completed_monotonic"] = completed
+            sync_info["jit_sync_dispatch_after_warmup"] = True
+            sync_info["jit_sync_status"] = "completed"
+            ready_at = float(completed) + pause_grace_s
+            remaining_grace = ready_at - time.monotonic()
+            remaining_budget = deadline - time.monotonic()
+            if remaining_grace > 0.0 and remaining_budget > 0.0:
+                time.sleep(min(remaining_grace, remaining_budget))
+        elif issued not in ("", None):
+            sync_info["jit_sync_status"] = "timed_out_in_flight"
+        else:
+            sync_info["jit_sync_status"] = "timed_out_not_issued"
+
+        sync_info["jit_sync_waited_ms"] = (time.monotonic() - start_wait) * 1000.0
+        return sync_info
+
     enqueue_initial_jit_warmups()
     trace_rows[0]["jit_scheduled_count"] = jit_scheduled_count
     trace_rows[0]["jit_upsert_count"] = jit_upsert_count
@@ -517,18 +585,30 @@ def run_one_workflow(
 
                 started_at[node.name] = time.monotonic()
 
+                def invoke_with_optional_sync(
+                    ready_node: NodeSpec = node,
+                    ready_memory_mb: int | None = node_memory_mb,
+                    ready_cpu_cores: float | None = node_cpu_cores,
+                    ready_action_name: str = node_action_name,
+                ) -> dict:
+                    sync_info = wait_for_stage_warmup(ready_node.name)
+                    row = invoke_node(
+                        client,
+                        workflow,
+                        ready_node,
+                        request_id,
+                        entry_ts_ms,
+                        completed,
+                        ready_memory_mb,
+                        ready_cpu_cores,
+                        ready_action_name,
+                        slo_class,
+                    )
+                    row.update(sync_info)
+                    return row
+
                 future = pool.submit(
-                    invoke_node,
-                    client,
-                    workflow,
-                    node,
-                    request_id,
-                    entry_ts_ms,
-                    completed,
-                    node_memory_mb,
-                    node_cpu_cores,
-                    node_action_name,
-                    slo_class,
+                    invoke_with_optional_sync,
                 )
                 running[node.name] = future
 
