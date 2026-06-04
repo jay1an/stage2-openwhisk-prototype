@@ -63,6 +63,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-workers", type=int, default=8)
     parser.add_argument("--timeout-sec", type=int, default=300)
     parser.add_argument("--jit-margin-ms", type=float, default=600.0)
+    parser.add_argument("--jit-fire-settle-ms", type=float, default=0.0)
+    parser.add_argument("--jit-settle-ms", type=float, default=2000.0)
     parser.add_argument("--jit-sync-pause-grace-ms", type=float, default=3000.0)
     parser.add_argument("--skip-reset", action="store_true")
     parser.add_argument("--jit-only", action="store_true")
@@ -335,6 +337,7 @@ def run_batch(
             enable_jit=enable_jit,
             jit_scheduler=scheduler,
             jit_margin_ms=args.jit_margin_ms,
+            jit_fire_settle_ms=args.jit_fire_settle_ms,
             jit_warmup_tracker=tracker,
             enable_jit_sync=enable_jit_sync,
             jit_sync_pause_grace_ms=args.jit_sync_pause_grace_ms,
@@ -363,6 +366,8 @@ def build_timing_rows(
     experiment_label: str,
     jit_rows: list[list[dict]],
     warmups: list[dict],
+    jit_settle_ms: float,
+    jit_fire_settle_ms: float,
 ) -> list[dict]:
     warmup_by_stage = {
         (record.get("request_id"), record.get("stage_name")): record
@@ -382,8 +387,12 @@ def build_timing_rows(
             warmup_ready = warmup.get("callback_end", "")
             real_invoke = row.get("real_invoke_monotonic", "")
             gap_ms = ""
+            settle_complete = ""
+            gap_real_minus_settle_ms = ""
             if warmup_ready not in ("", None) and real_invoke not in ("", None):
                 gap_ms = (float(real_invoke) - float(warmup_ready)) * 1000.0
+                settle_complete = float(warmup_ready) + jit_settle_ms / 1000.0
+                gap_real_minus_settle_ms = (float(real_invoke) - settle_complete) * 1000.0
             warmup_container = warmup.get("container_id", "")
             real_container = row.get("container_id", "")
             same_container = (
@@ -396,12 +405,16 @@ def build_timing_rows(
                     "experiment": experiment_label,
                     "run_index": run_index,
                     "request_id": request_id,
+                    "workflow_e2e_ms": workflow_rows[0].get("workflow_e2e_ms", ""),
                     "stage_name": stage_name,
                     "tier": PREMIUM_PLAN[stage_name],
                     "warmup_scheduled_fire_monotonic": warmup.get("scheduled_fire_time", ""),
                     "warmup_fire_monotonic": warmup.get("callback_start", ""),
                     "warmup_sent_monotonic": warmup.get("warmup_sent_monotonic", ""),
+                    "warmup_issued_monotonic": warmup.get("warmup_sent_monotonic", ""),
                     "warmup_ready_monotonic": warmup_ready,
+                    "warmup_return_monotonic": warmup_ready,
+                    "settle_complete_monotonic": settle_complete,
                     "warmup_activation_id": warmup.get("activation_id", ""),
                     "warmup_container_id": warmup_container,
                     "warmup_cold_like": warmup.get("cold_like", ""),
@@ -418,8 +431,11 @@ def build_timing_rows(
                     "same_container": same_container,
                     "cold_like": row.get("cold_like", ""),
                     "gap_warmup_ready_to_real_ms": gap_ms,
+                    "gap_real_minus_settle_ms": gap_real_minus_settle_ms,
                     "stage_start_monotonic": row.get("stage_start_monotonic", ""),
                     "resolved_action_name": row.get("resolved_action_name", ""),
+                    "jit_fire_settle_ms": jit_fire_settle_ms,
+                    "jit_settle_ms": jit_settle_ms,
                     "jit_sync_enabled": row.get("jit_sync_enabled", ""),
                     "jit_sync_waited_ms": row.get("jit_sync_waited_ms", ""),
                     "jit_sync_dispatch_after_warmup": row.get("jit_sync_dispatch_after_warmup", ""),
@@ -437,12 +453,16 @@ def write_timing_csv(path: Path, rows: list[dict]) -> None:
         "experiment",
         "run_index",
         "request_id",
+        "workflow_e2e_ms",
         "stage_name",
         "tier",
         "warmup_scheduled_fire_monotonic",
         "warmup_fire_monotonic",
         "warmup_sent_monotonic",
+        "warmup_issued_monotonic",
         "warmup_ready_monotonic",
+        "warmup_return_monotonic",
+        "settle_complete_monotonic",
         "warmup_activation_id",
         "warmup_container_id",
         "warmup_cold_like",
@@ -459,8 +479,11 @@ def write_timing_csv(path: Path, rows: list[dict]) -> None:
         "same_container",
         "cold_like",
         "gap_warmup_ready_to_real_ms",
+        "gap_real_minus_settle_ms",
         "stage_start_monotonic",
         "resolved_action_name",
+        "jit_fire_settle_ms",
+        "jit_settle_ms",
         "jit_sync_enabled",
         "jit_sync_waited_ms",
         "jit_sync_dispatch_after_warmup",
@@ -726,6 +749,8 @@ def run_jit_variant(
             experiment_label=experiment_label,
             jit_rows=rows,
             warmups=warmups,
+            jit_settle_ms=args.jit_settle_ms,
+            jit_fire_settle_ms=args.jit_fire_settle_ms,
         )
         return rows, warmups, timing_rows
     finally:

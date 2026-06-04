@@ -278,6 +278,7 @@ def run_one_workflow(
     jit_scheduler: object | None = None,
     enable_jit: bool = False,
     jit_margin_ms: float = 600.0,
+    jit_fire_settle_ms: float = 0.0,
     jit_warmup_tracker: object | None = None,
     enable_jit_sync: bool = False,
     jit_sync_pause_grace_ms: float = 3000.0,
@@ -437,7 +438,11 @@ def run_one_workflow(
         node = workflow.nodes[stage_name]
         stage_tier = normalized_plan[stage_name]
         cold_overhead_ms = stage_cold_overhead_ms(stage_name)
-        raw_fire_time = needed_at - cold_overhead_ms / 1000.0 - jit_margin_ms / 1000.0
+        raw_fire_time = (
+            needed_at
+            - (cold_overhead_ms + jit_fire_settle_ms) / 1000.0
+            - jit_margin_ms / 1000.0
+        )
         late_jit = raw_fire_time <= now
         fire_time = now if late_jit else raw_fire_time
         if late_jit:
@@ -470,6 +475,7 @@ def run_one_workflow(
                 "fire_time": fire_time,
                 "late_jit": late_jit,
                 "jit_margin_ms": jit_margin_ms,
+                "jit_fire_settle_ms": jit_fire_settle_ms,
                 "cold_overhead_ms": cold_overhead_ms,
                 "parents": list(node.parents),
                 "schedule_phase": schedule_phase,
