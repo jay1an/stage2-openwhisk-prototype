@@ -151,45 +151,85 @@ a useful concept to incorporate.
 
 ---
 
-### 6. SMIless (SC 2024)
+### 6. SMIless (SC 2024) — VERIFIED FROM SOURCE (github blinkbear/smiless-ad)
 
-**How it finds a plan:**
-Critical-path analysis + knapsack-style resource-cold-start co-optimization.
+Earlier notes about SMIless were based on the abstract and were WRONG on
+two points (keepalive=0, knapsack). The following is corrected after
+reading the actual optimizer source (optimizer-engine/optimizer/
+smiless.py 593 lines + path_search.py 509 lines).
 
-1. Analyze DAG, find critical path (considering dynamic invocations where
-   different inputs activate different branches).
-2. Allocate budget to critical-path stages first (knapsack: maximize latency
-   reduction per dollar spent).
-3. Co-optimize resource config and prewarm targets jointly.
+**How it actually finds a plan:**
+A* search (priority queue with admissible heuristic + SLA pruning) over
+the DAG, deciding PER NODE which device to use.
 
-keepalive is always 0 (scale-to-zero between requests).
+1. Nodes are ordered topologically (current_index 0..N).
+2. Each node has only TWO candidates: device in {cpu, cuda}. NOT memory
+   tiers. So the search space is 2^N, not tiers^N.
+3. A* state = (prefix of decided nodes, current_index). Priority
+   f = g + h:
+   - g = actual accumulated cost of decided nodes
+   - h = calc_heuristic_cost = remaining nodes' minimum execution time
+     lower bound (gpu_inference_time sum); if current_time + remaining
+     > SLA, prune (return inf)
+4. Constraint: completion_time <= SLA. Objective: min total cost.
+5. The repo also implements bfs / dfs / bfs_with_top_k(k=2) as variants.
+   bfs_with_top_k IS essentially beam search (they call it aug_smiless),
+   but the MAIN method is A*.
 
-**Relevance to our project:**
-- Critical-path-first budget allocation is a good heuristic for our planner.
-  Our DAG has one join point (classify_scene), so the critical path shifts
-  between the two paths depending on cold/warm state.
-- The knapsack formulation could inspire our resource allocation: given a
-  cost budget, which stages benefit most from more memory?
+**Prewarming (the "adaptive pre-warming window"):**
+```
+prewarm_window = max(0, IT - execution_time)
+```
+where IT = inter-arrival time (online predicted). If the predicted gap
+between requests exceeds execution time, prewarm that much ahead. This is
+WINDOW-LEVEL / statistical prewarming based on arrival rate, NOT
+per-request continuous-time JIT.
 
-**What we improve over SMIless:**
-- SMIless has keepalive=0. We add keepalive as an optimization variable.
-  This matters for bursty workloads with quiet periods — keepalive bridges
-  short gaps between bursts without paying cold-start cost.
-- SMIless targets ML inference (fixed DAG with conditional branches). We
-  handle general serverless workflows with time-varying arrival rates.
-- SMIless does not forecast arrivals. We use Stage 2 forecasting to
-  proactively adjust plans.
+**Keepalive (CORRECTED — SMIless DOES use keepalive, not 0):**
+SMIless chooses keepalive OR prewarm per function:
+```
+if prewarm_window == 0:  keep_alive_time = calc_keep_alive_time(entry)*unit
+else:                    keep_alive_time = -1   # rely on prewarm instead
+```
+- Frequent arrivals (execution_time >= interval, prewarm_window=0) ->
+  keep the container ALIVE.
+- Sparse arrivals (prewarm_window > 0) -> use prewarm, no keepalive.
+Keepalive duration is computed from the entry node's arrival statistics.
 
-**How keepalive helps (our discussion):**
-keepalive is a cost-risk tradeoff knob:
-- Long keepalive → containers survive quiet gaps → fewer cold starts → more
-  idle cost.
-- Short keepalive → containers released quickly → save idle cost → cold
-  starts after gaps.
-- Combined with prewarm: short keepalive + accurate JIT prewarm = cheapest
-  way to avoid cold starts. Long keepalive = insurance when forecasting is
-  inaccurate.
-The planner can trade off between these strategies per-stage and per-window.
+**Relevance / what we genuinely improve over SMIless:**
+- Decision space: SMIless picks CPU-vs-GPU (2 choices/node); we pick
+  among 9 memory tiers/stage (9^N, much larger and harder).
+- Search: SMIless uses A* (admissible heuristic = remaining min exec
+  time -> provably optimal). We use beam (near-optimal, empirically
+  matches brute force). We can RE-EXPRESS our search as A* using our
+  risk-aware marginal efficiency as a MORE INFORMED heuristic than their
+  execution-time lower bound (see Innovation notes).
+- Prewarming granularity: SMIless prewarms at the window/statistical
+  level (IT - execution_time); ours is per-request continuous-time JIT
+  triggered off the actual upstream completion, plus
+  warmup-synchronized dispatch. Finer-grained.
+- Container reuse settle delay: SMIless's prewarm model ASSUMES a warmed
+  container is immediately reusable. It does NOT model the time from
+  "warmup completes" to "container is reusable by the real invoke"
+  (we measured ~2.3s on OpenWhisk). Their window-level prewarming is
+  insensitive to this; our per-request JIT is not, so we discovered and
+  must model it. This is a unique finding (pending probe confirmation).
+- Keepalive: SMIless decides keepalive-vs-prewarm from arrival stats
+  (single SLA). We treat keepalive as a static/per-stage config and add
+  multi-SLO classes + dynamic plan adjustment.
+- SMIless: single SLA, CPU/GPU heterogeneity. Ours: multi-SLO classes,
+  memory-tier heterogeneity, time-varying arrival forecasting, dynamic
+  mid-workflow replanning.
+
+**Implication for our search method (beam -> A*):**
+Re-expressing our planner as A* (g = decided-stage cost, h = lower bound
+on remaining-stage cost + SLO feasibility pruning) gives provable
+optimality and a stronger narrative (same "A* with admissible heuristic"
+framing as SMIless), on a HARDER decision space (9 tiers vs 2 devices).
+Our marginal-efficiency theory is NOT discarded: it becomes (a) the
+risk-aware search-ordering heuristic inside A*, and (b) the fast
+near-optimal fallback for online dynamic replanning when A* is too slow.
+Keep beam as a comparison baseline (as SMIless keeps bfs/dfs/beam).
 
 ---
 
@@ -197,14 +237,15 @@ The planner can trade off between these strategies per-stage and per-window.
 
 | Capability | ORION | Jolteon | AQUATOPE | SMIless | IceBreaker | GrandSLAm | Ours |
 |---|---|---|---|---|---|---|---|
-| DAG-aware latency | CDF conv | parametric | per-stage | crit-path | none | per-stage | MC + analytical |
-| Resource sizing | greedy | convex opt | BO | knapsack | none | none | sweep + opt |
-| Prewarm | JIT | none | BNN | yes | yes | none | JIT per-window |
-| Keep-alive | none | none | none | none | utility | none | **per-stage opt** |
-| Time-varying load | static | static | BNN pred | static | Fourier | runtime | **multi-method forecast** |
-| DAG propagation | none | none | none | none | none | none | **delay_kernel** |
-| Joint optimization | partial | sizing only | separated | partial | keepalive only | none | **all three knobs** |
-| Online adaptive | none | none | partial | none | yes | yes | planned |
+| DAG-aware latency | CDF conv | parametric | per-stage | A* over DAG | none | per-stage | MC + analytical (FW+Clark) |
+| Resource decision | mem greedy | mem convex | mem BO | CPU/GPU (2/node) A* | none | none | 9 mem tiers/stage, beam→A* |
+| Prewarm | JIT lookahead | none | BNN | window (IT-exec) | yes | none | per-request continuous JIT |
+| Container reuse settle | not modeled | n/a | not modeled | not modeled | n/a | n/a | **measured ~2.3s, modeled** |
+| Keep-alive | none | none | none | keepalive-or-prewarm (arrival stats, 1 SLA) | utility | none | static/per-stage + multi-SLO |
+| Time-varying load | static | static | BNN pred | online IT | Fourier | runtime | **multi-method forecast** |
+| Joint optimization | partial | sizing only | separated | resource+prewarm | keepalive only | none | **resource+prewarm+dynamic** |
+| Multi-SLO classes | no | no | no | no (single SLA) | no | no | **yes** |
+| Online adaptive | none | none | partial | none | yes | yes | dynamic mid-workflow (planned) |
 
 ---
 
@@ -242,16 +283,59 @@ is valid for our mock actions and serves as an upper bound on what's
 achievable with instrumented functions. For uninstrumented functions, we
 fall back to parametric T(memory) fitting.
 
-### Innovation 3 (Mechanism): keepalive as Explicit Optimization Variable
+### Innovation 3 (Mechanism): keepalive handling
 
-All prior work either ignores keepalive (ORION, Jolteon, AQUATOPE, SMIless)
-or treats it independently from DAG-level SLO (IceBreaker).
+CORRECTION: SMIless DOES use keepalive (keepalive-or-prewarm per function
+from arrival statistics, single SLA). So "nobody does keepalive" is wrong.
+Our differentiation is: keepalive under MULTI-SLO classes + combined with
+per-request JIT and dynamic mid-workflow replanning, not keepalive
+existence per se.
 
-We expose keepalive_sec as a per-stage, per-window decision variable and
-jointly optimize it with prewarm_count and memory_tier. This is especially
-valuable for bursty-then-quiet workloads where:
-- Short keepalive + accurate prewarm = minimal cost, no cold starts.
-- Long keepalive = insurance against forecast errors during quiet periods.
+### Innovation 3b (Measurement + Mechanism): Container Reuse Settle Delay
+
+Discovered while building per-request JIT + warmup-synchronized dispatch:
+on OpenWhisk, after a warmup invocation completes (container created, code
+loaded), the container is NOT immediately reusable by a subsequent real
+invoke. There is a settle delay (measured gap threshold ~2.3s, consistent
+across stages: gap>2.4s -> reuse hit, gap<2.0s -> cold start) before the
+container is schedulable from the free pool.
+
+Why this is novel:
+- Window/statistical prewarming (SMIless: prewarm_window = IT - exec_time)
+  ASSUMES instant reusability and is insensitive to this delay.
+- Only per-request, precise-timing JIT (ours) hits this wall, because it
+  tries to make the container ready exactly when the downstream is needed.
+- The first hop (entry's direct downstream) is hardest: its lead time is
+  just the entry execution, and the warmup itself costs a full cold start,
+  so the gap is tight and often < 2.3s.
+
+Our mechanism: warmup-synchronized bounded-wait dispatch — wait (bounded
+by cold_overhead) for the settle window before issuing the real invoke,
+turning a blind cold start into a short wait + warm hit.
+
+STATUS: pending confirmation by the container-reuse-delay probe experiment
+(scripts/probe_container_reuse_delay.py, to be run). If confirmed, this is
+a standalone measurement insight + mechanism contribution that prior DAG
+prewarming work (SMIless/ORION/AQUATOPE) does not address.
+
+### Innovation 3c (Search): A* with risk-aware heuristic (beam as baseline)
+
+SMIless frames its planner as A* over the DAG with an admissible heuristic
+(remaining min execution time). We can re-express our planner the same way
+on a harder decision space (9 memory tiers/stage vs their 2 devices/node),
+using our marginal efficiency (risk_reduction / cost_increase) as a MORE
+INFORMED, risk-aware heuristic. The existing beam search becomes a
+comparison baseline (SMIless similarly keeps bfs/dfs/beam variants). The
+marginal-efficiency theory is reused as (a) A* search-ordering heuristic
+and (b) fast near-optimal fallback for online dynamic replanning.
+
+### Innovation 3d (original): keepalive as joint variable
+
+(Original framing, partially superseded by 3 above.) Expose keepalive as a
+decision variable jointly optimized with prewarm and memory tier, valuable
+for bursty-then-quiet workloads. Note SMIless already does a
+keepalive-or-prewarm choice; our addition is the multi-SLO + JIT + dynamic
+combination.
 
 ### Innovation 4 (Modeling): DAG Delay Kernel for Demand Propagation
 
@@ -328,3 +412,45 @@ configuration and can serve as input for Stage 3 profiling.
 3. Design memory/CPU sweep experiment for the Amdahl/parametric latency model.
 4. Formalize the Stage 5 optimization problem (chance-constrained).
 5. Implement analytical risk model as fast alternative to MC.
+
+---
+
+## Appendix: SMIless Source-Verified Facts (2026-06, github blinkbear/smiless-ad)
+
+Read directly from optimizer-engine/optimizer/{smiless.py, path_search.py}.
+Recorded so we never again rely on the (wrong) abstract-level summary.
+
+Search (path_search.py):
+- Main: A* / priority-queue search over DAG nodes in topological order.
+- Per node, only 2 device candidates {cpu, cuda}. Search space 2^N.
+- Priority f = g (accumulated actual cost of decided nodes) + h.
+- Heuristic h (calc_heuristic_cost): sum of remaining nodes'
+  gpu_inference_time (min exec lower bound); prune to inf if
+  current_time + remaining > SLA.
+- Constraint completion_time <= SLA; objective min total cost.
+- Variants implemented: path_search (A*-like), A_star_search, bfs, dfs,
+  bfs_with_top_k(k=2) == beam (called aug_smiless). Main is A*.
+
+Prewarm (calc_prewarm_window):
+- prewarm_window = max(0, IT - execution_time), IT = inter-arrival time.
+- Window/statistical level, based on predicted arrival rate. Assumes a
+  warmed container is immediately reusable (no settle-delay modeling).
+
+Keepalive (smiless.py get_keep_alive_time*):
+- Per function: if prewarm_window == 0 -> keep_alive_time =
+  calc_keep_alive_time(entry)*unit (KEEP ALIVE); else -> -1 (rely on
+  prewarm). So it is keepalive-OR-prewarm, single SLA.
+- Variants: SMIlessFIP uses Fourier extrapolation for arrival prediction;
+  SMIlessAzure uses distribution-based IT+keepalive prediction.
+
+Forecasting:
+- Online predictor estimates inter-arrival time (IT). SMIlessFIP uses
+  Fourier extrapolation (n_harm harmonics) — similar in spirit to our
+  fip-fourier Stage 2 method.
+
+Built on OpenFaaS (not OpenWhisk). Reported up to 5.73x cost reduction
+vs baselines while meeting SLA.
+
+Corrections to earlier notes in this doc: NOT keepalive=0; NOT knapsack;
+it is A* over a CPU/GPU device choice with arrival-driven keepalive-or-
+prewarm.
