@@ -521,7 +521,8 @@ def run_one_workflow(
         start_wait = time.monotonic()
         max_wait_s = max(0.0, stage_cold_overhead_ms(stage_name) / 1000.0)
         pause_grace_s = max(0.0, jit_sync_pause_grace_ms / 1000.0)
-        deadline = start_wait + max_wait_s
+        completion_deadline = start_wait + max_wait_s
+        deadline = completion_deadline + pause_grace_s
 
         status = {}
         if hasattr(jit_warmup_tracker, "get_status"):
@@ -535,7 +536,7 @@ def run_one_workflow(
             sync_info["jit_sync_status"] = "not_issued"
 
         if completed in ("", None) and hasattr(jit_warmup_tracker, "wait_until_completed"):
-            remaining = max(0.0, deadline - time.monotonic())
+            remaining = max(0.0, completion_deadline - time.monotonic())
             if remaining > 0.0:
                 status = jit_warmup_tracker.wait_until_completed(
                     request_id,

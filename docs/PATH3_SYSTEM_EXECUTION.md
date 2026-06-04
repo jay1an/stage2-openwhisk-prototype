@@ -694,6 +694,81 @@ first hop.
 
 ---
 
+## 8.9 Container reuse settle delay — MEASURED (2026-06)
+
+scripts/probe_container_reuse_delay.py ran a clean isolated probe:
+warmup an action, wait a controlled delay, then real-invoke, record hit.
+
+Result (hit rate vs delay, both actions identical):
+```
+delay_s | estimate_pose_1280 | match_face_2048
+0.0     | 0%                 | 0%
+0.5     | 0%                 | 0%
+1.0     | 0%                 | 0%
+1.5     | 0%                 | 12.5%
+2.0     | 100%               | 100%
+2.3-4.0 | 100%               | 100%
+```
+- miss: same_container=False, cold_like=True, real waitTime ~1.5-1.9s
+- hit: same_container=True, cold_like=False, real waitTime ~10-14ms
+- Threshold is ~2.0s, CONSISTENT across both actions -> it is a shared
+  OpenWhisk container-pool settle delay, not a per-stage workload trait.
+
+### Corrected total: warmup-to-reusable ≈ 4s
+
+The 2.0s settle is measured FROM warmup return. But the warmup
+invocation itself takes ~2.0s (its own ow_wait + init to create the
+container) before it returns. So end to end:
+```
+warmup issued
+  ├─ ~2.0s : warmup ow_wait + init (create container, load code) -> warmup returns
+  ├─ ~2.0s : settle (container becomes reusable from free pool)
+  └─ ~4.0s total : real invoke can hit this container
+```
+
+### Implication: first-hop JIT has limited value (owner's insight)
+
+JIT's lead time for the first hop (estimate) = the single entry stage's
+execution time. Compare to warmup-to-reusable ≈ 4s:
+- detect cold (~4.17s): lead time barely covers 4s; JIT can just hide it
+  (but margin ~0, fragile)
+- detect warm (after entry prewarm, ~2.4s): lead time 2.4s < 4s; the
+  warmup container is NOT ready when estimate is needed. "Waiting" for it
+  (~1.6s) ≈ cold-starting (~2s). So first-hop JIT does NOT pay off, and
+  entry prewarm making detect faster makes it WORSE.
+
+Therefore (data-backed, matches the earlier deferred Q1/Q2):
+- entry (detect) AND first hop (estimate) -> covered by PREWARM (kept warm)
+- second hop onward (match/classify/translate) -> JIT, because their lead
+  time = cumulative multiple upstream stages >> 4s (probe shows
+  match/translate hit 100% in real workflow when gap > 2.4s).
+
+### JIT fire-time correction (separate fix)
+
+Current fire_time = needed_at - cold_overhead - margin MISSES the settle
+term. Correct: fire_time = needed_at - (cold_overhead + settle) - margin
+≈ needed_at - 4s - margin. This makes the warmup fire ~2s earlier so the
+container is settled before the real invoke arrives.
+
+IMPORTANT (addresses owner's E2E concern): fire-time change moves WHEN
+THE WARMUP IS ISSUED, not when the real invoke is issued. The real invoke
+still fires as soon as the upstream completes. Firing warmup earlier only
+makes the container ready sooner -> fewer/shorter sync waits -> E2E only
+improves or stays equal, never worsens. The thing that can ADD to E2E is
+the warmup-sync WAIT (real invoke waiting for settle); firing earlier
+REDUCES that wait. To be quantified by the per-stage wait experiment.
+
+Owner's "sense whether a free container already exists" point: in steady
+state a free warm container exists -> real invoke hits directly, no JIT
+needed. That is exactly entry prewarm's job (keep entry + first hop warm).
+No runtime pool query needed (ledger/Prometheus rejected earlier): entry
++ first hop guaranteed warm by prewarm; second hop+ guaranteed by JIT.
+
+Risk noted: any sync WAIT adds to E2E; the per-stage wait experiment will
+measure how much, and whether the fire-time fix removes the need to wait.
+
+---
+
 ## 9. Implementation Subtasks (revised order)
 
 Given this architecture, the path 3 system subtasks:
