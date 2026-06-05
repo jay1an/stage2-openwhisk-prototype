@@ -68,6 +68,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--jit-sync-pause-grace-ms", type=float, default=3000.0)
     parser.add_argument("--skip-reset", action="store_true")
     parser.add_argument("--jit-only", action="store_true")
+    parser.add_argument(
+        "--plain-only",
+        action="store_true",
+        help="run only JIT off vs plain no-sync JIT; skip the sync treatment",
+    )
     parser.add_argument("--enable-jit-sync", action="store_true")
     parser.add_argument("--reset-once-before", action="store_true")
     parser.add_argument("--experiment-label", default="jit_diag")
@@ -823,6 +828,19 @@ def main() -> None:
         client=client,
         warmup_client=warmup_client,
     )
+    if args.plain_only:
+        diag_csv = (
+            Path(args.diag_csv)
+            if args.diag_csv
+            else Path(args.diag_out_dir) / f"{args.experiment_label}_per_request_timing.csv"
+        )
+        write_timing_csv(diag_csv, no_sync_timing)
+        print(f"\nDiagnostic timing CSV: {diag_csv}")
+        print("\nPlain-JIT estimate_pose")
+        print_estimate_progression(no_sync_timing)
+        print_summary(off_rows, no_sync_rows, no_sync_warmups)
+        return
+
     sync_rows, sync_warmups, sync_timing = run_jit_variant(
         label="JIT on sync treatment",
         experiment_label=f"{args.experiment_label}_sync",

@@ -278,8 +278,13 @@ def run_one_workflow(
     jit_scheduler: object | None = None,
     enable_jit: bool = False,
     jit_margin_ms: float = 600.0,
+    # LogDriverLogStoreProvider makes warmup containers reusable as soon as the
+    # warmup returns, so the default plain JIT path keeps this at zero. It stays
+    # as an escape hatch for deployments with a measured post-warmup settle.
     jit_fire_settle_ms: float = 0.0,
     jit_warmup_tracker: object | None = None,
+    # Plain JIT dispatches as soon as upstreams complete. The sync path is kept
+    # only for non-LogDriver deployments where warmup completion is not enough.
     enable_jit_sync: bool = False,
     jit_sync_pause_grace_ms: float = 3000.0,
 ) -> List[dict]:
@@ -438,6 +443,8 @@ def run_one_workflow(
         node = workflow.nodes[stage_name]
         stage_tier = normalized_plan[stage_name]
         cold_overhead_ms = stage_cold_overhead_ms(stage_name)
+        # Plain LogDriver JIT: needed_at - cold_overhead - margin. The optional
+        # settle term is normally zero and should only be set from measurements.
         raw_fire_time = (
             needed_at
             - (cold_overhead_ms + jit_fire_settle_ms) / 1000.0
