@@ -769,6 +769,110 @@ measure how much, and whether the fire-time fix removes the need to wait.
 
 ---
 
+## 8.10 RESOLVED: the 2s was synchronous log collection (2026-06-05)
+
+The ~2s container-reuse settle is now fully explained and fixed, with
+source-level + measurement-level closure. Two earlier hypotheses of mine
+were WRONG and are corrected here.
+
+### Root cause (source + experiment)
+
+ContainerProxy reuse chain (ContainerProxy.scala):
+```
+run action -> initializeAndRun (includes collectLogs) -> RunCompleted
+  -> container transitions Running -> Ready -> NeedWork (now reusable)
+```
+collectLogs sits between "action finished" and "container reusable".
+
+- DockerToActivationLogStore.collectLogs (and the File variant): calls
+  `container.logs(logLimit, waitForSentinel=true)` — reads container
+  stdout and WAITS for the sentinel marker. On docker json-file this
+  read/flush takes ~2s. The container does not become reusable until
+  this returns.
+- LogDriverLogStore.collectLogs: `Future.successful(ActivationLogs())`
+  — returns empty immediately, does NOT read logs. Container becomes
+  reusable at once.
+
+### Experiment confirmation (probe, LogDriver vs DockerToActivation)
+
+| delay_s | DockerToActivation hit | LogDriver hit |
+|---|---|---|
+| 0.0-1.5 | 0% (cold, new container) | 100% |
+| 2.0+    | 100% | 100% |
+
+Under LogDriver, EVERY delay (including 0.0s) hits with wait ~13ms.
+Under DockerToActivation, delay<2s misses (the container is still in
+collectLogs, not yet in the free pool, so a new cold container is made).
+
+### State machine + timing (the full picture)
+
+```
+Running -> [collectLogs] -> Ready -> [pause-grace] -> Paused -> [idle-container] -> Removed
+```
+- collectLogs: ~2s under DockerToActivation, ~0 under LogDriver
+- pause-grace = 10 seconds (OpenWhisk DEFAULT; we did NOT override it)
+- idle-container (keepalive) = 10 seconds (we set this)
+
+Because pause-grace is 10s and the probe's max delay is 4s, the container
+stays in Ready the whole time and NEVER pauses (invoker logs show zero
+pause/resume during the probe). So a real invoke within 10s of the
+warmup hits a Ready container directly, wait ~13ms — no resume involved.
+
+### Corrections to my earlier wrong claims
+
+1. "The 2s is a platform-fixed property, switching log provider won't
+   help" — WRONG. It was DockerToActivation's synchronous collectLogs.
+   LogDriver removes it (verified: 0s delay now hits). I over-extrapolated
+   from the File-provider result (File still reads logs, so it also
+   blocked ~2s; LogDriver does not read logs at all).
+2. "pauseGrace defaults to 50ms" — WRONG. It defaults to 10 seconds.
+   That is why the container stays Ready across the whole 0-4s probe
+   range and the earlier 2s miss was NOT pause/resume but collectLogs
+   blocking the container from entering Ready/free-pool.
+
+### Decision: LogDriver is now PERMANENT
+
+The cluster's invoker now runs
+`-Dwhisk.spi.LogStoreProvider=...LogDriverLogStoreProvider` permanently
+(owner switched it, will not revert). Consequences:
+- Container reuse settle: ~2s -> ~13ms (delay 0 hits).
+- `wsk activation logs` no longer returns logs (logs go to the node-level
+  docker/k8s log driver). We do NOT depend on activation logs; our
+  trace/probe read response.result + annotations (container_id,
+  cold_like, ow_init_ms, ow_wait_ms), which are unaffected (verified).
+- Also offloads invoker log processing, which is the recommended setup
+  for high-concurrency load (matches the planned high-pressure tests).
+- ENVIRONMENT CHANGE: all experiments from here on run under LogDriver.
+  Prior data based on DockerToActivation + 2s settle belongs to the old
+  environment.
+
+### Implications for JIT (simplification)
+
+With settle ~0 and a 10s Ready window:
+- warmup container is reusable immediately after the warmup returns, and
+  stays Ready for ~10s (pause-grace).
+- A real invoke within 10s of the warmup hits directly (~13ms), no resume.
+- Therefore:
+  * JIT fire-time no longer needs the settle term (set jit_fire_settle_ms
+    back to 0). fire_time = needed_at - cold_overhead - margin.
+  * warmup-synchronized bounded WAIT is no longer needed (container is
+    already reusable when the real invoke arrives). enable_jit_sync can
+    default to off.
+  * JIT reduces to the plain form: fire the warmup ~cold_overhead before
+    the downstream is needed; the container builds and stays Ready; the
+    real invoke hits it. Just keep warmup-to-real-invoke gap < 10s
+    (pause-grace), which always holds for civic_alert stage spacing.
+
+### Paper value
+
+A concrete, source-grounded systems optimization: OpenWhisk's default
+synchronous log collection (DockerToActivation) blocks container reuse
+for ~2s after every activation; switching to LogDriver (offloading log
+handling) cuts container-reuse latency from ~2s to ~13ms and removes a
+hidden bottleneck for JIT prewarming and high-concurrency throughput.
+
+---
+
 ## 9. Implementation Subtasks (revised order)
 
 Given this architecture, the path 3 system subtasks:
