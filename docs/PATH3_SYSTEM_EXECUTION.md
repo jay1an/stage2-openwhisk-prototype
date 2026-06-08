@@ -873,6 +873,56 @@ hidden bottleneck for JIT prewarming and high-concurrency throughput.
 
 ---
 
+## 8.11 P3.E entry prewarm result + value-boundary insight (2026-06-06)
+
+scripts/entry_prewarm.py: standalone entry prewarm, oracle predictor,
+isolated validation (no run_workflow/JIT changes). Reuses JitScheduler
+for timed warmup firing. Simple v1: one warmup per predicted arrival,
+no 10s Ready-window reuse modeling (TODO).
+
+Validation (first 200 arrivals of the 60-min 2x schedule, window 3s,
+lead 2s, redeploy entry action before each run for a cold pool):
+
+| mode | arrivals | warmups | cold rate | mean ow_wait |
+|---|---|---|---|---|
+| no-prewarm | 200 | 0 | 5.0% | 81 ms |
+| oracle | 200 | 200 | 0.5% | 17.6 ms |
+| initial burst (first 20) | — | — | 40% -> 5% | — |
+
+### Key insight: entry prewarm's value is at bursts / sparse arrivals, NOT dense steady state
+
+Baseline was only 5% cold (not ~100%) because this arrival slice is dense
+(mean gap 0.686s) and, under LogDriver, a container stays Ready ~10s
+(pause-grace). So after the first wave, containers are naturally reused
+and warm without any prewarm. Entry prewarm's marginal value in dense
+steady state is therefore small.
+
+Where entry prewarm DOES matter:
+- The initial burst / cold-start (container pool empty): 40% -> 5%.
+- Sparse arrivals (gap > 10s Ready window): containers expire between
+  requests, every request cold -> prewarm prevents it.
+- Burst edges after quiet periods in the real Azure trace (periodic).
+
+So entry prewarm covers the entry stage's cold starts at burst edges and
+sparse/cold-start conditions; in dense steady state the LogDriver Ready
+window already keeps entry warm via natural reuse.
+
+### Follow-ups (logged)
+- 10s Ready-window reuse modeling: v1 fires 1 warmup per arrival (200:200,
+  costly). Modeling reuse would cut warmups sharply in dense arrivals
+  (a few reused containers suffice). OWNER asked to remember this.
+- First-window lead time: 2s too short for an initial multi-container
+  burst (window 0 missed); use 2.5-3s for the cold first window.
+- Advanced predictor (LSTM / online selector) to replace oracle.
+
+### Cold-start elimination chain now complete (component level)
+- entry (detect): entry prewarm (P3.E) — covers burst/sparse cold starts
+- first hop + downstream: plain JIT under LogDriver (P3.C-final) — 0% cold
+Both validated in isolation. Real-trace value (especially entry prewarm
+at burst edges) to be confirmed in P3.G end-to-end replay.
+
+---
+
 ## 9. Implementation Subtasks (revised order)
 
 Given this architecture, the path 3 system subtasks:
