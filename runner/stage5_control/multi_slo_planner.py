@@ -18,7 +18,6 @@ import pandas as pd
 
 from runner.stage4_risk.dag_aggregation import (
     LogNormalParams,
-    add_deterministic_shift,
     conditional_risk,
 )
 from runner.stage4_risk.entry_cold import calibrate_p_baseline
@@ -305,17 +304,25 @@ def _warm_stage_dist(
     )
 
 
-def _dynamic_cold_overhead_ms(stage_name: str, ref_data: ReferenceData) -> float:
+def _cold_like_stage_dist(
+    *,
+    stage_name: str,
+    memory_mb: int,
+    ref_data: ReferenceData,
+) -> LogNormalParams:
     try:
-        cold_overhead_ms = float(ref_data.cold_overhead_per_stage[stage_name])
+        base_params = ref_data.lognormal_params[stage_name]["cold_like"]
     except KeyError as exc:
-        raise ValueError(f"missing cold overhead for stage={stage_name}") from exc
-    if cold_overhead_ms < 0.0 or not math.isfinite(cold_overhead_ms):
-        raise ValueError(
-            f"cold overhead for stage={stage_name} must be finite and non-negative, "
-            f"got {cold_overhead_ms}"
-        )
-    return cold_overhead_ms
+        raise ValueError(f"missing cold_like lognormal params for stage={stage_name}") from exc
+    return scale_stage_for_memory_tier(
+        stage_name=stage_name,
+        latency_class="cold_like",
+        target_memory_mb=int(memory_mb),
+        base_memory_mb=BASE_MEMORY_MB,
+        base_params=base_params,
+        amdahl_params=ref_data.amdahl_params,
+        splines=ref_data.warm_splines,
+    )
 
 
 def _dynamic_stage_dists(
@@ -327,15 +334,17 @@ def _dynamic_stage_dists(
     cold_upgrade_stages = cold_upgrade_stages or set()
     stage_dists: dict[str, LogNormalParams] = {}
     for stage_name, memory_mb in memory_tier_per_stage.items():
-        dist = _warm_stage_dist(
-            stage_name=stage_name,
-            memory_mb=int(memory_mb),
-            ref_data=ref_data,
-        )
         if stage_name in cold_upgrade_stages:
-            dist = add_deterministic_shift(
-                dist,
-                _dynamic_cold_overhead_ms(stage_name, ref_data),
+            dist = _cold_like_stage_dist(
+                stage_name=stage_name,
+                memory_mb=int(memory_mb),
+                ref_data=ref_data,
+            )
+        else:
+            dist = _warm_stage_dist(
+                stage_name=stage_name,
+                memory_mb=int(memory_mb),
+                ref_data=ref_data,
             )
         stage_dists[stage_name] = dist
     return stage_dists
@@ -388,7 +397,7 @@ def dynamic_upgrade(
 
     Current-tier pending stages are assumed to remain JIT-warmed, so they use
     warm distributions.  Upgrade candidates are not prewarmed and therefore
-    include the target-stage cold overhead as a deterministic shift.
+    use the same per-tier cold_like scaling path as the offline risk model.
     """
 
     _validate_dynamic_inputs(

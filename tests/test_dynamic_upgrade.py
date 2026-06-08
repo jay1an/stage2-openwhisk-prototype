@@ -7,12 +7,14 @@ from dataclasses import dataclass
 
 import pytest
 
+from runner.stage4_risk.plan_risk import PlanInput, _scaled_stage
 from runner.stage5_control.multi_slo_planner import (
     DEFAULT_SAFETY_FACTORS,
     DEFAULT_TIERS,
     STAGES,
     PlannerConfig,
     _dynamic_conditional_risk,
+    _dynamic_stage_dists,
     dynamic_upgrade,
     load_reference_data,
 )
@@ -75,6 +77,41 @@ def apply_changes(plan: dict[str, int], changes: dict[str, int] | None) -> dict[
     if changes:
         out.update(changes)
     return out
+
+
+def test_dynamic_cold_dist_matches_offline_scaled_stage(fixture_data: FixtureData) -> None:
+    stage_name = "estimate_pose"
+    tier_mb = 1536
+    plan_tiers = {stage: 1280 for stage in STAGES}
+    plan_tiers[stage_name] = tier_mb
+
+    dynamic_dist = _dynamic_stage_dists(
+        memory_tier_per_stage=plan_tiers,
+        ref_data=fixture_data.ref_data,
+        cold_upgrade_stages={stage_name},
+    )[stage_name]
+    offline_plan = PlanInput(
+        memory_tier_per_stage=plan_tiers,
+        entry_prewarm_count=0.0,
+        predicted_arrivals=5.0,
+        lognormal_params=fixture_data.ref_data.lognormal_params,
+        amdahl_params=fixture_data.ref_data.amdahl_params,
+        cold_overhead_per_stage=fixture_data.ref_data.cold_overhead_per_stage,
+        p_baseline=fixture_data.ref_data.p_baseline,
+    )
+    offline_dist = _scaled_stage(offline_plan, stage_name, "cold_like")
+    mu_diff = abs(dynamic_dist.mu - offline_dist.mu)
+    sigma_diff = abs(dynamic_dist.sigma - offline_dist.sigma)
+    print(
+        "consistency cold_like: "
+        f"stage={stage_name} tier={tier_mb} "
+        f"dynamic_mu={dynamic_dist.mu:.12f} offline_mu={offline_dist.mu:.12f} "
+        f"mu_diff={mu_diff:.3e} "
+        f"dynamic_sigma={dynamic_dist.sigma:.12f} "
+        f"offline_sigma={offline_dist.sigma:.12f} sigma_diff={sigma_diff:.3e}"
+    )
+    assert mu_diff <= 1e-9
+    assert sigma_diff <= 1e-9
 
 
 def test_u1_noop_when_state_is_healthy(fixture_data: FixtureData) -> None:
