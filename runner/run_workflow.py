@@ -1,8 +1,9 @@
 import argparse
+import json
 import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from typing import Dict, List
+from typing import TYPE_CHECKING, Dict, Iterable, List
 
 from .openwhisk_client import OpenWhiskClient
 from .resource_profiles import memory_to_cpu_cores as profile_memory_to_cpu_cores
@@ -12,6 +13,9 @@ from .workflow import NodeSpec, WorkflowSpec, load_workflow, suffix_action_name
 
 DEPLOYED_MEMORY_TIERS = (512, 768, 1024, 1280, 1536, 2048, 2560, 3072, 3840)
 DEPLOYED_MEMORY_TIER_SET = set(DEPLOYED_MEMORY_TIERS)
+
+if TYPE_CHECKING:
+    from .stage5_control.multi_slo_planner import PlannerConfig, ReferenceData
 
 
 def now_ms() -> int:
@@ -98,6 +102,71 @@ def validate_stage_plan(workflow: WorkflowSpec, plan: dict[str, int]) -> dict[st
             )
         normalized[stage_name] = tier
     return normalized
+
+
+def _runtime_topological_stage_names(workflow: WorkflowSpec) -> list[str]:
+    remaining = list(workflow.nodes)
+    seen = set()
+    ordered: list[str] = []
+    while remaining:
+        progressed = False
+        for stage_name in list(remaining):
+            if all(parent in seen for parent in workflow.nodes[stage_name].parents):
+                ordered.append(stage_name)
+                seen.add(stage_name)
+                remaining.remove(stage_name)
+                progressed = True
+        if not progressed:
+            raise RuntimeError(
+                f"workflow has a cycle or missing parent; remaining={remaining}"
+            )
+    return ordered
+
+
+def _runtime_upgrade_decision(
+    workflow: WorkflowSpec,
+    normalized_plan: dict[str, int] | None,
+    completed_names: Iterable[str],
+    running_names: Iterable[str],
+    started_names: Iterable[str],
+    measured_completion_at: dict[str, float],
+    workflow_start_monotonic: float,
+    dynamic_config: "PlannerConfig | None",
+    dynamic_ref_data: "ReferenceData | None",
+) -> dict[str, int] | None:
+    if normalized_plan is None or dynamic_config is None or dynamic_ref_data is None:
+        return None
+
+    completed_set = set(completed_names)
+    running_set = set(running_names)
+    started_set = set(started_names)
+    completed_finish_ms = {
+        stage_name: (
+            float(measured_completion_at[stage_name]) - float(workflow_start_monotonic)
+        )
+        * 1000.0
+        for stage_name in completed_set
+    }
+    pending_stages = [
+        stage_name
+        for stage_name in _runtime_topological_stage_names(workflow)
+        if stage_name not in completed_set
+        and stage_name not in running_set
+        and stage_name not in started_set
+    ]
+    if not pending_stages:
+        return None
+
+    from .stage5_control.multi_slo_planner import dynamic_upgrade
+
+    return dynamic_upgrade(
+        config=dynamic_config,
+        ref_data=dynamic_ref_data,
+        workflow=workflow,
+        current_tiers=dict(normalized_plan),
+        completed_finish_ms=completed_finish_ms,
+        pending_stages=pending_stages,
+    )
 
 
 def invoke_node(
@@ -287,8 +356,17 @@ def run_one_workflow(
     # only for non-LogDriver deployments where warmup completion is not enough.
     enable_jit_sync: bool = False,
     jit_sync_pause_grace_ms: float = 3000.0,
+    enable_dynamic: bool = False,
+    dynamic_config: "PlannerConfig | None" = None,
+    dynamic_ref_data: "ReferenceData | None" = None,
 ) -> List[dict]:
     normalized_plan = validate_stage_plan(workflow, plan) if plan is not None else None
+    dynamic_active = bool(
+        enable_dynamic
+        and dynamic_config is not None
+        and dynamic_ref_data is not None
+        and normalized_plan is not None
+    )
     jit_active = bool(enable_jit and jit_scheduler is not None and normalized_plan is not None)
     jit_sync_active = bool(jit_active and enable_jit_sync and jit_warmup_tracker is not None)
     warm_splines = None
@@ -354,6 +432,8 @@ def run_one_workflow(
             "error": "",
         }
     ]
+    if dynamic_active:
+        trace_rows[0]["dynamic_upgrades"] = ""
 
     def topological_stage_names() -> list[str]:
         remaining = list(workflow.nodes)
@@ -651,7 +731,10 @@ def run_one_workflow(
                 node_name = next(name for name, item in running.items() if item is future)
                 row = future.result()
                 row["stage_start_monotonic"] = started_at.get(node_name, "")
-                trace_rows.append({k: v for k, v in row.items() if not k.startswith("_")})
+                trace_row = {k: v for k, v in row.items() if not k.startswith("_")}
+                if dynamic_active:
+                    trace_row["dynamic_upgrades"] = ""
+                trace_rows.append(trace_row)
                 if row["status"] != "ok":
                     error = f"node {node_name} failed: {row['error']}"
                     if raise_on_error:
@@ -670,6 +753,25 @@ def run_one_workflow(
                 measured_completion_at[node_name] = time.monotonic()
                 completed[node_name] = row["_result"]
                 del running[node_name]
+                if dynamic_active:
+                    changes = _runtime_upgrade_decision(
+                        workflow=workflow,
+                        normalized_plan=normalized_plan,
+                        completed_names=completed.keys(),
+                        running_names=running.keys(),
+                        started_names=started_at.keys(),
+                        measured_completion_at=measured_completion_at,
+                        workflow_start_monotonic=workflow_start_monotonic,
+                        dynamic_config=dynamic_config,
+                        dynamic_ref_data=dynamic_ref_data,
+                    )
+                    if changes:
+                        normalized_plan.update(changes)
+                        trace_row["dynamic_upgrades"] = json.dumps(
+                            changes,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
                 upsert_pending_jit_warmups()
 
     workflow_end_ms = now_ms()
