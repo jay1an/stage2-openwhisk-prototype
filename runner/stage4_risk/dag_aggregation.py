@@ -185,6 +185,80 @@ def aggregate_civic_alert(
     return add_deterministic_shift(e2e, shift_ms)
 
 
+def aggregate_dag(
+    workflow: WorkflowSpec,
+    stage_dists: dict[str, LogNormalParams],
+    transition_overhead_ms: float = 0.0,
+) -> LogNormalParams:
+    """Aggregate arbitrary DAG latency from per-stage lognormal distributions."""
+
+    if transition_overhead_ms < 0.0 or not math.isfinite(transition_overhead_ms):
+        raise ValueError(
+            f"transition_overhead_ms must be finite and non-negative, got {transition_overhead_ms}"
+        )
+
+    node_names = set(workflow.nodes)
+    dist_names = set(stage_dists)
+    missing = sorted(node_names - dist_names)
+    unknown = sorted(dist_names - node_names)
+    if missing or unknown:
+        parts = []
+        if missing:
+            parts.append(f"missing stage distributions: {missing}")
+        if unknown:
+            parts.append(f"unknown stage distributions: {unknown}")
+        raise ValueError("; ".join(parts))
+    if not workflow.nodes:
+        raise ValueError("workflow must contain at least one node")
+
+    children: dict[str, list[str]] = {name: [] for name in workflow.nodes}
+    indegree: dict[str, int] = {name: 0 for name in workflow.nodes}
+    for node_name, node in workflow.nodes.items():
+        for parent in node.parents:
+            if parent not in workflow.nodes:
+                raise ValueError(f"node {node_name!r} references unknown parent {parent!r}")
+            children[parent].append(node_name)
+            indegree[node_name] += 1
+
+    ready = [name for name in workflow.nodes if indegree[name] == 0]
+    topo_order: list[str] = []
+    while ready:
+        node_name = ready.pop(0)
+        topo_order.append(node_name)
+        for child in children[node_name]:
+            indegree[child] -= 1
+            if indegree[child] == 0:
+                ready.append(child)
+    if len(topo_order) != len(workflow.nodes):
+        cycle_nodes = sorted(name for name, degree in indegree.items() if degree > 0)
+        raise ValueError(f"workflow graph contains a cycle involving: {cycle_nodes}")
+
+    finish: dict[str, LogNormalParams] = {}
+    longest_edges: dict[str, int] = {}
+    for node_name in topo_order:
+        parents = workflow.nodes[node_name].parents
+        if parents:
+            arrival = finish[parents[0]]
+            for parent in parents[1:]:
+                arrival = clark_max(arrival, finish[parent], rho=0.0)
+            finish[node_name] = fenton_wilkinson_sum([arrival, stage_dists[node_name]])
+            longest_edges[node_name] = max(longest_edges[parent] + 1 for parent in parents)
+        else:
+            finish[node_name] = stage_dists[node_name]
+            longest_edges[node_name] = 0
+
+    sinks = [name for name in topo_order if not children[name]]
+    e2e = finish[sinks[0]]
+    for sink in sinks[1:]:
+        e2e = clark_max(e2e, finish[sink], rho=0.0)
+
+    critical_path_edges = max(longest_edges[sink] for sink in sinks)
+    return add_deterministic_shift(
+        e2e,
+        critical_path_edges * float(transition_overhead_ms),
+    )
+
+
 def _load_stage_params(params_csv: str | Path, scenario: str) -> dict[str, LogNormalParams]:
     df = pd.read_csv(params_csv)
     required = {"stage_name", "latency_class", "mu", "sigma"}
