@@ -189,6 +189,7 @@ def aggregate_dag(
     workflow: WorkflowSpec,
     stage_dists: dict[str, LogNormalParams],
     transition_overhead_ms: float = 0.0,
+    fixed_finish: dict[str, float] | None = None,
 ) -> LogNormalParams:
     """Aggregate arbitrary DAG latency from per-stage lognormal distributions."""
 
@@ -211,6 +212,25 @@ def aggregate_dag(
     if not workflow.nodes:
         raise ValueError("workflow must contain at least one node")
 
+    fixed_finish = fixed_finish or {}
+    unknown_fixed = sorted(set(fixed_finish) - node_names)
+    if unknown_fixed:
+        raise ValueError(f"unknown fixed finish nodes: {unknown_fixed}")
+    normalized_fixed_finish: dict[str, float] = {}
+    for node_name, value in fixed_finish.items():
+        try:
+            finish_ms = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"fixed finish for {node_name!r} must be finite and positive, got {value}"
+            ) from exc
+        if finish_ms <= 0.0 or not math.isfinite(finish_ms):
+            raise ValueError(
+                f"fixed finish for {node_name!r} must be finite and positive, got {value}"
+            )
+        normalized_fixed_finish[node_name] = finish_ms
+    fixed_finish = normalized_fixed_finish
+
     children: dict[str, list[str]] = {name: [] for name in workflow.nodes}
     indegree: dict[str, int] = {name: 0 for name in workflow.nodes}
     for node_name, node in workflow.nodes.items():
@@ -219,6 +239,26 @@ def aggregate_dag(
                 raise ValueError(f"node {node_name!r} references unknown parent {parent!r}")
             children[parent].append(node_name)
             indegree[node_name] += 1
+
+    fixed_nodes = set(fixed_finish)
+    incomplete_fixed_parents = {
+        node_name: [
+            parent
+            for parent in workflow.nodes[node_name].parents
+            if parent not in fixed_nodes
+        ]
+        for node_name in fixed_nodes
+    }
+    incomplete_fixed_parents = {
+        node_name: parents
+        for node_name, parents in incomplete_fixed_parents.items()
+        if parents
+    }
+    if incomplete_fixed_parents:
+        raise ValueError(
+            "fixed finish nodes require fixed parents; "
+            f"incomplete parents: {incomplete_fixed_parents}"
+        )
 
     ready = [name for name in workflow.nodes if indegree[name] == 0]
     topo_order: list[str] = []
@@ -238,14 +278,22 @@ def aggregate_dag(
     for node_name in topo_order:
         parents = workflow.nodes[node_name].parents
         if parents:
+            longest_edges[node_name] = max(longest_edges[parent] + 1 for parent in parents)
+        else:
+            longest_edges[node_name] = 0
+
+        if node_name in fixed_finish:
+            finish[node_name] = LogNormalParams(
+                mu=math.log(float(fixed_finish[node_name])),
+                sigma=0.0,
+            )
+        elif parents:
             arrival = finish[parents[0]]
             for parent in parents[1:]:
                 arrival = clark_max(arrival, finish[parent], rho=0.0)
             finish[node_name] = fenton_wilkinson_sum([arrival, stage_dists[node_name]])
-            longest_edges[node_name] = max(longest_edges[parent] + 1 for parent in parents)
         else:
             finish[node_name] = stage_dists[node_name]
-            longest_edges[node_name] = 0
 
     sinks = [name for name in topo_order if not children[name]]
     e2e = finish[sinks[0]]
@@ -257,6 +305,22 @@ def aggregate_dag(
         e2e,
         critical_path_edges * float(transition_overhead_ms),
     )
+
+
+def conditional_risk(
+    workflow: WorkflowSpec,
+    stage_dists: dict[str, LogNormalParams],
+    completed_finish_ms: dict[str, float],
+    slo_ms: float,
+    transition_overhead_ms: float = 0.0,
+) -> float:
+    e2e = aggregate_dag(
+        workflow,
+        stage_dists,
+        transition_overhead_ms=transition_overhead_ms,
+        fixed_finish=completed_finish_ms,
+    )
+    return e2e.survival(slo_ms)
 
 
 def _load_stage_params(params_csv: str | Path, scenario: str) -> dict[str, LogNormalParams]:
