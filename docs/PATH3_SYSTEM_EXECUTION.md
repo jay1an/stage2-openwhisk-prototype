@@ -965,8 +965,125 @@ Each subtask is verified independently before integration.
 
 ---
 
+## 11. P3.G End-to-End Dynamic System — Final Alignment (2026-06-08)
+
+This section locks the end-to-end design for P3.G. It BUILDS ON (does not
+replace) the rolling dynamic design in Section 5, the JIT-coverage vs
+dynamic-upgrade tension in Section 8.6, and the online-mode planner in
+PATH3_PLANNER_DESIGN.md Section 3. Where this section and earlier drafts
+differ, THIS section is authoritative.
+
+### 11.1 Context update under LogDriver
+
+The permanent switch to LogDriverLogStoreProvider (Section 8.10) changed
+what "cold" means here:
+- The ~2s container-reuse SETTLE (synchronous log collection) is GONE;
+  warm containers are reusable ~13ms after RunCompleted.
+- The cold-START overhead (a brand-new container from nothing, ~2s) is
+  UNCHANGED — LogDriver does not touch container creation.
+- Validated: with plain JIT under LogDriver, all downstream stages (incl.
+  the first hop) reach 0% cold (Section 8.10/8.11).
+
+Consequence for risk and plans: warm execution-time distributions are
+unaffected by LogDriver (it changes reuse latency, not compute time), so
+the offline plans do NOT need re-fitting. The only quantity that drops is
+the entry natural cold rate (denser steady-state reuse), which only makes
+existing plans safer. => Decision A: reuse offline plans as the dynamic
+STARTING point; do not re-plan from scratch.
+
+The Section 8.6 tension ("execution time is a dual-purpose budget:
+latency + cold-hiding") STILL HOLDS — it is about cold-START overhead,
+which LogDriver did not remove. It is mitigated, not eliminated, by
+cross-level speculative warmup (cumulative lead time).
+
+### 11.2 System boundary: control plane vs data plane
+
+The replay client is EXTERNAL to our system: a workload generator that
+stands in for "users" submitting requests. It is NOT a contribution. Our
+system is the CONTROL PLANE (planner + prewarm + JIT orchestration)
+layered on the standard OpenWhisk DATA PLANE via its REST API.
+
+```
+═══ EXTERNAL (simulated users — NOT our work) ═══
+   Replay Client: emit requests per Azure schedule, tag SLO class
+        │ workflow request
+        ▼
+══════════════ OUR SYSTEM (control plane) ══════════════
+   ┌────────────────────────┐  runtime latency feedback
+   │ Orchestrator + JIT      │──(completed-stage actuals)──┐
+   │  route tier per plan     │                            ▼
+   │  JIT-prewarm downstream   │              ┌──────────────────────┐
+   │  execute dynamic reroute  │◀──push/update plan──│ Online Planner  │
+   └──────────┬─────────────┘                │  holds per-class plan │
+              │                              │  monitors slack       │
+   ┌──────────┴──────────┐                   │  online conditional   │
+   │ Prewarm Controller   │                   │    risk → UP-upgrade  │
+   │  entry prewarm        │                   └──────────────────────┘
+   └──────────┬──────────┘
+              │ invoke (REST)
+              ▼
+═══ OpenWhisk DATA PLANE (standard, existing) ═══
+   controller → invoker → containers (45 variants: 5 stages × 9 tiers)
+```
+
+"Online" does NOT mean "k8s pod". v1 is process-level (pod-ification was
+considered and deferred 2026-06-08: too much engineering for now; the
+control/data-plane split is logical, the architecture figure is what
+matters). The Online Planner is a resident process/thread, not a pod.
+
+### 11.3 Dynamic adjustment closed loop (final)
+
+Reuses Section 5's rolling design and Section 8.6 decision 4:
+1. On each stage completion, record its ACTUAL finish time (relative to
+   workflow start).
+2. Before scheduling the next stage(s), compute the online conditional
+   risk: completed nodes = measured constants, remaining nodes = current-
+   tier distributions, `conditional_risk = P(remaining path > SLO −
+   t_elapsed)`. Math + generalized DAG aggregation: PLANNER Section 9.
+3. If `conditional_risk > class target`, upgrade pending (not-yet-started)
+   stages by marginal efficiency until back under target.
+4. Cold accounting (Decision a): an upgrade candidate's risk INCLUDES the
+   target tier's cold-START overhead when that variant is not warm, so an
+   upgrade is taken only when remaining slack absorbs (cold + larger-tier
+   execution) AND it is still safer than not upgrading. No backup
+   pre-warming (option b rejected).
+
+### 11.4 Final decisions locked (2026-06-08)
+
+| Decision | Choice | Rationale / ref |
+|----------|--------|-----------------|
+| Initial plan | Reuse offline `multi_slo_planner` output, no re-fit | Decision A; LogDriver doesn't change warm exec time |
+| Dynamic | Direct-to-dynamic (v1 is already dynamic, not static-first) | owner 2026-06-08 |
+| Adjust direction | UP-only in v1 (downgrade deferred) | matches robustness intent; no oscillation; cost vs Always-Warm expected to still win (confirm in T6) |
+| Eval cadence | Every stage completion | analytic aggregation is ~µs |
+| Cold on upgrade | Decision a: count target-tier cold in conditional risk; no backup prewarm | owner 2026-06-08; Section 8.6 decision 4 |
+| Risk scope | Online conditional risk only (no correlation / non-stationary in v1) | owner 2026-06-08 |
+| Replay client | External workload generator, not a contribution | owner 2026-06-08 |
+
+### 11.5 Build roadmap T1–T6 (LogDriver + dynamic-first)
+
+Supersedes the Section 9 build order for the current context (most of
+P3.A–P3.F are DONE; the LogDriver switch + direct-to-dynamic decision
+re-shape the remaining work). Each task has an independent verify gate.
+
+| # | Task | Depends | Verify |
+|---|------|---------|--------|
+| T1 | Generalized DAG aggregation (topological order, reuse Fenton/Clark; civic_alert as special case) | — | civic_alert output matches current `aggregate_civic_alert` bit-for-bit |
+| T2 | Online conditional risk (completed=const, remaining=dist, include target-tier cold) | T1 | MC validation of conditional distribution; boundary cases |
+| T3 | Online Planner (hold initial plan + slack monitor + UP-only marginal-efficiency upgrade API) | T2 + existing greedy | given execution state → correct upgrade decision |
+| T4 | Orchestrator integration (per-stage hook: record actual → call planner → reroute pending tiers) | T3 + existing JIT | injected slowdown triggers upgrade |
+| T5 | End-to-end replay driver (external replay tags SLO class + prewarm parallel + metrics) | T4 + existing entry_prewarm | full-trace run produces metrics |
+| T6 | Baseline comparison (Scale-To-Zero / Always-Warm) | T5 | comparison table (baseline defs TBD) |
+
+---
+
 ## Changelog
 
+- 2026-06-08: P3.G final alignment. Locked direct-to-dynamic end-to-end
+  design: control/data-plane split with replay as EXTERNAL workload,
+  online conditional risk (generalized DAG aggregation), per-stage UP-only
+  dynamic upgrade with Decision-a cold accounting, offline plans reused as
+  starting point. Build roadmap T1–T6. Pod-ification deferred. See Sec 11.
 - 2026-05-30: Initial document. Captures the full execution architecture
   aligned across several discussion rounds: unified stage-start trigger,
   dynamic-early/warmup-late separation, last-upstream JIT scheduling

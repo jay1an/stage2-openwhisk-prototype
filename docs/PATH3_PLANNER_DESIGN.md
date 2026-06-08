@@ -778,7 +778,80 @@ Decisions reference:
 
 ---
 
+## 9. Online Conditional Risk + Dynamic Upgrade — Final Alignment (2026-06-08)
+
+Locks the risk-model upgrade that powers the dynamic system
+(PATH3_SYSTEM_EXECUTION.md Section 11). Builds on Section 3's online-mode
+sketch; where they differ, THIS section is authoritative.
+
+### 9.1 Generalized DAG aggregation (the one real new module)
+
+Current `aggregate_civic_alert` (runner/stage4_risk/dag_aggregation.py)
+HARDCODES the civic_alert topology and requires all 5 stages present. But
+the underlying operators — `fenton_wilkinson_sum` (series), `clark_max`
+(fan-in), `add_deterministic_shift` — are topology-agnostic and reusable.
+
+Upgrade: a generic aggregator that walks the DAG in topological order:
+```
+finish[node] = ( max over parents of finish[parent] )  ⊕  stage_dist[node]
+   max over parents : pairwise clark_max
+   ⊕               : fenton_wilkinson_sum (series add)
+E2E = max over sink nodes of finish[sink]
+```
+civic_alert becomes a special case; the generic version MUST reproduce the
+current function bit-for-bit (regression gate). Bonus: this is exactly
+what future multi-workflow support needs anyway, so it is not pure cost.
+
+### 9.2 Online conditional risk
+
+At runtime, completed stages have MEASURED finish times (constants);
+remaining stages keep their current-tier distributions. Feed both into the
+generic aggregator with completed nodes deterministic (sigma→0):
+```
+conditional_risk = P( E2E_from_current_state > SLO )
+                 = survival(SLO) of the conditioned remaining DAG
+```
+Same closed-form machinery, conditioned on observed state. No Monte Carlo
+at runtime — this is what keeps it O(1) per stage.
+
+### 9.3 Dynamic upgrade policy (UP-only v1)
+
+If `conditional_risk > class target`, upgrade pending (not-yet-started)
+stages by marginal efficiency (reuse offline greedy's marginal logic) on
+the remaining sub-DAG until back under target.
+
+Decision a (cold accounting): an upgrade candidate's conditional risk
+INCLUDES the target tier's cold-START overhead when that variant is not
+warm. So an upgrade is taken only when remaining slack absorbs (cold +
+larger-tier execution) AND it still lowers risk vs not upgrading. No
+backup pre-warming (option b rejected). This encodes the Section 8.6
+dual-purpose-budget tension directly into the online decision.
+
+v1 is UP-only (no downgrade): matches the robustness intent ("slowed down
+→ add resources"), avoids oscillation. Downgrade-for-cost is a logged
+future enhancement.
+
+### 9.4 Framing 2 reinforcement (vs SMIless)
+
+The closed-form risk model is O(1) re-computable. This single property
+powers BOTH:
+- offline: guides the graph search (beam / A*) for the initial plan
+- online: re-evaluates conditional risk per stage in µs, enabling dynamic
+  upgrade
+
+SMIless uses profiling-based cost estimation that cannot be re-evaluated
+online cheaply, so its keepalive/prewarm decisions are STATIC. Our
+analytical model is what UNLOCKS the online dynamic robustness SMIless
+cannot do. This sharpens Framing 2 from "we also use graph search" to "our
+analytical risk model unlocks online robustness others can't."
+
+---
+
 ## Changelog
 
+- 2026-06-08: Added Section 9 (online conditional risk + dynamic upgrade,
+  final alignment): generalized DAG aggregation, conditional risk on
+  observed state, UP-only marginal-efficiency upgrade with Decision-a cold
+  accounting, Framing-2 reinforcement vs SMIless.
 - 2026-05-28: Initial document. All design decisions for path 3 captured
   here pending extended sweep results and SLO finalization.
