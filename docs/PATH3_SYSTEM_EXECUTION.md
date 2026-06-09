@@ -1077,8 +1077,68 @@ re-shape the remaining work). Each task has an independent verify gate.
 
 ---
 
+## 12. P3.G Measurement Issue + Tier Re-alignment Plan (2026-06-09)
+
+T5.2b end-to-end showed measured warm execution did NOT match the offline spline
+(actual 1.1-1.4x slower, worst at high tiers, premium SLO-satisfaction only 0.61). A
+data-driven investigation (several hypotheses ruled out: cold start, wiring, our
+concurrency, node heterogeneity) found TWO independent causes — neither a flaw in the
+planning method.
+
+### 12.1 Root cause A — worker/cpu-limit mismatch → CFS throttle
+The action ProcessPool uses workers = ceil(cpu), but the k8s pod has a cpu LIMIT (= the
+tier's cores). When worker processes > cpu quota the whole cgroup is CFS-throttled,
+cores go intermittently idle, and the hardware never grants turbo → the tier's cores
+aren't used at speed. Of 9 tiers only 1280/2560/3840 (integer cores 1/2/3, where
+workers==cores) avoid throttle. Yet 4/5 stage tier-pairs still showed +18~30% speedup,
+so tier sizing is fundamentally sound — just degraded by throttle.
+
+### 12.2 Root cause B — all-core turbo suppression (shared node)
+dell (Xeon 8352M, 64 physical / 128 logical cores, base 2.30GHz) is SHARED. A co-tenant
+('ye') ran 9 training processes throughout. They use only ~7% of cores, but by raising
+the active-core count they pushed the CPU from single-core turbo (~3.4GHz) to all-core
+turbo (~2.3GHz), uniformly slowing every pod. Evidence: now-isolated (mi=1) cpu_process
+≈ now-loaded (mi=32) ≈ 2x the 5/28 sweep — NOT our concurrency, but the node turbo
+state. This scales absolute latency uniformly but preserves relative tier differences.
+
+### 12.3 Re-aligned tier→CPU→worker design
+Keep the cpu-scaling formula (200m×ceil(mem/256)) — it already yields clean values:
+- sub-1 core (throttles, but differentiated by quota ratio; fits "low tier = slow"):
+  512=0.4, 768=0.6, 1024=0.8
+- integer cores (workers=cores → no throttle → boost → near-linear speedup):
+  1280=1, 2560=2, 3840=3
+Change ONLY the worker rule: `workers = max(1, round(cpu))`. Non-integer >1 tiers
+(1536/2048/3072) stay deployed for completeness but are NOT used for planning (they
+throttle: round(1.6)=2 > 1.6).
+
+### 12.4 Re-measurement plan (decided 2026-06-09)
+1. workers = max(1, round(cpu)) in workflow_action.py
+2. bump keepalive to 600s (sweep warm samples need containers to survive)
+3. redeploy all 9 tiers with the new action
+4. full re-sweep (per-stage + e2e, cold + warm) → reports/sweep_realign/
+5. re-fit the warm resource model from the new measurements
+6. recompute JIT lead times / plans from the new model
+7. switch to a SPARSER, more serverless-like trace (see 12.5)
+
+Caveat: dell is busy now (turbo suppressed), so absolute times are biased. We record
+now and RE-COMPARE when the node is idle. Idle==busy → fine; else revisit.
+
+### 12.5 Trace density finding — current trace is too dense
+cand2-2x: 4011 reqs/60min, mean 1.11/s, inter-arrival p50=0.57s, p99=5.21s. Under 10s
+keepalive only 0.1% of gaps exceed keepalive → almost everything is warm. Real
+serverless is intermittent/sparse (why it beats a dedicated server on cost). A dense
+trace hides the cold-start problem the system targets. Plan: adopt a sparser/bursty
+trace so cold start becomes a real cost and JIT/prewarm value shows.
+
+---
+
 ## Changelog
 
+- 2026-06-09: T5.2b measurement investigation (Section 12). Warm-exec gap traced to
+  (A) worker>cpu-limit CFS throttle and (B) shared-node all-core turbo suppression
+  (co-tenant), NOT a planning flaw (tier sizing 4/5 sound). Re-alignment: workers=
+  round(cpu), 6 aligned tiers (sub-1 + integer cores), keepalive 600s, full re-sweep +
+  re-fit + recompute JIT, switch to sparser trace. dell busy now → record, re-compare idle.
 - 2026-06-08: P3.G final alignment. Locked direct-to-dynamic end-to-end
   design: control/data-plane split with replay as EXTERNAL workload,
   online conditional risk (generalized DAG aggregation), per-stage UP-only
