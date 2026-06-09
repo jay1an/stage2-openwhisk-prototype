@@ -7,9 +7,11 @@ import argparse
 import csv
 import hashlib
 import json
+import random
 import statistics
 import subprocess
 import sys
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -35,6 +37,7 @@ DEFAULT_SCHEDULE = (
 )
 DEFAULT_WORKFLOW = ROOT / "configs" / "civic_alert_flow.yaml"
 DEFAULT_ACTION_FILE = ROOT / "actions" / "workflow_action.py"
+DEFAULT_PLAN_CSV = ROOT / "reports" / "path3_planner" / "plan_summary.csv"
 STAGE_ORDER = [
     "detect_object",
     "estimate_pose",
@@ -132,6 +135,20 @@ CONTAINER_IDLE_COLUMNS = [
     "idle_gb_seconds",
     "idle_vcpu_seconds",
 ]
+PER_CLASS_SUMMARY_COLUMNS = [
+    "slo_class",
+    "slo_ms",
+    "count",
+    "e2e_p50_ms",
+    "e2e_p95_ms",
+    "e2e_p99_ms",
+    "slo_satisfaction_rate",
+    "entry_cold_rate",
+    "downstream_cold_rate",
+    "cost_gbsec",
+    "dynamic_trigger_count",
+    "total_upgrades",
+]
 
 
 def now_ms() -> int:
@@ -207,6 +224,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="remove existing output files in --out-dir before running",
     )
+    parser.add_argument("--plan-csv", default=str(DEFAULT_PLAN_CSV))
+    parser.add_argument("--enable-jit", action="store_true", default=False)
+    parser.add_argument("--enable-dynamic", action="store_true", default=False)
+    parser.add_argument("--premium-ratio", type=float, default=0.5)
+    parser.add_argument("--slo-class-seed", type=int, default=20260609)
+    parser.add_argument("--slo-premium-ms", type=float, default=15000.0)
+    parser.add_argument("--slo-free-ms", type=float, default=20000.0)
     return parser.parse_args()
 
 
@@ -247,6 +271,69 @@ def load_schedule(path: str, limit: int) -> list[dict[str, Any]]:
     if limit and limit > 0:
         rows = rows[:limit]
     return rows
+
+
+def parse_memory_config(value: str) -> dict[str, int]:
+    plan: dict[str, int] = {}
+    for item in str(value or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(f"invalid memory_config item: {item!r}")
+        stage_name, tier = item.split(":", 1)
+        stage_name = stage_name.strip()
+        try:
+            plan[stage_name] = int(tier)
+        except ValueError as exc:
+            raise ValueError(f"invalid tier in memory_config item: {item!r}") from exc
+    missing = sorted(set(STAGE_ORDER) - set(plan))
+    unknown = sorted(set(plan) - set(STAGE_ORDER))
+    if missing or unknown:
+        raise ValueError(
+            f"memory_config stage mismatch: missing={missing} unknown={unknown}"
+        )
+    return {stage: int(plan[stage]) for stage in STAGE_ORDER}
+
+
+def load_plan_by_class(path: str | Path) -> dict[str, dict[str, int]]:
+    plan_path = Path(path)
+    with plan_path.open(newline="", encoding="utf-8-sig") as handle:
+        rows = list(csv.DictReader(handle))
+    if not rows:
+        raise ValueError(f"plan CSV is empty: {plan_path}")
+    required = {"slo_class", "memory_config"}
+    missing_columns = sorted(required - set(rows[0]))
+    if missing_columns:
+        raise ValueError(f"plan CSV missing columns: {missing_columns}")
+
+    by_class: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        slo_class = str(row.get("slo_class", "")).strip().lower()
+        if slo_class:
+            by_class[slo_class].append(row)
+
+    out: dict[str, dict[str, int]] = {}
+    for slo_class in ["premium", "free"]:
+        candidates = by_class.get(slo_class, [])
+        if not candidates:
+            raise ValueError(f"plan CSV has no row for slo_class={slo_class!r}")
+        selected = next(
+            (
+                row
+                for row in candidates
+                if str(row.get("arrival_scenario", "")).strip().lower() == "typical"
+            ),
+            candidates[0],
+        )
+        out[slo_class] = parse_memory_config(str(selected.get("memory_config", "")))
+    return out
+
+
+def assign_slo_class(rng: random.Random, premium_ratio: float) -> str:
+    if premium_ratio < 0.0 or premium_ratio > 1.0:
+        raise ValueError(f"premium_ratio must be in [0, 1], got {premium_ratio}")
+    return "premium" if rng.random() < float(premium_ratio) else "free"
 
 
 def resolve_action_suffix(args: argparse.Namespace) -> str:
@@ -491,10 +578,12 @@ def build_detail_records(
     }
 
     for row in stages:
+        row_memory_mb = int(as_float(row.get("allocated_memory_mb"), memory_mb))
+        row_cpu_cores = as_float(row.get("allocated_cpu_cores"), cpu_cores)
         costs = stage_cost(
             row,
-            memory_mb=memory_mb,
-            cpu_cores=cpu_cores,
+            memory_mb=row_memory_mb,
+            cpu_cores=row_cpu_cores,
             price_per_gb_second=price_per_gb_second,
             price_per_vcpu_second=price_per_vcpu_second,
             price_per_request=price_per_request,
@@ -560,6 +649,8 @@ def build_detail_records(
         "source_label": source_row.get("source_label", ""),
         "source_app": source_row.get("source_app", ""),
         "source_func": source_row.get("source_func", ""),
+        "slo_class": schedule_row.get("slo_class", ""),
+        "slo_ms": schedule_row.get("slo_ms", ""),
         "source_start_s": source_row.get("source_start_s", ""),
         "source_end_s": source_row.get("source_end_s", ""),
         "source_duration_ms": source_row.get("source_duration_ms", ""),
@@ -589,6 +680,8 @@ def build_detail_records(
         "cpu_cost": totals["cpu_cost"],
         "request_cost": totals["request_cost"],
         "total_cost": totals["total_cost"],
+        "dynamic_upgraded": schedule_row.get("dynamic_upgraded", False),
+        "dynamic_upgrade_count": schedule_row.get("dynamic_upgrade_count", 0),
     }
     return workflow_record, stage_details
 
@@ -612,6 +705,21 @@ def write_csv(path: Path, columns: list[str], rows: list[dict[str, Any]]) -> Non
             writer.writerow({column: row.get(column, "") for column in columns})
 
 
+def workflow_columns(include_slo: bool) -> list[str]:
+    if not include_slo:
+        return list(WORKFLOW_COLUMNS)
+    columns = list(WORKFLOW_COLUMNS)
+    insert_at = columns.index("source_start_s")
+    for column in ["slo_class", "slo_ms"]:
+        if column not in columns:
+            columns.insert(insert_at, column)
+            insert_at += 1
+    for column in ["dynamic_upgraded", "dynamic_upgrade_count"]:
+        if column not in columns:
+            columns.append(column)
+    return columns
+
+
 def stats(values: list[float]) -> dict[str, float]:
     clean = [float(value) for value in values]
     if not clean:
@@ -622,6 +730,21 @@ def stats(values: list[float]) -> dict[str, float]:
         "min": min(clean),
         "max": max(clean),
     }
+
+
+def percentile(values: list[float], fraction: float) -> float:
+    clean = sorted(float(value) for value in values)
+    if not clean:
+        return 0.0
+    if fraction <= 0.0:
+        return clean[0]
+    if fraction >= 1.0:
+        return clean[-1]
+    position = (len(clean) - 1) * float(fraction)
+    lower = int(position)
+    upper = min(lower + 1, len(clean) - 1)
+    weight = position - lower
+    return clean[lower] * (1.0 - weight) + clean[upper] * weight
 
 
 def numeric_values(rows: list[dict[str, Any]], field: str) -> list[float]:
@@ -743,6 +866,79 @@ def summarize_stages(stage_details: list[dict[str, Any]]) -> list[dict[str, Any]
                     as_float(row.get("execution_vcpu_seconds")) for row in subset
                 ),
                 "total_cost": sum(as_float(row.get("total_cost")) for row in subset),
+            }
+        )
+    return rows
+
+
+def summarize_per_class(
+    workflows: list[dict[str, Any]],
+    stage_details: list[dict[str, Any]],
+    slo_ms_by_class: dict[str, float],
+) -> list[dict[str, Any]]:
+    stages_by_request: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in stage_details:
+        stages_by_request[str(row.get("request_id", ""))].append(row)
+
+    rows = []
+    for slo_class in ["premium", "free"]:
+        subset = [
+            row for row in workflows if str(row.get("slo_class", "")).lower() == slo_class
+        ]
+        e2e_values = numeric_values(subset, "workflow_e2e_ms")
+        slo_ms = float(slo_ms_by_class[slo_class])
+        satisfied = [
+            as_float(row.get("workflow_e2e_ms")) <= slo_ms
+            for row in subset
+            if row.get("workflow_e2e_ms") not in ("", None)
+        ]
+        class_stage_rows = [
+            stage_row
+            for workflow_row in subset
+            for stage_row in stages_by_request.get(str(workflow_row.get("request_id", "")), [])
+        ]
+        entry_rows = [
+            row for row in class_stage_rows if row.get("stage_name") == STAGE_ORDER[0]
+        ]
+        downstream_rows = [
+            row for row in class_stage_rows if row.get("stage_name") != STAGE_ORDER[0]
+        ]
+        rows.append(
+            {
+                "slo_class": slo_class,
+                "slo_ms": slo_ms,
+                "count": len(subset),
+                "e2e_p50_ms": percentile(e2e_values, 0.50),
+                "e2e_p95_ms": percentile(e2e_values, 0.95),
+                "e2e_p99_ms": percentile(e2e_values, 0.99),
+                "slo_satisfaction_rate": (
+                    sum(1 for item in satisfied if item) / len(satisfied)
+                    if satisfied
+                    else 0.0
+                ),
+                "entry_cold_rate": (
+                    sum(1 for row in entry_rows if row.get("stage_latency_class") == "cold")
+                    / len(entry_rows)
+                    if entry_rows
+                    else 0.0
+                ),
+                "downstream_cold_rate": (
+                    sum(
+                        1
+                        for row in downstream_rows
+                        if row.get("stage_latency_class") == "cold"
+                    )
+                    / len(downstream_rows)
+                    if downstream_rows
+                    else 0.0
+                ),
+                "cost_gbsec": sum(as_float(row.get("execution_gb_seconds")) for row in subset),
+                "dynamic_trigger_count": sum(
+                    1 for row in subset if as_bool(row.get("dynamic_upgraded"))
+                ),
+                "total_upgrades": sum(
+                    int(as_float(row.get("dynamic_upgrade_count"))) for row in subset
+                ),
             }
         )
     return rows
@@ -916,6 +1112,14 @@ def run_scheduled_workflow(
     invoke_timeout_sec: int,
     memory_mb: int,
     cpu_cores: float,
+    plan: dict[str, int] | None = None,
+    slo_class: str = "",
+    slo_ms: float | None = None,
+    jit_scheduler: object | None = None,
+    enable_jit: bool = False,
+    enable_dynamic: bool = False,
+    dynamic_config: object | None = None,
+    dynamic_ref_data: object | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     client = OpenWhiskClient(
         apihost=apihost,
@@ -930,14 +1134,29 @@ def run_scheduled_workflow(
     rows: list[dict[str, Any]] = []
 
     try:
-        rows = run_one_workflow(
-            workflow,
-            client,
-            stage_max_workers,
-            allocated_memory_mb=memory_mb,
-            allocated_cpu_cores=cpu_cores,
-            raise_on_error=False,
-        )
+        if plan is not None:
+            rows = run_one_workflow(
+                workflow,
+                client,
+                stage_max_workers,
+                raise_on_error=False,
+                plan=plan,
+                slo_class=slo_class,
+                jit_scheduler=jit_scheduler,
+                enable_jit=enable_jit,
+                enable_dynamic=enable_dynamic,
+                dynamic_config=dynamic_config,
+                dynamic_ref_data=dynamic_ref_data,
+            )
+        else:
+            rows = run_one_workflow(
+                workflow,
+                client,
+                stage_max_workers,
+                allocated_memory_mb=memory_mb,
+                allocated_cpu_cores=cpu_cores,
+                raise_on_error=False,
+            )
         request_id = rows[0]["request_id"]
         error_rows = [
             row for row in rows
@@ -954,10 +1173,23 @@ def run_scheduled_workflow(
         error = str(exc)
 
     end_ms = now_ms()
+    dynamic_upgrade_count = 0
+    for row in rows:
+        raw = row.get("dynamic_upgrades", "")
+        if raw in ("", None):
+            continue
+        try:
+            parsed = json.loads(str(raw))
+        except json.JSONDecodeError:
+            parsed = {}
+        if isinstance(parsed, dict):
+            dynamic_upgrade_count += len(parsed)
     schedule_row = {
         "workflow_name": workflow.workflow_name,
         "index": int(float(source_row.get("index", 0))),
         "request_id": request_id,
+        "slo_class": slo_class,
+        "slo_ms": float(slo_ms) if slo_ms is not None else "",
         "target_ms": target_ms,
         "target_offset_ms": target_offset_ms,
         "submit_ms": submit_ms,
@@ -966,11 +1198,47 @@ def run_scheduled_workflow(
         "target_lag_ms": start_ms - target_ms,
         "status": status,
         "error": error,
+        "dynamic_upgraded": dynamic_upgrade_count > 0,
+        "dynamic_upgrade_count": dynamic_upgrade_count,
     }
     return schedule_row, rows
 
 
-def prepare_outputs(out_dir: Path, overwrite: bool) -> dict[str, Path]:
+def invoke_replay_warmup(client: OpenWhiskClient, task: Any) -> None:
+    params = {
+        "__warmup": True,
+        "request_id": task.metadata.get("request_id", ""),
+        "workflow_name": task.metadata.get("workflow_name", ""),
+        "stage_name": task.metadata.get("stage_name", ""),
+        "allocated_memory_mb": task.metadata.get("tier_mb", ""),
+    }
+    try:
+        client.invoke_activation(task.action_name, params)
+    except Exception as exc:
+        print(
+            f"warmup failed action={task.action_name} task={task.task_key}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def make_replay_warmup_callback(client: OpenWhiskClient):
+    def callback(task: Any) -> None:
+        worker = threading.Thread(
+            target=invoke_replay_warmup,
+            args=(client, task),
+            daemon=True,
+        )
+        worker.start()
+
+    return callback
+
+
+def prepare_outputs(
+    out_dir: Path,
+    overwrite: bool,
+    include_per_class: bool = False,
+) -> dict[str, Path]:
     paths = {
         "trace": out_dir / "raw_trace.csv",
         "workflow_detail": out_dir / "workflow_detail.csv",
@@ -981,6 +1249,8 @@ def prepare_outputs(out_dir: Path, overwrite: bool) -> dict[str, Path]:
         "cost_summary": out_dir / "cost_summary.csv",
         "metadata": out_dir / "run_metadata.json",
     }
+    if include_per_class:
+        paths["per_class_summary"] = out_dir / "per_class_summary.csv"
     out_dir.mkdir(parents=True, exist_ok=True)
     existing = [path for path in paths.values() if path.exists()]
     if existing and not overwrite:
@@ -1004,6 +1274,7 @@ def drain_completed(
     stage_records: list[dict[str, Any]],
     source_rows_by_index: dict[int, dict[str, Any]],
     args: argparse.Namespace,
+    include_slo: bool = False,
 ) -> tuple[int, int]:
     if not active:
         return completed_count, 0
@@ -1032,7 +1303,7 @@ def drain_completed(
             price_per_vcpu_second=args.price_per_vcpu_second,
             price_per_request=args.price_per_request,
         )
-        append_csv_row(paths["workflow_detail"], WORKFLOW_COLUMNS, workflow_record)
+        append_csv_row(paths["workflow_detail"], workflow_columns(include_slo), workflow_record)
         for row in stage_detail:
             append_csv_row(paths["stage_detail"], STAGE_DETAIL_COLUMNS, row)
         workflow_records.append(workflow_record)
@@ -1057,20 +1328,69 @@ def main() -> None:
         raise ValueError("--max-inflight must be >= 1")
     if args.stage_max_workers < 1:
         raise ValueError("--stage-max-workers must be >= 1")
+    if args.premium_ratio < 0.0 or args.premium_ratio > 1.0:
+        raise ValueError("--premium-ratio must be in [0, 1]")
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(args.out_dir) if args.out_dir else ROOT / "reports" / f"civic_azure_replay_{run_id}"
-    paths = prepare_outputs(out_dir, args.overwrite)
+    multi_slo_active = bool(args.enable_jit or args.enable_dynamic)
+    paths = prepare_outputs(out_dir, args.overwrite, include_per_class=multi_slo_active)
     auth = auth_from_args(args.auth)
     base_workflow = load_workflow(args.workflow)
-    action_suffix = resolve_action_suffix(args)
+    action_suffix = "" if multi_slo_active else resolve_action_suffix(args)
     workflow = with_action_suffix(base_workflow, action_suffix)
     schedule_rows = load_schedule(args.schedule, args.limit)
     source_rows_by_index = {
         int(float(row.get("index", idx))): row for idx, row in enumerate(schedule_rows)
     }
+    plan_by_class: dict[str, dict[str, int]] = {}
+    slo_ms_by_class = {
+        "premium": float(args.slo_premium_ms),
+        "free": float(args.slo_free_ms),
+    }
+    slo_rng = random.Random(args.slo_class_seed)
+    dynamic_ref_data = None
+    dynamic_config_by_class: dict[str, Any] = {}
+    jit_scheduler = None
 
-    if not args.skip_deploy:
+    if multi_slo_active:
+        plan_by_class = load_plan_by_class(args.plan_csv)
+
+    if args.enable_dynamic:
+        from runner.stage5_control.multi_slo_planner import (
+            DEFAULT_SAFETY_FACTORS,
+            DEFAULT_TIERS,
+            STAGES,
+            PlannerConfig,
+            load_reference_data,
+        )
+
+        dynamic_ref_data = load_reference_data()
+        dynamic_config_by_class = {
+            slo_class: PlannerConfig(
+                slo_ms=slo_ms,
+                max_violation_rate=0.05,
+                predicted_arrivals=5.0,
+                tiers=list(DEFAULT_TIERS),
+                safety_factors=list(DEFAULT_SAFETY_FACTORS),
+                stages=list(STAGES),
+            )
+            for slo_class, slo_ms in slo_ms_by_class.items()
+        }
+
+    if args.enable_jit:
+        from runner.stage5_control.jit_scheduler import JitScheduler
+
+        warmup_client = OpenWhiskClient(
+            apihost=args.apihost,
+            auth=auth,
+            namespace=workflow.namespace,
+            timeout_sec=args.invoke_timeout_sec,
+        )
+        jit_scheduler = JitScheduler(make_replay_warmup_callback(warmup_client))
+        jit_scheduler.start()
+
+    if not args.skip_deploy and not multi_slo_active:
         action_names = [node.action for node in workflow.nodes.values()]
         print(
             f"checking {len(dict.fromkeys(action_names))} actions for memory={args.memory_mb}MiB "
@@ -1078,6 +1398,12 @@ def main() -> None:
             flush=True,
         )
         update_actions(args, auth, action_names)
+    elif not args.skip_deploy and multi_slo_active:
+        print(
+            "multi-SLO plan mode uses predeployed per-tier variants; "
+            "skipping uniform action deployment",
+            flush=True,
+        )
 
     metadata = {
         "run_id": run_id,
@@ -1088,6 +1414,15 @@ def main() -> None:
         "out_dir": str(out_dir),
         "memory_mb": args.memory_mb,
         "cpu_cores": args.cpu_cores,
+        "multi_slo_active": multi_slo_active,
+        "enable_jit": args.enable_jit,
+        "enable_dynamic": args.enable_dynamic,
+        "plan_csv": str(args.plan_csv),
+        "premium_ratio": args.premium_ratio,
+        "slo_class_seed": args.slo_class_seed,
+        "slo_premium_ms": args.slo_premium_ms,
+        "slo_free_ms": args.slo_free_ms,
+        "plans_by_class": plan_by_class,
         "keepalive_sec": args.keepalive_sec,
         "max_inflight": args.max_inflight,
         "stage_max_workers": args.stage_max_workers,
@@ -1105,6 +1440,11 @@ def main() -> None:
     print(f"replay_span_s={metadata['target_offset_max_ms'] / 1000.0:.3f}")
     print(f"resource={args.memory_mb}MiB/{args.cpu_cores}vCPU keepalive={args.keepalive_sec}s")
     print(f"max_inflight={args.max_inflight}; stage_max_workers={args.stage_max_workers}")
+    if multi_slo_active:
+        print(
+            f"multi_slo=on enable_jit={args.enable_jit} enable_dynamic={args.enable_dynamic} "
+            f"premium_ratio={args.premium_ratio} seed={args.slo_class_seed}"
+        )
     print("No additional schedule compression will be applied.")
 
     store = CsvTraceStore(str(paths["trace"]))
@@ -1115,29 +1455,91 @@ def main() -> None:
     completed = 0
     base_ms = now_ms()
 
-    with ThreadPoolExecutor(max_workers=args.max_inflight) as pool:
-        for source_row in schedule_rows:
-            target_offset_ms = int(float(source_row["target_offset_ms"]))
-            target_ms = base_ms + target_offset_ms
-            while True:
-                completed, _ = drain_completed(
-                    active,
-                    block=False,
-                    total=len(schedule_rows),
-                    completed_count=completed,
-                    store=store,
-                    paths=paths,
-                    workflow_records=workflow_records,
-                    stage_records=stage_records,
-                    source_rows_by_index=source_rows_by_index,
-                    args=args,
-                )
-                delay_ms = target_ms - now_ms()
-                if delay_ms <= 0:
-                    break
-                time.sleep(min(delay_ms / 1000.0, 0.25))
+    try:
+        with ThreadPoolExecutor(max_workers=args.max_inflight) as pool:
+            for source_row in schedule_rows:
+                target_offset_ms = int(float(source_row["target_offset_ms"]))
+                target_ms = base_ms + target_offset_ms
+                while True:
+                    completed, _ = drain_completed(
+                        active,
+                        block=False,
+                        total=len(schedule_rows),
+                        completed_count=completed,
+                        store=store,
+                        paths=paths,
+                        workflow_records=workflow_records,
+                        stage_records=stage_records,
+                        source_rows_by_index=source_rows_by_index,
+                        args=args,
+                        include_slo=multi_slo_active,
+                    )
+                    delay_ms = target_ms - now_ms()
+                    if delay_ms <= 0:
+                        break
+                    time.sleep(min(delay_ms / 1000.0, 0.25))
 
-            while len(active) >= args.max_inflight:
+                while len(active) >= args.max_inflight:
+                    completed, _ = drain_completed(
+                        active,
+                        block=True,
+                        total=len(schedule_rows),
+                        completed_count=completed,
+                        store=store,
+                        paths=paths,
+                        workflow_records=workflow_records,
+                        stage_records=stage_records,
+                        source_rows_by_index=source_rows_by_index,
+                        args=args,
+                        include_slo=multi_slo_active,
+                    )
+
+                plan = None
+                slo_class = ""
+                slo_ms = None
+                dynamic_config = None
+                if multi_slo_active:
+                    slo_class = assign_slo_class(slo_rng, args.premium_ratio)
+                    slo_ms = slo_ms_by_class[slo_class]
+                    plan = plan_by_class[slo_class]
+                    dynamic_config = dynamic_config_by_class.get(slo_class)
+                    source_row["slo_class"] = slo_class
+                    source_row["slo_ms"] = slo_ms
+
+                submit_ms = now_ms()
+                future = pool.submit(
+                    run_scheduled_workflow,
+                    workflow=workflow,
+                    apihost=args.apihost,
+                    auth=auth,
+                    source_row=source_row,
+                    target_ms=target_ms,
+                    target_offset_ms=target_offset_ms,
+                    submit_ms=submit_ms,
+                    stage_max_workers=args.stage_max_workers,
+                    invoke_timeout_sec=args.invoke_timeout_sec,
+                    memory_mb=args.memory_mb,
+                    cpu_cores=args.cpu_cores,
+                    plan=plan,
+                    slo_class=slo_class,
+                    slo_ms=slo_ms,
+                    jit_scheduler=jit_scheduler,
+                    enable_jit=args.enable_jit,
+                    enable_dynamic=args.enable_dynamic,
+                    dynamic_config=dynamic_config,
+                    dynamic_ref_data=dynamic_ref_data,
+                )
+                active.add(future)
+                submitted += 1
+                if submitted % max(1, args.progress_every) == 0 or submitted == len(schedule_rows):
+                    print(
+                        f"submitted [{submitted}/{len(schedule_rows)}] "
+                        f"target_offset_ms={target_offset_ms} "
+                        f"active={len(active)}",
+                        flush=True,
+                    )
+
+            while active:
                 completed, _ = drain_completed(
                     active,
                     block=True,
@@ -1149,46 +1551,11 @@ def main() -> None:
                     stage_records=stage_records,
                     source_rows_by_index=source_rows_by_index,
                     args=args,
+                    include_slo=multi_slo_active,
                 )
-
-            submit_ms = now_ms()
-            future = pool.submit(
-                run_scheduled_workflow,
-                workflow=workflow,
-                apihost=args.apihost,
-                auth=auth,
-                source_row=source_row,
-                target_ms=target_ms,
-                target_offset_ms=target_offset_ms,
-                submit_ms=submit_ms,
-                stage_max_workers=args.stage_max_workers,
-                invoke_timeout_sec=args.invoke_timeout_sec,
-                memory_mb=args.memory_mb,
-                cpu_cores=args.cpu_cores,
-            )
-            active.add(future)
-            submitted += 1
-            if submitted % max(1, args.progress_every) == 0 or submitted == len(schedule_rows):
-                print(
-                    f"submitted [{submitted}/{len(schedule_rows)}] "
-                    f"target_offset_ms={target_offset_ms} "
-                    f"active={len(active)}",
-                    flush=True,
-                )
-
-        while active:
-            completed, _ = drain_completed(
-                active,
-                block=True,
-                total=len(schedule_rows),
-                completed_count=completed,
-                store=store,
-                paths=paths,
-                workflow_records=workflow_records,
-                stage_records=stage_records,
-                source_rows_by_index=source_rows_by_index,
-                args=args,
-            )
+    finally:
+        if jit_scheduler is not None:
+            jit_scheduler.stop()
 
     workflow_summary = summarize_workflows(workflow_records)
     stage_summary = summarize_stages(stage_records)
@@ -1212,6 +1579,17 @@ def main() -> None:
     write_csv(paths["stage_summary"], list(stage_summary[0]), stage_summary)
     write_csv(paths["container_idle_detail"], CONTAINER_IDLE_COLUMNS, container_idle_records)
     write_csv(paths["cost_summary"], list(cost_summary[0]), cost_summary)
+    if multi_slo_active:
+        per_class_summary = summarize_per_class(
+            workflow_records,
+            stage_records,
+            slo_ms_by_class,
+        )
+        write_csv(
+            paths["per_class_summary"],
+            PER_CLASS_SUMMARY_COLUMNS,
+            per_class_summary,
+        )
 
     overall = next(row for row in workflow_summary if row["workflow_cold_class"] == "all")
     successful = next(row for row in workflow_summary if row["workflow_cold_class"] == "ok")
@@ -1225,6 +1603,8 @@ def main() -> None:
     print(f"workflow_summary={paths['workflow_summary']}")
     print(f"stage_summary={paths['stage_summary']}")
     print(f"cost_summary={paths['cost_summary']}")
+    if multi_slo_active:
+        print(f"per_class_summary={paths['per_class_summary']}")
     print(
         "overall: "
         f"count={overall['count']} "
