@@ -847,8 +847,35 @@ analytical risk model unlocks online robustness others can't."
 
 ---
 
+## 10. Deferred idea — theta-weighted robust plan selection (captured 2026-06-09)
+
+Owner idea (inspired by Qian et al. 2025, "Adaptive Probabilistic Planning for the
+Uncertain and Dynamic Orienteering Problem", PDF in repo). Current planner picks the
+cheapest plan whose P(E2E>SLO) <= target — a hard constraint that sits right on the P95
+boundary and is therefore fragile. Proposal: introduce a safety factor theta, keep
+several candidate plans (beam already yields k), and select via a weighted score over
+(marginal efficiency, safety margin) instead of only the P95 constraint, so the chosen
+plan keeps some risk headroom.
+
+Why it fits:
+- Beam search already produces k candidates; weighted selection is a post-processing
+  layer, no search rewrite.
+- Complements dynamic upgrade: static plan keeps a theta safety margin (robust),
+  runtime conditional-risk fine-tunes — two layers of defense.
+- Sharpens the contribution vs SMIless: explicit risk/cost trade-off + safety factor,
+  not just constraint satisfaction.
+
+To do before adopting: read the Qian paper, align theta's definition + the weighting
+form, define the safety and efficiency metrics, decide beam-postprocess vs modified
+objective. Deferred until the measurement re-alignment (Section 12 of SYSTEM_EXECUTION)
+is settled.
+
+---
+
 ## Changelog
 
+- 2026-06-09: Captured Section 10 (deferred theta-weighted robust plan selection idea,
+  from Qian et al. 2025), to revisit after measurement re-alignment.
 - 2026-06-08: Added Section 9 (online conditional risk + dynamic upgrade,
   final alignment): generalized DAG aggregation, conditional risk on
   observed state, UP-only marginal-efficiency upgrade with Decision-a cold
