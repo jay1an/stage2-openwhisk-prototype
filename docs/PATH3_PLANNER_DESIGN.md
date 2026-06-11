@@ -847,33 +847,95 @@ analytical risk model unlocks online robustness others can't."
 
 ---
 
-## 10. Deferred idea — theta-weighted robust plan selection (captured 2026-06-09)
+## 10. Safety-belief plan selection (aligned 2026-06-11; tentative, may revise)
 
-Owner idea (inspired by Qian et al. 2025, "Adaptive Probabilistic Planning for the
-Uncertain and Dynamic Orienteering Problem", PDF in repo). Current planner picks the
-cheapest plan whose P(E2E>SLO) <= target — a hard constraint that sits right on the P95
-boundary and is therefore fragile. Proposal: introduce a safety factor theta, keep
-several candidate plans (beam already yields k), and select via a weighted score over
-(marginal efficiency, safety margin) instead of only the P95 constraint, so the chosen
-plan keeps some risk headroom.
+Adapted from Qian et al. 2025 ("Adaptive Probabilistic Planning for the Uncertain and
+Dynamic Orienteering Problem", PDF in thesis/). The current planner picks the single
+cheapest plan whose model-estimated P(E2E>SLO) <= 5% — a hard constraint sitting right on
+the P95 cliff, fragile to model error. Because dell is a SHARED node (co-tenants come and
+go, shifting all-core turbo state), latency carries an irreducible, unmodelable variance:
+the model can be de-biased (Section 12 re-sweep) but never fully trusted. That makes the
+operating point a genuine cost-vs-reliability trade-off, not a single constrained optimum
+— which is exactly where Qian's safety-belief sweep + normalized scoring applies.
 
-Why it fits:
-- Beam search already produces k candidates; weighted selection is a post-processing
-  layer, no search rewrite.
-- Complements dynamic upgrade: static plan keeps a theta safety margin (robust),
-  runtime conditional-risk fine-tunes — two layers of defense.
-- Sharpens the contribution vs SMIless: explicit risk/cost trade-off + safety factor,
-  not just constraint satisfaction.
+### 10.1 Mapping Qian -> our problem
+- Qian's hard energy budget  <->  our SLO deadline T (Premium 15s / Free 20s).
+- Qian's safety belief beta (the CDF quantile at which uncertain cost is budgeted against
+  the deadline)  <->  our planning reliability target. Low belief = under-estimate latency
+  = overrun the deadline = SLO violated (directly analogous to Qian under-budgeting power).
+- Qian's prize (maximand)  <->  our COST SAVING (maximand). NOT raw cost: cost is a
+  minimand, so it enters the score inverted, else arg max would reward expensive plans.
 
-To do before adopting: read the Qian paper, align theta's definition + the weighting
-form, define the safety and efficiency metrics, decide beam-postprocess vs modified
-objective. Deferred until the measurement re-alignment (Section 12 of SYSTEM_EXECUTION)
-is settled.
+Key improvement over Qian: we apply the safety belief on the FW+Clark-AGGREGATED E2E
+distribution (one tail prob), not per-edge percentiles summed. This avoids the
+sum-of-per-stage-percentiles over-estimation Qian lives with.
+
+### 10.2 Parameterization (chosen: A)
+Theta = target reliability. A plan satisfies belief theta iff its model-predicted
+reliability r = P(E2E <= T) >= theta, i.e. compute_plan_risk(plan, T) <= 1 - theta.
+The existing beam search is reused verbatim with its risk threshold set to (1 - theta)
+instead of fixed 0.05 — a thin sweep loop around the planner, no core change.
+(Alternative parameterization B = inflate latency by a factor before requiring 5%; kept
+as a fallback, to be reconsidered once the idle re-sweep shows the residual error form.)
+
+### 10.3 Candidate generation
+For each theta in the sweep, beam search (k=5, validated ~= brute-force optimum) returns
+the min-cost plan meeting belief theta. Because tiers are DISCRETE, the (theta, cost)
+frontier is a step function: many theta collapse to the same plan (cf. Qian's beta=80=90
+identical). Dedup -> the candidate set is the finite cost-vs-reliability Pareto plans.
+
+### 10.4 Selection score (adapted Qian eq. 6)
+Over the FEASIBLE candidate set only (realized r_i >= 0.95; sub-SLO plans are not
+deployable and would distort normalization):
+
+    S* = arg max_i [ w * (r_i - r_min)/(r_max - r_min)
+                     + (1 - w) * (C_max - C_i)/(C_max - C_min) ]
+
+- r_i = the plan's model-predicted reliability 1 - compute_plan_risk(plan, T) (NOT the
+  sweep knob theta — using the realized r handles discreteness overshoot and auto-dedups).
+- Both terms normalized to [0,1] -> w has a consistent meaning across workflows / SLO
+  classes (a portability advantage over an absolute reliability threshold).
+- Non-triviality depends on the frontier having a KNEE (cost convex in reliability). If
+  it is ~linear the arg max degenerates to an endpoint (pick by whichever weight wins) —
+  informative, not a bug ("no free robustness above the SLO -> just take 99.9%").
+
+### 10.5 r_i accuracy (the score is only as good as r_i)
+r_i must be UNBIASED (perfection not required — theta hedges residual shared-node noise;
+but a biased r_i, like Section 12's throttle/turbo low bias, systematically misselects).
+Gate before trusting r_i: (1) de-bias means via the idle re-sweep refit; (2) validate
+predicted-vs-measured violation on a plan grid (reports/path2_plan_grid, harness
+path2_no_jit_validation / path2_calibration); (3) check assumptions on the WARM data —
+per-stage unimodality vs lognormal (2-node affinity=false can inject a second mode; do
+NOT force lognormal if bimodal), CV-constant across tiers, and the AGGREGATED E2E fit
+(not just per-stage).
+
+### 10.6 Honest conditions for using the score
+- Weight-sensitivity analysis (cf. Qian Appendix E): show S* is insensitive to w over a
+  reasonable range; if sensitive, the score is untrustworthy -> fall back to the
+  constraint baseline "cheapest feasible plan with r >= a fixed target".
+- Two-layer defense unchanged: static plan keeps the theta margin (systematic robustness),
+  runtime UP-only dynamic upgrade (Section 9) absorbs transient spikes.
+
+### 10.7 OPEN (pending data / decision)
+- Theta range: DIAGNOSTIC sweep wide (~80-99.9%) to plot the frontier and locate the knee;
+  SELECT only over the feasible >= 95% sub-range. Final normalization range pinned after
+  the frontier is generated (post idle re-sweep + refit).
+- Parameterization A vs B: revisit after the idle re-sweep reveals the residual error form
+  (uniform scalar -> B attractive; tier-dependent/variance -> stay with A or add a
+  variance-inflation term).
+- Confirm the frontier actually has enough distinct feasible plans + a knee; if not, the
+  score degenerates and we use the constraint baseline.
 
 ---
 
 ## Changelog
 
+- 2026-06-11: Rewrote Section 10 from deferred note to aligned (tentative) design:
+  safety-belief sweep (parameterization A, threshold 1-theta) + adapted Qian eq.6
+  selection (cost-saving as the maximand; r_i = model-predicted reliability) over the
+  feasible >=95% Pareto set, applied on the FW+Clark-aggregated E2E. Motivated by the
+  shared-node irreducible latency variance. Open: theta range, A-vs-B, frontier knee,
+  r_i validation/de-bias (pending idle re-sweep).
 - 2026-06-09: Captured Section 10 (deferred theta-weighted robust plan selection idea,
   from Qian et al. 2025), to revisit after measurement re-alignment.
 - 2026-06-08: Added Section 9 (online conditional risk + dynamic upgrade,
