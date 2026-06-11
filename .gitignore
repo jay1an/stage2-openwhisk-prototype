@@ -4,6 +4,9 @@ reports/
 __pycache__/
 *.pyc
 
+# Local reference papers (PDFs) — keep locally, don't push.
+thesis/
+
 # Per user rule (2026-05-23): no Chinese docs or READMEs on GitHub.
 # Keep them locally, but don't push.
 README.md
