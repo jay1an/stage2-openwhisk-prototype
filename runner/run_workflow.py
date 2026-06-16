@@ -11,7 +11,22 @@ from .trace_store import CsvTraceStore
 from .workflow import NodeSpec, WorkflowSpec, load_workflow, suffix_action_name
 
 
-DEPLOYED_MEMORY_TIERS = (512, 768, 1024, 1280, 1536, 2048, 2560, 3072, 3840)
+DEPLOYED_MEMORY_TIERS = (
+    512,
+    768,
+    1024,
+    1280,
+    1536,
+    1792,
+    2048,
+    2304,
+    2560,
+    2816,
+    3072,
+    3328,
+    3584,
+    3840,
+)
 DEPLOYED_MEMORY_TIER_SET = set(DEPLOYED_MEMORY_TIERS)
 
 if TYPE_CHECKING:
@@ -123,6 +138,18 @@ def _runtime_topological_stage_names(workflow: WorkflowSpec) -> list[str]:
     return ordered
 
 
+def _runtime_descendant_stage_names(workflow: WorkflowSpec, stage_name: str) -> set[str]:
+    descendants: set[str] = set()
+    stack = list(workflow.children_of(stage_name))
+    while stack:
+        child = stack.pop()
+        if child in descendants:
+            continue
+        descendants.add(child)
+        stack.extend(workflow.children_of(child))
+    return descendants
+
+
 def _runtime_upgrade_decision(
     workflow: WorkflowSpec,
     normalized_plan: dict[str, int] | None,
@@ -133,6 +160,7 @@ def _runtime_upgrade_decision(
     workflow_start_monotonic: float,
     dynamic_config: "PlannerConfig | None",
     dynamic_ref_data: "ReferenceData | None",
+    eligible_stage_names: Iterable[str] | None = None,
 ) -> dict[str, int] | None:
     if normalized_plan is None or dynamic_config is None or dynamic_ref_data is None:
         return None
@@ -140,6 +168,7 @@ def _runtime_upgrade_decision(
     completed_set = set(completed_names)
     running_set = set(running_names)
     started_set = set(started_names)
+    eligible_set = set(eligible_stage_names) if eligible_stage_names is not None else None
     completed_finish_ms = {
         stage_name: (
             float(measured_completion_at[stage_name]) - float(workflow_start_monotonic)
@@ -153,6 +182,7 @@ def _runtime_upgrade_decision(
         if stage_name not in completed_set
         and stage_name not in running_set
         and stage_name not in started_set
+        and (eligible_set is None or stage_name in eligible_set)
     ]
     if not pending_stages:
         return None
@@ -396,6 +426,7 @@ def run_one_workflow(
     jit_late_count = 0
     jit_initial_late_count = 0
     jit_upsert_late_count = 0
+    dynamic_start_upgrades_by_stage: Dict[str, str] = {}
     if normalized_plan is not None:
         entry_memory_mb = normalized_plan.get(workflow.entry, "")
     else:
@@ -612,6 +643,7 @@ def run_one_workflow(
             return sync_info
 
         start_wait = time.monotonic()
+        current_tier = normalized_plan[stage_name] if normalized_plan is not None else ""
         max_wait_s = max(0.0, stage_cold_overhead_ms(stage_name) / 1000.0)
         pause_grace_s = max(0.0, jit_sync_pause_grace_ms / 1000.0)
         completion_deadline = start_wait + max_wait_s
@@ -619,7 +651,7 @@ def run_one_workflow(
 
         status = {}
         if hasattr(jit_warmup_tracker, "get_status"):
-            status = jit_warmup_tracker.get_status(request_id, stage_name)
+            status = jit_warmup_tracker.get_status(request_id, stage_name, current_tier)
         issued = status_value(status, "issued_monotonic", "")
         completed = status_value(status, "completed_monotonic", "")
         if issued not in ("", None):
@@ -634,6 +666,7 @@ def run_one_workflow(
                 status = jit_warmup_tracker.wait_until_completed(
                     request_id,
                     stage_name,
+                    current_tier,
                     remaining,
                 )
                 issued = status_value(status, "issued_monotonic", issued)
@@ -658,6 +691,49 @@ def run_one_workflow(
         sync_info["jit_sync_waited_ms"] = (time.monotonic() - start_wait) * 1000.0
         return sync_info
 
+    def merge_dynamic_upgrades(existing: str, changes: dict[str, int]) -> str:
+        merged: dict[str, int] = {}
+        if existing:
+            try:
+                parsed = json.loads(existing)
+            except json.JSONDecodeError:
+                parsed = {}
+            if isinstance(parsed, dict):
+                merged.update({str(key): int(value) for key, value in parsed.items()})
+        merged.update({str(key): int(value) for key, value in changes.items()})
+        return json.dumps(merged, sort_keys=True, separators=(",", ":"))
+
+    def invalidate_changed_stage_warmups(changes: dict[str, int]) -> None:
+        for stage_name in changes:
+            jit_current_fire_times.pop(stage_name, None)
+
+    def apply_dynamic_upgrade_at_stage_start(stage_name: str) -> None:
+        if not dynamic_active:
+            return
+        descendants = _runtime_descendant_stage_names(workflow, stage_name)
+        if not descendants:
+            return
+        changes = _runtime_upgrade_decision(
+            workflow=workflow,
+            normalized_plan=normalized_plan,
+            completed_names=completed.keys(),
+            running_names=running.keys(),
+            started_names=started_at.keys(),
+            measured_completion_at=measured_completion_at,
+            workflow_start_monotonic=workflow_start_monotonic,
+            dynamic_config=dynamic_config,
+            dynamic_ref_data=dynamic_ref_data,
+            eligible_stage_names=descendants,
+        )
+        if changes:
+            normalized_plan.update(changes)
+            invalidate_changed_stage_warmups(changes)
+            dynamic_start_upgrades_by_stage[stage_name] = merge_dynamic_upgrades(
+                dynamic_start_upgrades_by_stage.get(stage_name, ""),
+                changes,
+            )
+        upsert_pending_jit_warmups()
+
     enqueue_initial_jit_warmups()
     trace_rows[0]["jit_scheduled_count"] = jit_scheduled_count
     trace_rows[0]["jit_upsert_count"] = jit_upsert_count
@@ -678,6 +754,7 @@ def run_one_workflow(
                     node_action_name = suffix_action_name(node.action, f"_{node_memory_mb}")
 
                 started_at[node.name] = time.monotonic()
+                apply_dynamic_upgrade_at_stage_start(node.name)
 
                 def invoke_with_optional_sync(
                     ready_node: NodeSpec = node,
@@ -733,7 +810,10 @@ def run_one_workflow(
                 row["stage_start_monotonic"] = started_at.get(node_name, "")
                 trace_row = {k: v for k, v in row.items() if not k.startswith("_")}
                 if dynamic_active:
-                    trace_row["dynamic_upgrades"] = ""
+                    trace_row["dynamic_upgrades"] = dynamic_start_upgrades_by_stage.pop(
+                        node_name,
+                        "",
+                    )
                 trace_rows.append(trace_row)
                 if row["status"] != "ok":
                     error = f"node {node_name} failed: {row['error']}"
@@ -767,10 +847,10 @@ def run_one_workflow(
                     )
                     if changes:
                         normalized_plan.update(changes)
-                        trace_row["dynamic_upgrades"] = json.dumps(
+                        invalidate_changed_stage_warmups(changes)
+                        trace_row["dynamic_upgrades"] = merge_dynamic_upgrades(
+                            str(trace_row.get("dynamic_upgrades", "")),
                             changes,
-                            sort_keys=True,
-                            separators=(",", ":"),
                         )
                 upsert_pending_jit_warmups()
 

@@ -24,9 +24,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from runner.openwhisk_client import OpenWhiskClient
-from runner.run_workflow import run_one_workflow
+from runner.run_workflow import activation_annotations, run_one_workflow
 from runner.trace_store import CsvTraceStore
-from runner.workflow import WorkflowSpec, load_workflow, with_action_suffix
+from runner.workflow import WorkflowSpec, load_workflow, suffix_action_name, with_action_suffix
 
 
 DEFAULT_SCHEDULE = (
@@ -101,6 +101,12 @@ STAGE_DETAIL_COLUMNS = [
     "ow_duration_ms",
     "ow_runtime_overhead_ms",
     "client_gateway_overhead_ms",
+    "jit_sync_enabled",
+    "jit_sync_waited_ms",
+    "jit_sync_dispatch_after_warmup",
+    "jit_sync_status",
+    "jit_sync_warmup_issued_monotonic",
+    "jit_sync_warmup_completed_monotonic",
     "serial_wall_ms",
     "io_wall_ms",
     "parallel_wall_ms",
@@ -146,6 +152,10 @@ PER_CLASS_SUMMARY_COLUMNS = [
     "entry_cold_rate",
     "downstream_cold_rate",
     "cost_gbsec",
+    "entry_prewarm_count",
+    "entry_prewarm_gbsec",
+    "jit_sync_waited_ms_mean",
+    "jit_sync_status_counts",
     "dynamic_trigger_count",
     "total_upgrades",
 ]
@@ -226,7 +236,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--plan-csv", default=str(DEFAULT_PLAN_CSV))
     parser.add_argument("--enable-jit", action="store_true", default=False)
+    parser.add_argument("--enable-jit-sync", action="store_true", default=False)
+    parser.add_argument("--jit-sync-pause-grace-ms", type=float, default=0.0)
     parser.add_argument("--enable-dynamic", action="store_true", default=False)
+    parser.add_argument("--enable-entry-prewarm", action="store_true", default=False)
+    parser.add_argument(
+        "--entry-prewarm-lead-sec",
+        type=float,
+        default=2.5,
+        help="oracle entry warmup lead time before each scheduled arrival",
+    )
     parser.add_argument("--premium-ratio", type=float, default=0.5)
     parser.add_argument("--slo-class-seed", type=int, default=20260609)
     parser.add_argument("--slo-premium-ms", type=float, default=15000.0)
@@ -334,6 +353,24 @@ def assign_slo_class(rng: random.Random, premium_ratio: float) -> str:
     if premium_ratio < 0.0 or premium_ratio > 1.0:
         raise ValueError(f"premium_ratio must be in [0, 1], got {premium_ratio}")
     return "premium" if rng.random() < float(premium_ratio) else "free"
+
+
+def preassign_slo_classes(
+    schedule_rows: list[dict[str, Any]],
+    rng: random.Random,
+    premium_ratio: float,
+    slo_ms_by_class: dict[str, float],
+) -> None:
+    for row in schedule_rows:
+        slo_class = assign_slo_class(rng, premium_ratio)
+        row["slo_class"] = slo_class
+        row["slo_ms"] = float(slo_ms_by_class[slo_class])
+
+
+def cpu_cores_for_memory(memory_mb: int) -> float:
+    from runner.stage4_risk.scaling import memory_to_cpu_cores
+
+    return float(memory_to_cpu_cores(int(memory_mb)))
 
 
 def resolve_action_suffix(args: argparse.Namespace) -> str:
@@ -547,6 +584,110 @@ def stage_cost(
     }
 
 
+def entry_prewarm_cost(
+    record: dict[str, Any],
+    *,
+    price_per_gb_second: float,
+    price_per_vcpu_second: float,
+    price_per_request: float,
+) -> dict[str, float]:
+    memory_mb = int(as_float(record.get("tier_mb"), 0.0))
+    if memory_mb <= 0:
+        return {
+            "execution_gb_seconds": 0.0,
+            "execution_vcpu_seconds": 0.0,
+            "memory_cost": 0.0,
+            "cpu_cost": 0.0,
+            "request_cost": float(price_per_request),
+            "total_cost": float(price_per_request),
+        }
+    duration_ms = as_float(record.get("ow_duration_ms"))
+    if duration_ms <= 0:
+        duration_ms = as_float(record.get("action_duration_ms"))
+    return stage_cost(
+        {
+            "ow_duration_ms": duration_ms,
+            "action_duration_ms": duration_ms,
+        },
+        memory_mb=memory_mb,
+        cpu_cores=cpu_cores_for_memory(memory_mb),
+        price_per_gb_second=price_per_gb_second,
+        price_per_vcpu_second=price_per_vcpu_second,
+        price_per_request=price_per_request,
+    )
+
+
+class WarmupStatusTracker:
+    def __init__(self):
+        self.condition = threading.Condition()
+        self.statuses: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def _status_locked(
+        self, request_id: str, stage_name: str, tier: object
+    ) -> dict[str, Any]:
+        key = (str(request_id), str(stage_name), str(tier))
+        if key not in self.statuses:
+            self.statuses[key] = {
+                "issued_monotonic": "",
+                "completed_monotonic": "",
+                "activation_id": "",
+                "container_id": "",
+                "error": "",
+                "event": threading.Event(),
+            }
+        return self.statuses[key]
+
+    def mark_issued(
+        self, request_id: str, stage_name: str, tier: object, issued_monotonic: float
+    ) -> None:
+        with self.condition:
+            status = self._status_locked(request_id, stage_name, tier)
+            status["issued_monotonic"] = issued_monotonic
+            status["completed_monotonic"] = ""
+            status["activation_id"] = ""
+            status["container_id"] = ""
+            status["error"] = ""
+            status["event"] = threading.Event()
+            self.condition.notify_all()
+
+    def mark_completed(
+        self,
+        request_id: str,
+        stage_name: str,
+        tier: object,
+        completed_monotonic: float,
+        activation_id: str = "",
+        container_id: str = "",
+        error: str = "",
+    ) -> None:
+        with self.condition:
+            status = self._status_locked(request_id, stage_name, tier)
+            status["completed_monotonic"] = completed_monotonic
+            status["activation_id"] = activation_id
+            status["container_id"] = container_id
+            status["error"] = error
+            status["event"].set()
+            self.condition.notify_all()
+
+    def get_status(self, request_id: str, stage_name: str, tier: object) -> dict[str, Any]:
+        with self.condition:
+            status = self._status_locked(request_id, stage_name, tier)
+            return {key: value for key, value in status.items() if key != "event"}
+
+    def wait_until_completed(
+        self,
+        request_id: str,
+        stage_name: str,
+        tier: object,
+        timeout: float,
+    ) -> dict[str, Any]:
+        with self.condition:
+            status = self._status_locked(request_id, stage_name, tier)
+            event = status["event"]
+        event.wait(timeout=max(0.0, timeout))
+        return self.get_status(request_id, stage_name, tier)
+
+
 def build_detail_records(
     *,
     source_row: dict[str, Any],
@@ -622,6 +763,21 @@ def build_detail_records(
                 "ow_duration_ms": row.get("ow_duration_ms", ""),
                 "ow_runtime_overhead_ms": row.get("ow_runtime_overhead_ms", ""),
                 "client_gateway_overhead_ms": row.get("client_gateway_overhead_ms", ""),
+                "jit_sync_enabled": row.get("jit_sync_enabled", ""),
+                "jit_sync_waited_ms": row.get("jit_sync_waited_ms", ""),
+                "jit_sync_dispatch_after_warmup": row.get(
+                    "jit_sync_dispatch_after_warmup",
+                    "",
+                ),
+                "jit_sync_status": row.get("jit_sync_status", ""),
+                "jit_sync_warmup_issued_monotonic": row.get(
+                    "jit_sync_warmup_issued_monotonic",
+                    "",
+                ),
+                "jit_sync_warmup_completed_monotonic": row.get(
+                    "jit_sync_warmup_completed_monotonic",
+                    "",
+                ),
                 "serial_wall_ms": row.get("serial_wall_ms", ""),
                 "io_wall_ms": row.get("io_wall_ms", ""),
                 "parallel_wall_ms": row.get("parallel_wall_ms", ""),
@@ -641,6 +797,20 @@ def build_detail_records(
                 "total_cost": costs["total_cost"],
             }
         )
+
+    entry_prewarm_count = int(as_float(schedule_row.get("entry_prewarm_count"), 0.0))
+    entry_prewarm_gb_seconds = as_float(schedule_row.get("entry_prewarm_gb_seconds"))
+    entry_prewarm_vcpu_seconds = as_float(schedule_row.get("entry_prewarm_vcpu_seconds"))
+    entry_prewarm_memory_cost = as_float(schedule_row.get("entry_prewarm_memory_cost"))
+    entry_prewarm_cpu_cost = as_float(schedule_row.get("entry_prewarm_cpu_cost"))
+    entry_prewarm_request_cost = as_float(schedule_row.get("entry_prewarm_request_cost"))
+    entry_prewarm_total_cost = as_float(schedule_row.get("entry_prewarm_total_cost"))
+    totals["gb_seconds"] += entry_prewarm_gb_seconds
+    totals["vcpu_seconds"] += entry_prewarm_vcpu_seconds
+    totals["memory_cost"] += entry_prewarm_memory_cost
+    totals["cpu_cost"] += entry_prewarm_cpu_cost
+    totals["request_cost"] += entry_prewarm_request_cost
+    totals["total_cost"] += entry_prewarm_total_cost
 
     workflow_record = {
         "workflow_name": schedule_row["workflow_name"],
@@ -675,13 +845,20 @@ def build_detail_records(
         "sum_stage_init_ms": totals["init"],
         "execution_gb_seconds": totals["gb_seconds"],
         "execution_vcpu_seconds": totals["vcpu_seconds"],
-        "request_count": len(stages),
+        "request_count": len(stages) + entry_prewarm_count,
         "memory_cost": totals["memory_cost"],
         "cpu_cost": totals["cpu_cost"],
         "request_cost": totals["request_cost"],
         "total_cost": totals["total_cost"],
         "dynamic_upgraded": schedule_row.get("dynamic_upgraded", False),
         "dynamic_upgrade_count": schedule_row.get("dynamic_upgrade_count", 0),
+        "entry_prewarm_count": entry_prewarm_count,
+        "entry_prewarm_status": schedule_row.get("entry_prewarm_status", ""),
+        "entry_prewarm_action": schedule_row.get("entry_prewarm_action", ""),
+        "entry_prewarm_tier_mb": schedule_row.get("entry_prewarm_tier_mb", ""),
+        "entry_prewarm_ow_duration_ms": schedule_row.get("entry_prewarm_ow_duration_ms", ""),
+        "entry_prewarm_gb_seconds": entry_prewarm_gb_seconds,
+        "entry_prewarm_vcpu_seconds": entry_prewarm_vcpu_seconds,
     }
     return workflow_record, stage_details
 
@@ -715,6 +892,17 @@ def workflow_columns(include_slo: bool) -> list[str]:
             columns.insert(insert_at, column)
             insert_at += 1
     for column in ["dynamic_upgraded", "dynamic_upgrade_count"]:
+        if column not in columns:
+            columns.append(column)
+    for column in [
+        "entry_prewarm_count",
+        "entry_prewarm_status",
+        "entry_prewarm_action",
+        "entry_prewarm_tier_mb",
+        "entry_prewarm_ow_duration_ms",
+        "entry_prewarm_gb_seconds",
+        "entry_prewarm_vcpu_seconds",
+    ]:
         if column not in columns:
             columns.append(column)
     return columns
@@ -758,6 +946,15 @@ def numeric_values(rows: list[dict[str, Any]], field: str) -> list[float]:
         except (TypeError, ValueError):
             continue
     return values
+
+
+def value_counts_json(rows: list[dict[str, Any]], field: str) -> str:
+    counts: dict[str, int] = defaultdict(int)
+    for row in rows:
+        value = str(row.get(field, "") or "")
+        if value:
+            counts[value] += 1
+    return json.dumps(dict(sorted(counts.items())), sort_keys=True)
 
 
 def as_int_or_none(value: Any) -> int | None:
@@ -903,6 +1100,7 @@ def summarize_per_class(
         downstream_rows = [
             row for row in class_stage_rows if row.get("stage_name") != STAGE_ORDER[0]
         ]
+        sync_wait = numeric_values(downstream_rows, "jit_sync_waited_ms")
         rows.append(
             {
                 "slo_class": slo_class,
@@ -933,6 +1131,17 @@ def summarize_per_class(
                     else 0.0
                 ),
                 "cost_gbsec": sum(as_float(row.get("execution_gb_seconds")) for row in subset),
+                "entry_prewarm_count": sum(
+                    int(as_float(row.get("entry_prewarm_count"))) for row in subset
+                ),
+                "entry_prewarm_gbsec": sum(
+                    as_float(row.get("entry_prewarm_gb_seconds")) for row in subset
+                ),
+                "jit_sync_waited_ms_mean": statistics.mean(sync_wait) if sync_wait else 0.0,
+                "jit_sync_status_counts": value_counts_json(
+                    downstream_rows,
+                    "jit_sync_status",
+                ),
                 "dynamic_trigger_count": sum(
                     1 for row in subset if as_bool(row.get("dynamic_upgraded"))
                 ),
@@ -1117,6 +1326,9 @@ def run_scheduled_workflow(
     slo_ms: float | None = None,
     jit_scheduler: object | None = None,
     enable_jit: bool = False,
+    jit_warmup_tracker: object | None = None,
+    enable_jit_sync: bool = False,
+    jit_sync_pause_grace_ms: float = 0.0,
     enable_dynamic: bool = False,
     dynamic_config: object | None = None,
     dynamic_ref_data: object | None = None,
@@ -1144,6 +1356,9 @@ def run_scheduled_workflow(
                 slo_class=slo_class,
                 jit_scheduler=jit_scheduler,
                 enable_jit=enable_jit,
+                jit_warmup_tracker=jit_warmup_tracker,
+                enable_jit_sync=enable_jit_sync,
+                jit_sync_pause_grace_ms=jit_sync_pause_grace_ms,
                 enable_dynamic=enable_dynamic,
                 dynamic_config=dynamic_config,
                 dynamic_ref_data=dynamic_ref_data,
@@ -1200,38 +1415,171 @@ def run_scheduled_workflow(
         "error": error,
         "dynamic_upgraded": dynamic_upgrade_count > 0,
         "dynamic_upgrade_count": dynamic_upgrade_count,
+        "entry_prewarm_count": int(as_float(source_row.get("entry_prewarm_count"), 0.0)),
+        "entry_prewarm_action": source_row.get("entry_prewarm_action", ""),
+        "entry_prewarm_tier_mb": source_row.get("entry_prewarm_tier_mb", ""),
     }
     return schedule_row, rows
 
 
-def invoke_replay_warmup(client: OpenWhiskClient, task: Any) -> None:
+def invoke_replay_warmup(
+    client: OpenWhiskClient,
+    task: Any,
+    tracker: WarmupStatusTracker | None = None,
+    warmup_records: dict[int, dict[str, Any]] | None = None,
+    warmup_records_lock: threading.Lock | None = None,
+) -> None:
     params = {
         "__warmup": True,
         "request_id": task.metadata.get("request_id", ""),
         "workflow_name": task.metadata.get("workflow_name", ""),
         "stage_name": task.metadata.get("stage_name", ""),
         "allocated_memory_mb": task.metadata.get("tier_mb", ""),
+        "allocated_cpu_cores": task.metadata.get("cpu_cores", ""),
     }
+    activation: dict[str, Any] = {}
+    result: dict[str, Any] = {}
+    annotations: dict[str, Any] = {}
+    status = "ok"
+    error = ""
+    sent_ms = now_ms()
+    warmup_sent_monotonic = time.monotonic()
+    request_id = str(task.metadata.get("request_id", ""))
+    stage_name = str(task.metadata.get("stage_name", ""))
+    warmup_tier = str(task.metadata.get("tier_mb", ""))
+    if tracker is not None and request_id and stage_name:
+        tracker.mark_issued(request_id, stage_name, warmup_tier, warmup_sent_monotonic)
     try:
-        client.invoke_activation(task.action_name, params)
+        activation = client.invoke_activation(task.action_name, params)
+        response = activation.get("response", {})
+        result = response.get("result", {}) if isinstance(response, dict) else {}
+        if not isinstance(result, dict):
+            result = {"error": result}
+        annotations = activation_annotations(activation)
+        activation_status = response.get("status", "") if isinstance(response, dict) else ""
+        if not response:
+            status = "error"
+            error = "activation did not return a completed response"
+        elif activation_status and activation_status != "success":
+            status = "error"
+            error = str(result.get("error", ""))
     except Exception as exc:
+        status = "error"
+        error = str(exc)
         print(
             f"warmup failed action={task.action_name} task={task.task_key}: {exc}",
             file=sys.stderr,
             flush=True,
         )
+    ended_ms = now_ms()
+    completed_monotonic = time.monotonic()
+    if tracker is not None and request_id and stage_name:
+        tracker.mark_completed(
+            request_id,
+            stage_name,
+            warmup_tier,
+            completed_monotonic,
+            activation_id=activation.get("activationId", ""),
+            container_id=result.get("container_id", ""),
+            error=error,
+        )
+    if (
+        warmup_records is not None
+        and warmup_records_lock is not None
+        and task.metadata.get("prewarm_kind") == "entry_oracle"
+    ):
+        try:
+            schedule_index = int(float(task.metadata.get("schedule_index", "")))
+        except (TypeError, ValueError):
+            schedule_index = -1
+        if schedule_index >= 0:
+            record = {
+                "task_key": task.task_key,
+                "schedule_index": schedule_index,
+                "slo_class": task.metadata.get("slo_class", ""),
+                "action_name": task.action_name,
+                "stage_name": task.metadata.get("stage_name", ""),
+                "tier_mb": task.metadata.get("tier_mb", ""),
+                "cpu_cores": task.metadata.get("cpu_cores", ""),
+                "status": status,
+                "error": error,
+                "sent_ms": sent_ms,
+                "ended_ms": ended_ms,
+                "activation_id": activation.get("activationId", ""),
+                "ow_duration_ms": activation.get("duration", ""),
+                "action_duration_ms": result.get("action_duration_ms", ""),
+                "ow_wait_ms": annotations.get("waitTime", ""),
+                "ow_init_ms": annotations.get("initTime", ""),
+                "container_id": result.get("container_id", ""),
+                "cold_like": result.get("cold_like", ""),
+            }
+            with warmup_records_lock:
+                warmup_records[schedule_index] = record
 
 
-def make_replay_warmup_callback(client: OpenWhiskClient):
+def make_replay_warmup_callback(
+    client: OpenWhiskClient,
+    tracker: WarmupStatusTracker | None = None,
+    warmup_records: dict[int, dict[str, Any]] | None = None,
+    warmup_records_lock: threading.Lock | None = None,
+):
     def callback(task: Any) -> None:
         worker = threading.Thread(
             target=invoke_replay_warmup,
-            args=(client, task),
+            args=(client, task, tracker, warmup_records, warmup_records_lock),
             daemon=True,
         )
         worker.start()
 
     return callback
+
+
+def schedule_entry_prewarm_tasks(
+    *,
+    scheduler: Any,
+    workflow: WorkflowSpec,
+    schedule_rows: list[dict[str, Any]],
+    plan_by_class: dict[str, dict[str, int]],
+    base_monotonic: float,
+    lead_sec: float,
+) -> int:
+    from runner.stage5_control.jit_scheduler import WarmupTask
+
+    entry_node = workflow.nodes[workflow.entry]
+    scheduled = 0
+    for row in schedule_rows:
+        slo_class = str(row.get("slo_class", "")).strip().lower()
+        if not slo_class:
+            raise ValueError("entry prewarm requires preassigned slo_class")
+        tier_mb = int(plan_by_class[slo_class][entry_node.name])
+        target_offset_sec = int(float(row["target_offset_ms"])) / 1000.0
+        fire_time = base_monotonic + max(0.0, target_offset_sec - float(lead_sec))
+        schedule_index = int(float(row.get("index", scheduled)))
+        action_name = suffix_action_name(entry_node.action, f"_{tier_mb}")
+        cpu_cores = cpu_cores_for_memory(tier_mb)
+        task = WarmupTask(
+            task_key=f"entry:{schedule_index}:{slo_class}:{tier_mb}",
+            fire_time=fire_time,
+            action_name=action_name,
+            metadata={
+                "prewarm_kind": "entry_oracle",
+                "request_id": f"entry-prewarm-{schedule_index}",
+                "workflow_name": workflow.workflow_name,
+                "stage_name": entry_node.name,
+                "tier_mb": tier_mb,
+                "cpu_cores": cpu_cores,
+                "slo_class": slo_class,
+                "schedule_index": schedule_index,
+                "target_offset_ms": int(float(row["target_offset_ms"])),
+                "lead_sec": float(lead_sec),
+            },
+        )
+        row["entry_prewarm_count"] = 1
+        row["entry_prewarm_action"] = action_name
+        row["entry_prewarm_tier_mb"] = tier_mb
+        scheduler.schedule(task)
+        scheduled += 1
+    return scheduled
 
 
 def prepare_outputs(
@@ -1275,6 +1623,8 @@ def drain_completed(
     source_rows_by_index: dict[int, dict[str, Any]],
     args: argparse.Namespace,
     include_slo: bool = False,
+    entry_prewarm_records: dict[int, dict[str, Any]] | None = None,
+    entry_prewarm_records_lock: threading.Lock | None = None,
 ) -> tuple[int, int]:
     if not active:
         return completed_count, 0
@@ -1291,6 +1641,37 @@ def drain_completed(
         schedule_row, rows = future.result()
         index = int(schedule_row["index"])
         source_row = source_rows_by_index[index]
+        if (
+            entry_prewarm_records is not None
+            and entry_prewarm_records_lock is not None
+            and int(as_float(schedule_row.get("entry_prewarm_count"), 0.0)) > 0
+        ):
+            with entry_prewarm_records_lock:
+                warmup_record = dict(entry_prewarm_records.get(index, {}))
+            if warmup_record:
+                costs = entry_prewarm_cost(
+                    warmup_record,
+                    price_per_gb_second=args.price_per_gb_second,
+                    price_per_vcpu_second=args.price_per_vcpu_second,
+                    price_per_request=args.price_per_request,
+                )
+                schedule_row["entry_prewarm_status"] = warmup_record.get("status", "")
+                schedule_row["entry_prewarm_action"] = warmup_record.get("action_name", "")
+                schedule_row["entry_prewarm_tier_mb"] = warmup_record.get("tier_mb", "")
+                schedule_row["entry_prewarm_ow_duration_ms"] = warmup_record.get(
+                    "ow_duration_ms",
+                    "",
+                )
+                schedule_row["entry_prewarm_gb_seconds"] = costs["execution_gb_seconds"]
+                schedule_row["entry_prewarm_vcpu_seconds"] = costs["execution_vcpu_seconds"]
+                schedule_row["entry_prewarm_memory_cost"] = costs["memory_cost"]
+                schedule_row["entry_prewarm_cpu_cost"] = costs["cpu_cost"]
+                schedule_row["entry_prewarm_request_cost"] = costs["request_cost"]
+                schedule_row["entry_prewarm_total_cost"] = costs["total_cost"]
+            else:
+                schedule_row["entry_prewarm_status"] = "missing_record"
+                schedule_row["entry_prewarm_request_cost"] = args.price_per_request
+                schedule_row["entry_prewarm_total_cost"] = args.price_per_request
         if rows:
             store.append_many(rows)
         workflow_record, stage_detail = build_detail_records(
@@ -1330,10 +1711,16 @@ def main() -> None:
         raise ValueError("--stage-max-workers must be >= 1")
     if args.premium_ratio < 0.0 or args.premium_ratio > 1.0:
         raise ValueError("--premium-ratio must be in [0, 1]")
+    if args.enable_jit_sync and not args.enable_jit:
+        raise ValueError("--enable-jit-sync requires --enable-jit")
+    if args.jit_sync_pause_grace_ms < 0.0:
+        raise ValueError("--jit-sync-pause-grace-ms must be >= 0")
+    if args.entry_prewarm_lead_sec < 0.0:
+        raise ValueError("--entry-prewarm-lead-sec must be >= 0")
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(args.out_dir) if args.out_dir else ROOT / "reports" / f"civic_azure_replay_{run_id}"
-    multi_slo_active = bool(args.enable_jit or args.enable_dynamic)
+    multi_slo_active = bool(args.enable_jit or args.enable_dynamic or args.enable_entry_prewarm)
     paths = prepare_outputs(out_dir, args.overwrite, include_per_class=multi_slo_active)
     auth = auth_from_args(args.auth)
     base_workflow = load_workflow(args.workflow)
@@ -1352,9 +1739,14 @@ def main() -> None:
     dynamic_ref_data = None
     dynamic_config_by_class: dict[str, Any] = {}
     jit_scheduler = None
+    jit_warmup_tracker = WarmupStatusTracker() if args.enable_jit_sync else None
+    entry_prewarm_records: dict[int, dict[str, Any]] = {}
+    entry_prewarm_records_lock = threading.Lock()
+    entry_prewarm_scheduled = 0
 
     if multi_slo_active:
         plan_by_class = load_plan_by_class(args.plan_csv)
+        preassign_slo_classes(schedule_rows, slo_rng, args.premium_ratio, slo_ms_by_class)
 
     if args.enable_dynamic:
         from runner.stage5_control.multi_slo_planner import (
@@ -1378,7 +1770,7 @@ def main() -> None:
             for slo_class, slo_ms in slo_ms_by_class.items()
         }
 
-    if args.enable_jit:
+    if args.enable_jit or args.enable_entry_prewarm:
         from runner.stage5_control.jit_scheduler import JitScheduler
 
         warmup_client = OpenWhiskClient(
@@ -1387,7 +1779,14 @@ def main() -> None:
             namespace=workflow.namespace,
             timeout_sec=args.invoke_timeout_sec,
         )
-        jit_scheduler = JitScheduler(make_replay_warmup_callback(warmup_client))
+        jit_scheduler = JitScheduler(
+            make_replay_warmup_callback(
+                warmup_client,
+                jit_warmup_tracker,
+                entry_prewarm_records,
+                entry_prewarm_records_lock,
+            )
+        )
         jit_scheduler.start()
 
     if not args.skip_deploy and not multi_slo_active:
@@ -1416,7 +1815,11 @@ def main() -> None:
         "cpu_cores": args.cpu_cores,
         "multi_slo_active": multi_slo_active,
         "enable_jit": args.enable_jit,
+        "enable_jit_sync": args.enable_jit_sync,
+        "jit_sync_pause_grace_ms": args.jit_sync_pause_grace_ms,
         "enable_dynamic": args.enable_dynamic,
+        "enable_entry_prewarm": args.enable_entry_prewarm,
+        "entry_prewarm_lead_sec": args.entry_prewarm_lead_sec,
         "plan_csv": str(args.plan_csv),
         "premium_ratio": args.premium_ratio,
         "slo_class_seed": args.slo_class_seed,
@@ -1443,6 +1846,8 @@ def main() -> None:
     if multi_slo_active:
         print(
             f"multi_slo=on enable_jit={args.enable_jit} enable_dynamic={args.enable_dynamic} "
+            f"enable_jit_sync={args.enable_jit_sync} "
+            f"enable_entry_prewarm={args.enable_entry_prewarm} "
             f"premium_ratio={args.premium_ratio} seed={args.slo_class_seed}"
         )
     print("No additional schedule compression will be applied.")
@@ -1454,6 +1859,28 @@ def main() -> None:
     submitted = 0
     completed = 0
     base_ms = now_ms()
+    base_monotonic = time.monotonic()
+    if args.enable_entry_prewarm:
+        if jit_scheduler is None:
+            raise RuntimeError("entry prewarm requires an active JIT scheduler")
+        entry_prewarm_scheduled = schedule_entry_prewarm_tasks(
+            scheduler=jit_scheduler,
+            workflow=base_workflow,
+            schedule_rows=schedule_rows,
+            plan_by_class=plan_by_class,
+            base_monotonic=base_monotonic,
+            lead_sec=args.entry_prewarm_lead_sec,
+        )
+        metadata["entry_prewarm_scheduled"] = entry_prewarm_scheduled
+        paths["metadata"].write_text(
+            json.dumps(metadata, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        print(
+            f"entry_prewarm=on scheduled={entry_prewarm_scheduled} "
+            f"lead_sec={args.entry_prewarm_lead_sec}",
+            flush=True,
+        )
 
     try:
         with ThreadPoolExecutor(max_workers=args.max_inflight) as pool:
@@ -1473,6 +1900,8 @@ def main() -> None:
                         source_rows_by_index=source_rows_by_index,
                         args=args,
                         include_slo=multi_slo_active,
+                        entry_prewarm_records=entry_prewarm_records,
+                        entry_prewarm_records_lock=entry_prewarm_records_lock,
                     )
                     delay_ms = target_ms - now_ms()
                     if delay_ms <= 0:
@@ -1492,6 +1921,8 @@ def main() -> None:
                         source_rows_by_index=source_rows_by_index,
                         args=args,
                         include_slo=multi_slo_active,
+                        entry_prewarm_records=entry_prewarm_records,
+                        entry_prewarm_records_lock=entry_prewarm_records_lock,
                     )
 
                 plan = None
@@ -1499,12 +1930,10 @@ def main() -> None:
                 slo_ms = None
                 dynamic_config = None
                 if multi_slo_active:
-                    slo_class = assign_slo_class(slo_rng, args.premium_ratio)
-                    slo_ms = slo_ms_by_class[slo_class]
+                    slo_class = str(source_row.get("slo_class", "")).strip().lower()
+                    slo_ms = float(source_row.get("slo_ms", slo_ms_by_class[slo_class]))
                     plan = plan_by_class[slo_class]
                     dynamic_config = dynamic_config_by_class.get(slo_class)
-                    source_row["slo_class"] = slo_class
-                    source_row["slo_ms"] = slo_ms
 
                 submit_ms = now_ms()
                 future = pool.submit(
@@ -1525,6 +1954,9 @@ def main() -> None:
                     slo_ms=slo_ms,
                     jit_scheduler=jit_scheduler,
                     enable_jit=args.enable_jit,
+                    jit_warmup_tracker=jit_warmup_tracker,
+                    enable_jit_sync=args.enable_jit_sync,
+                    jit_sync_pause_grace_ms=args.jit_sync_pause_grace_ms,
                     enable_dynamic=args.enable_dynamic,
                     dynamic_config=dynamic_config,
                     dynamic_ref_data=dynamic_ref_data,
@@ -1552,6 +1984,8 @@ def main() -> None:
                     source_rows_by_index=source_rows_by_index,
                     args=args,
                     include_slo=multi_slo_active,
+                    entry_prewarm_records=entry_prewarm_records,
+                    entry_prewarm_records_lock=entry_prewarm_records_lock,
                 )
     finally:
         if jit_scheduler is not None:

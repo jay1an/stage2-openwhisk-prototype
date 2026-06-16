@@ -147,8 +147,8 @@ class WarmupStatusTracker:
         self.condition = threading.Condition()
         self.statuses: dict[tuple[str, str], dict] = {}
 
-    def _status_locked(self, request_id: str, stage_name: str) -> dict:
-        key = (request_id, stage_name)
+    def _status_locked(self, request_id: str, stage_name: str, tier: object) -> dict:
+        key = (str(request_id), str(stage_name), str(tier))
         if key not in self.statuses:
             self.statuses[key] = {
                 "issued_monotonic": "",
@@ -160,9 +160,11 @@ class WarmupStatusTracker:
             }
         return self.statuses[key]
 
-    def mark_issued(self, request_id: str, stage_name: str, issued_monotonic: float) -> None:
+    def mark_issued(
+        self, request_id: str, stage_name: str, tier: object, issued_monotonic: float
+    ) -> None:
         with self.condition:
-            status = self._status_locked(request_id, stage_name)
+            status = self._status_locked(request_id, stage_name, tier)
             status["issued_monotonic"] = issued_monotonic
             self.condition.notify_all()
 
@@ -170,13 +172,14 @@ class WarmupStatusTracker:
         self,
         request_id: str,
         stage_name: str,
+        tier: object,
         completed_monotonic: float,
         activation_id: str = "",
         container_id: str = "",
         error: str = "",
     ) -> None:
         with self.condition:
-            status = self._status_locked(request_id, stage_name)
+            status = self._status_locked(request_id, stage_name, tier)
             status["completed_monotonic"] = completed_monotonic
             status["activation_id"] = activation_id
             status["container_id"] = container_id
@@ -184,22 +187,23 @@ class WarmupStatusTracker:
             status["event"].set()
             self.condition.notify_all()
 
-    def get_status(self, request_id: str, stage_name: str) -> dict:
+    def get_status(self, request_id: str, stage_name: str, tier: object) -> dict:
         with self.condition:
-            status = self._status_locked(request_id, stage_name)
+            status = self._status_locked(request_id, stage_name, tier)
             return {key: value for key, value in status.items() if key != "event"}
 
     def wait_until_completed(
         self,
         request_id: str,
         stage_name: str,
+        tier: object,
         timeout: float,
     ) -> dict:
         with self.condition:
-            status = self._status_locked(request_id, stage_name)
+            status = self._status_locked(request_id, stage_name, tier)
             event = status["event"]
         event.wait(timeout=max(0.0, timeout))
-        return self.get_status(request_id, stage_name)
+        return self.get_status(request_id, stage_name, tier)
 
 
 class WarmupRecorder:
@@ -229,8 +233,11 @@ class WarmupRecorder:
         warmup_sent_monotonic = time.monotonic()
         request_id = task.metadata.get("request_id", "")
         stage_name = task.metadata.get("stage_name", "")
+        warmup_tier = task.metadata.get("tier_mb", "")
         if self.tracker is not None:
-            self.tracker.mark_issued(request_id, stage_name, warmup_sent_monotonic)
+            self.tracker.mark_issued(
+                request_id, stage_name, warmup_tier, warmup_sent_monotonic
+            )
         activation = {}
         result = {}
         annotations = {}
@@ -246,6 +253,7 @@ class WarmupRecorder:
             self.tracker.mark_completed(
                 request_id,
                 stage_name,
+                warmup_tier,
                 callback_end,
                 activation_id=activation.get("activationId", ""),
                 container_id=result.get("container_id", ""),
