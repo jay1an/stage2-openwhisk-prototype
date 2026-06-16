@@ -241,10 +241,11 @@ def resolve_parallel_workers(profile, allocated_cpu_cores):
 
     requested = profile.get("parallel_workers", "auto")
     if requested in (None, "", "auto"):
-        if allocated_cpu_cores is not None and allocated_cpu_cores > 1.0:
-            workers = int(math.ceil(allocated_cpu_cores))
-        else:
-            workers = 1
+        workers = (
+            max(1, math.ceil(allocated_cpu_cores))
+            if allocated_cpu_cores is not None
+            else 1
+        )
     else:
         workers = optional_int(requested) or 1
 

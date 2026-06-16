@@ -44,7 +44,22 @@ STAGES = [
     "classify_scene",
     "translate_alert",
 ]
-DEFAULT_TIERS = [512, 768, 1024, 1280, 1536, 2048, 2560, 3072, 3840]
+DEFAULT_TIERS = [
+    512,
+    768,
+    1024,
+    1280,
+    1536,
+    1792,
+    2048,
+    2304,
+    2560,
+    2816,
+    3072,
+    3328,
+    3584,
+    3840,
+]
 DEFAULT_SAFETY_FACTORS = [0.0, 0.5, 1.0, 1.5, 2.0]
 DEFAULT_LOGNORMAL_PARAMS = (
     Path(__file__).resolve().parents[2]
