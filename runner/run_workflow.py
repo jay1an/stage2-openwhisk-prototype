@@ -386,6 +386,7 @@ def run_one_workflow(
     # only for non-LogDriver deployments where warmup completion is not enough.
     enable_jit_sync: bool = False,
     jit_sync_pause_grace_ms: float = 3000.0,
+    jit_sync_inflight_max_ms: float = 6000.0,
     enable_dynamic: bool = False,
     dynamic_config: "PlannerConfig | None" = None,
     dynamic_ref_data: "ReferenceData | None" = None,
@@ -630,6 +631,25 @@ def run_one_workflow(
                 schedule_phase="upsert",
             )
 
+    def prewarmable_stage_names() -> set[str]:
+        if not jit_active:
+            return set()
+        now = time.monotonic()
+        predicted_start, _ = compute_predicted_times()
+        eligible: set[str] = set()
+        for stage_name in topo_order:
+            if stage_name == workflow.entry:
+                continue
+            if stage_name in completed or stage_name in running or stage_name in started_at:
+                continue
+            lead_s = (
+                stage_cold_overhead_ms(stage_name) / 1000.0
+                + max(0.0, jit_margin_ms) / 1000.0
+            )
+            if predicted_start[stage_name] - now >= lead_s:
+                eligible.add(stage_name)
+        return eligible
+
     def wait_for_stage_warmup(stage_name: str) -> dict:
         sync_info = {
             "jit_sync_enabled": jit_sync_active,
@@ -646,8 +666,10 @@ def run_one_workflow(
         current_tier = normalized_plan[stage_name] if normalized_plan is not None else ""
         max_wait_s = max(0.0, stage_cold_overhead_ms(stage_name) / 1000.0)
         pause_grace_s = max(0.0, jit_sync_pause_grace_ms / 1000.0)
+        inflight_extension_s = max(0.0, jit_sync_inflight_max_ms / 1000.0)
         completion_deadline = start_wait + max_wait_s
-        deadline = completion_deadline + pause_grace_s
+        extension_deadline = completion_deadline + inflight_extension_s
+        deadline = extension_deadline + pause_grace_s
 
         status = {}
         if hasattr(jit_warmup_tracker, "get_status"):
@@ -672,19 +694,39 @@ def run_one_workflow(
                 issued = status_value(status, "issued_monotonic", issued)
                 completed = status_value(status, "completed_monotonic", completed)
 
+        completed_after_extension = False
+        if (
+            completed in ("", None)
+            and issued not in ("", None)
+            and hasattr(jit_warmup_tracker, "wait_until_completed")
+        ):
+            remaining = max(0.0, extension_deadline - time.monotonic())
+            if remaining > 0.0:
+                status = jit_warmup_tracker.wait_until_completed(
+                    request_id,
+                    stage_name,
+                    current_tier,
+                    remaining,
+                )
+                issued = status_value(status, "issued_monotonic", issued)
+                completed = status_value(status, "completed_monotonic", completed)
+                completed_after_extension = completed not in ("", None)
+
         if issued not in ("", None):
             sync_info["jit_sync_warmup_issued_monotonic"] = issued
         if completed not in ("", None):
             sync_info["jit_sync_warmup_completed_monotonic"] = completed
             sync_info["jit_sync_dispatch_after_warmup"] = True
-            sync_info["jit_sync_status"] = "completed"
+            sync_info["jit_sync_status"] = (
+                "completed_after_extension" if completed_after_extension else "completed"
+            )
             ready_at = float(completed) + pause_grace_s
             remaining_grace = ready_at - time.monotonic()
             remaining_budget = deadline - time.monotonic()
             if remaining_grace > 0.0 and remaining_budget > 0.0:
                 time.sleep(min(remaining_grace, remaining_budget))
         elif issued not in ("", None):
-            sync_info["jit_sync_status"] = "timed_out_in_flight"
+            sync_info["jit_sync_status"] = "timed_out_hang"
         else:
             sync_info["jit_sync_status"] = "timed_out_not_issued"
 
@@ -713,6 +755,7 @@ def run_one_workflow(
         descendants = _runtime_descendant_stage_names(workflow, stage_name)
         if not descendants:
             return
+        eligible = descendants.intersection(prewarmable_stage_names())
         changes = _runtime_upgrade_decision(
             workflow=workflow,
             normalized_plan=normalized_plan,
@@ -723,7 +766,7 @@ def run_one_workflow(
             workflow_start_monotonic=workflow_start_monotonic,
             dynamic_config=dynamic_config,
             dynamic_ref_data=dynamic_ref_data,
-            eligible_stage_names=descendants,
+            eligible_stage_names=eligible,
         )
         if changes:
             normalized_plan.update(changes)
@@ -844,6 +887,7 @@ def run_one_workflow(
                         workflow_start_monotonic=workflow_start_monotonic,
                         dynamic_config=dynamic_config,
                         dynamic_ref_data=dynamic_ref_data,
+                        eligible_stage_names=prewarmable_stage_names(),
                     )
                     if changes:
                         normalized_plan.update(changes)

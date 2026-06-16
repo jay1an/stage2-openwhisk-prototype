@@ -238,6 +238,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-jit", action="store_true", default=False)
     parser.add_argument("--enable-jit-sync", action="store_true", default=False)
     parser.add_argument("--jit-sync-pause-grace-ms", type=float, default=0.0)
+    parser.add_argument(
+        "--jit-sync-inflight-max-ms",
+        type=float,
+        default=6000.0,
+        help="extra bounded wait for an issued-but-in-flight warmup before dispatch",
+    )
     parser.add_argument("--enable-dynamic", action="store_true", default=False)
     parser.add_argument("--enable-entry-prewarm", action="store_true", default=False)
     parser.add_argument(
@@ -1329,6 +1335,7 @@ def run_scheduled_workflow(
     jit_warmup_tracker: object | None = None,
     enable_jit_sync: bool = False,
     jit_sync_pause_grace_ms: float = 0.0,
+    jit_sync_inflight_max_ms: float = 6000.0,
     enable_dynamic: bool = False,
     dynamic_config: object | None = None,
     dynamic_ref_data: object | None = None,
@@ -1359,6 +1366,7 @@ def run_scheduled_workflow(
                 jit_warmup_tracker=jit_warmup_tracker,
                 enable_jit_sync=enable_jit_sync,
                 jit_sync_pause_grace_ms=jit_sync_pause_grace_ms,
+                jit_sync_inflight_max_ms=jit_sync_inflight_max_ms,
                 enable_dynamic=enable_dynamic,
                 dynamic_config=dynamic_config,
                 dynamic_ref_data=dynamic_ref_data,
@@ -1715,6 +1723,8 @@ def main() -> None:
         raise ValueError("--enable-jit-sync requires --enable-jit")
     if args.jit_sync_pause_grace_ms < 0.0:
         raise ValueError("--jit-sync-pause-grace-ms must be >= 0")
+    if args.jit_sync_inflight_max_ms < 0.0:
+        raise ValueError("--jit-sync-inflight-max-ms must be >= 0")
     if args.entry_prewarm_lead_sec < 0.0:
         raise ValueError("--entry-prewarm-lead-sec must be >= 0")
 
@@ -1817,6 +1827,7 @@ def main() -> None:
         "enable_jit": args.enable_jit,
         "enable_jit_sync": args.enable_jit_sync,
         "jit_sync_pause_grace_ms": args.jit_sync_pause_grace_ms,
+        "jit_sync_inflight_max_ms": args.jit_sync_inflight_max_ms,
         "enable_dynamic": args.enable_dynamic,
         "enable_entry_prewarm": args.enable_entry_prewarm,
         "entry_prewarm_lead_sec": args.entry_prewarm_lead_sec,
@@ -1957,6 +1968,7 @@ def main() -> None:
                     jit_warmup_tracker=jit_warmup_tracker,
                     enable_jit_sync=args.enable_jit_sync,
                     jit_sync_pause_grace_ms=args.jit_sync_pause_grace_ms,
+                    jit_sync_inflight_max_ms=args.jit_sync_inflight_max_ms,
                     enable_dynamic=args.enable_dynamic,
                     dynamic_config=dynamic_config,
                     dynamic_ref_data=dynamic_ref_data,
