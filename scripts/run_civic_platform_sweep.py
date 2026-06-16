@@ -2,10 +2,13 @@
 """Run paired all-cold/all-warm civic workflow samples by memory tier."""
 
 import argparse
+import math
 import statistics
 import subprocess
 import sys
+import time
 from collections import defaultdict
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -54,6 +57,48 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=3,
         help="number of paired all-cold then all-warm workflow runs per tier",
+    )
+    parser.add_argument(
+        "--tier-cycles",
+        default="",
+        help=(
+            "optional per-tier cycle overrides, e.g. "
+            "'512:15,768:15,1280:5'; unspecified tiers use --cycles"
+        ),
+    )
+    parser.add_argument(
+        "--worker-rule",
+        choices=["auto", "round", "ceil"],
+        default="auto",
+        help=(
+            "force an explicit per-tier parallel_workers count. "
+            "'auto' preserves workflow/action defaults; 'round' and 'ceil' "
+            "derive workers from the configured CPU estimate."
+        ),
+    )
+    parser.add_argument(
+        "--parallel-workers-override",
+        default="",
+        help=(
+            "optional explicit tier:workers map, e.g. '1536:2,3072:3'. "
+            "Entries override --worker-rule for those tiers."
+        ),
+    )
+    parser.add_argument(
+        "--between-tier-sleep-sec",
+        type=float,
+        default=0.0,
+        help="optional sleep between memory tiers to let old containers drain",
+    )
+    parser.add_argument(
+        "--abort-on-pending",
+        action="store_true",
+        help="abort if any OpenWhisk pod is Pending during the sweep",
+    )
+    parser.add_argument(
+        "--pending-namespace",
+        default="openwhisk",
+        help="namespace checked by --abort-on-pending",
     )
     parser.add_argument("--kind", default="python:3")
     parser.add_argument("--timeout-ms", type=int, default=60000)
@@ -125,6 +170,58 @@ def auth_from_args(value: str) -> str:
     return value or read_cluster_auth()
 
 
+def resolve_tier_cycles(args: argparse.Namespace) -> dict[int, int]:
+    cycles_by_tier = {memory_mb: args.cycles for memory_mb in args.memory_tiers}
+    if not args.tier_cycles:
+        return cycles_by_tier
+
+    for item in args.tier_cycles.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(f"invalid --tier-cycles entry: {item!r}")
+        tier_text, cycles_text = item.split(":", 1)
+        try:
+            tier = int(tier_text.strip())
+            cycles = int(cycles_text.strip())
+        except ValueError as exc:
+            raise ValueError(f"invalid --tier-cycles entry: {item!r}") from exc
+        if tier < 1 or cycles < 1:
+            raise ValueError(f"--tier-cycles entries must be positive: {item!r}")
+        if tier in cycles_by_tier:
+            cycles_by_tier[tier] = cycles
+    return cycles_by_tier
+
+
+def parse_parallel_worker_overrides(value: str) -> dict[int, int]:
+    overrides: dict[int, int] = {}
+    if not value:
+        return overrides
+
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(f"invalid --parallel-workers-override entry: {item!r}")
+        tier_text, workers_text = item.split(":", 1)
+        try:
+            tier = int(tier_text.strip())
+            workers = int(workers_text.strip())
+        except ValueError as exc:
+            raise ValueError(
+                f"invalid --parallel-workers-override entry: {item!r}"
+            ) from exc
+        if tier < 1 or workers < 1:
+            raise ValueError(
+                "--parallel-workers-override entries must be positive: "
+                f"{item!r}"
+            )
+        overrides[tier] = workers
+    return overrides
+
+
 def estimated_cpu_m(memory_mb: int, args: argparse.Namespace) -> int:
     if args.cpu_profile == "custom":
         scaled = memory_mb * args.cpu_base_millicpu / args.cpu_base_memory_mb
@@ -139,6 +236,74 @@ def estimated_cpu_m(memory_mb: int, args: argparse.Namespace) -> int:
 
 def estimated_cpu_cores(memory_mb: int, args: argparse.Namespace) -> float:
     return estimated_cpu_m(memory_mb, args) / 1000.0
+
+
+def workers_for_rule(memory_mb: int, args: argparse.Namespace, rule: str) -> int:
+    cpu = estimated_cpu_cores(memory_mb, args)
+    if rule == "round":
+        return max(1, round(cpu))
+    if rule == "ceil":
+        return max(1, math.ceil(cpu))
+    raise ValueError(f"unsupported worker rule: {rule}")
+
+
+def resolve_worker_counts(
+    args: argparse.Namespace,
+    overrides: dict[int, int],
+) -> dict[int, int | None]:
+    counts: dict[int, int | None] = {}
+    for memory_mb in args.memory_tiers:
+        if memory_mb in overrides:
+            counts[memory_mb] = overrides[memory_mb]
+        elif args.worker_rule == "auto":
+            counts[memory_mb] = None
+        else:
+            counts[memory_mb] = workers_for_rule(memory_mb, args, args.worker_rule)
+    return counts
+
+
+def with_parallel_workers(workflow, workers: int | None):
+    if workers is None:
+        return workflow
+    return replace(
+        workflow,
+        nodes={
+            name: replace(node, parallel_workers=str(workers))
+            for name, node in workflow.nodes.items()
+        },
+    )
+
+
+def pending_pod_count(namespace: str) -> int:
+    result = subprocess.run(
+        ["kubectl", "get", "pods", "-n", namespace, "--no-headers"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    return sum(1 for line in result.stdout.splitlines() if "Pending" in line)
+
+
+def assert_no_pending(namespace: str, context: str) -> None:
+    count = pending_pod_count(namespace)
+    print(f"pending_pods[{context}]={count}", flush=True)
+    if count:
+        raise RuntimeError(f"aborting: {count} Pending pods detected during {context}")
+
+
+def sleep_between_tiers(seconds: float, namespace: str, abort_on_pending: bool) -> None:
+    if seconds <= 0:
+        return
+    print(f"sleeping_between_tiers_sec={seconds:.1f}", flush=True)
+    deadline = time.monotonic() + seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(5.0, remaining))
+        if abort_on_pending:
+            assert_no_pending(namespace, "between_tiers")
 
 
 def update_actions(
@@ -233,6 +398,26 @@ def print_table(headers: list[str], rows: list[list[object]]) -> None:
     print(separator)
     for row in text_rows:
         print(" | ".join(value.rjust(widths[index]) for index, value in enumerate(row)))
+
+
+def print_worker_resolution(
+    args: argparse.Namespace,
+    worker_counts: dict[int, int | None],
+) -> None:
+    rows = []
+    for memory_mb in args.memory_tiers:
+        forced = worker_counts[memory_mb]
+        rows.append(
+            [
+                memory_mb,
+                estimated_cpu_cores(memory_mb, args),
+                workers_for_rule(memory_mb, args, "round"),
+                workers_for_rule(memory_mb, args, "ceil"),
+                "auto" if forced is None else forced,
+            ]
+        )
+    print("\nWorker resolution")
+    print_table(["mem_MiB", "cpu_cores", "round", "ceil", "used"], rows)
 
 
 def print_summary(samples: list[dict], args: argparse.Namespace) -> None:
@@ -332,6 +517,11 @@ def main() -> None:
         raise ValueError("--cycles must be >= 1")
     if not args.memory_tiers or any(memory < 1 for memory in args.memory_tiers):
         raise ValueError("--memory-tiers must contain positive MB values")
+    if args.between_tier_sleep_sec < 0:
+        raise ValueError("--between-tier-sleep-sec must be >= 0")
+    tier_cycles = resolve_tier_cycles(args)
+    worker_overrides = parse_parallel_worker_overrides(args.parallel_workers_override)
+    worker_counts = resolve_worker_counts(args, worker_overrides)
 
     auth = auth_from_args(args.auth)
     workflow = load_workflow(args.workflow)
@@ -352,21 +542,34 @@ def main() -> None:
 
     print(f"workflow={workflow.workflow_name}")
     print(f"memory_tiers={args.memory_tiers}; paired_cycles={args.cycles}")
+    if args.tier_cycles:
+        print(f"tier_cycles={tier_cycles}")
     print(f"cpu_profile={args.cpu_profile}")
+    print(f"worker_rule={args.worker_rule}; worker_overrides={worker_overrides}")
     print(f"trace={trace_path}")
     print("Cold samples are forced by redeploying each action revision before the call.")
+    print_worker_resolution(args, worker_counts)
 
     samples = []
-    for memory_mb in args.memory_tiers:
+    for tier_index, memory_mb in enumerate(args.memory_tiers):
+        tier_workflow = with_parallel_workers(workflow, worker_counts[memory_mb])
+        worker_label = "auto" if worker_counts[memory_mb] is None else worker_counts[memory_mb]
         print(
             f"\n=== memory={memory_mb} MiB "
-            f"(configured CPU estimate={estimated_cpu_m(memory_mb, args)}m) ==="
+            f"(configured CPU estimate={estimated_cpu_m(memory_mb, args)}m; "
+            f"parallel_workers={worker_label}) ==="
         )
-        for cycle in range(1, args.cycles + 1):
+        if args.abort_on_pending:
+            assert_no_pending(args.pending_namespace, f"before_tier_{memory_mb}")
+        for cycle in range(1, tier_cycles[memory_mb] + 1):
+            if args.abort_on_pending:
+                assert_no_pending(args.pending_namespace, f"before_deploy_{memory_mb}_{cycle}")
             update_actions(args, auth, action_names, memory_mb)
+            if args.abort_on_pending:
+                assert_no_pending(args.pending_namespace, f"after_deploy_{memory_mb}_{cycle}")
 
             cold_rows = run_one_workflow(
-                workflow,
+                tier_workflow,
                 client,
                 args.max_workers,
                 allocated_memory_mb=memory_mb,
@@ -382,9 +585,11 @@ def main() -> None:
                 "rows": cold_rows,
             }
             samples.append(cold_sample)
+            if args.abort_on_pending:
+                assert_no_pending(args.pending_namespace, f"after_cold_{memory_mb}_{cycle}")
 
             warm_rows = run_one_workflow(
-                workflow,
+                tier_workflow,
                 client,
                 args.max_workers,
                 allocated_memory_mb=memory_mb,
@@ -404,6 +609,15 @@ def main() -> None:
             print(
                 f"cycle={cycle} cold_e2e_ms={cold_sample['e2e_ms']:.1f} "
                 f"warm_e2e_ms={warm_sample['e2e_ms']:.1f}"
+            )
+            if args.abort_on_pending:
+                assert_no_pending(args.pending_namespace, f"after_warm_{memory_mb}_{cycle}")
+
+        if tier_index < len(args.memory_tiers) - 1:
+            sleep_between_tiers(
+                args.between_tier_sleep_sec,
+                args.pending_namespace,
+                args.abort_on_pending,
             )
 
     print_summary(samples, args)
