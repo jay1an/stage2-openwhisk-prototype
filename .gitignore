@@ -7,6 +7,9 @@ __pycache__/
 # Local reference papers (PDFs) — keep locally, don't push.
 thesis/
 
+# Large local raw traces (Azure Functions dataset) — local only.
+AzureFunctionsInvocationTrace*.txt
+
 # Per user rule (2026-05-23): no Chinese docs or READMEs on GitHub.
 # Keep them locally, but don't push.
 README.md
