@@ -219,6 +219,7 @@ def invoke_node(
             resolved_action_name,
             {
                 "workflow_name": workflow.workflow_name,
+                "__ow_reservation_key": f"{request_id}:{node.name}",
                 "request_id": request_id,
                 "entry_ts_ms": entry_ts_ms,
                 "stage_name": node.name,

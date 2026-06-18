@@ -236,6 +236,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--plan-csv", default=str(DEFAULT_PLAN_CSV))
     parser.add_argument("--enable-jit", action="store_true", default=False)
+    parser.add_argument("--jit-margin-ms", type=float, default=600.0)
     parser.add_argument("--enable-jit-sync", action="store_true", default=False)
     parser.add_argument("--jit-sync-pause-grace-ms", type=float, default=0.0)
     parser.add_argument(
@@ -1332,6 +1333,7 @@ def run_scheduled_workflow(
     slo_ms: float | None = None,
     jit_scheduler: object | None = None,
     enable_jit: bool = False,
+    jit_margin_ms: float = 600.0,
     jit_warmup_tracker: object | None = None,
     enable_jit_sync: bool = False,
     jit_sync_pause_grace_ms: float = 0.0,
@@ -1363,6 +1365,7 @@ def run_scheduled_workflow(
                 slo_class=slo_class,
                 jit_scheduler=jit_scheduler,
                 enable_jit=enable_jit,
+                jit_margin_ms=jit_margin_ms,
                 jit_warmup_tracker=jit_warmup_tracker,
                 enable_jit_sync=enable_jit_sync,
                 jit_sync_pause_grace_ms=jit_sync_pause_grace_ms,
@@ -1445,6 +1448,15 @@ def invoke_replay_warmup(
         "allocated_memory_mb": task.metadata.get("tier_mb", ""),
         "allocated_cpu_cores": task.metadata.get("cpu_cores", ""),
     }
+    # Entry-oracle prewarm fires before the workflow runs, so its placeholder request_id
+    # ("entry-prewarm-{index}") can never match the real entry invoke's runtime request_id. Don't reserve for
+    # it -- leave the prewarmed entry container unreserved so the real entry invoke can reuse it. Downstream JIT
+    # warmups carry no "prewarm_kind", so they keep the key (their request_id matches the real invoke) and stay
+    # reservation-protected.
+    if task.metadata.get("prewarm_kind") != "entry_oracle":
+        params["__ow_reservation_key"] = (
+            f'{task.metadata.get("request_id", "")}:{task.metadata.get("stage_name", "")}'
+        )
     activation: dict[str, Any] = {}
     result: dict[str, Any] = {}
     annotations: dict[str, Any] = {}
@@ -1721,6 +1733,8 @@ def main() -> None:
         raise ValueError("--premium-ratio must be in [0, 1]")
     if args.enable_jit_sync and not args.enable_jit:
         raise ValueError("--enable-jit-sync requires --enable-jit")
+    if args.jit_margin_ms < 0.0:
+        raise ValueError("--jit-margin-ms must be >= 0")
     if args.jit_sync_pause_grace_ms < 0.0:
         raise ValueError("--jit-sync-pause-grace-ms must be >= 0")
     if args.jit_sync_inflight_max_ms < 0.0:
@@ -1825,6 +1839,7 @@ def main() -> None:
         "cpu_cores": args.cpu_cores,
         "multi_slo_active": multi_slo_active,
         "enable_jit": args.enable_jit,
+        "jit_margin_ms": args.jit_margin_ms,
         "enable_jit_sync": args.enable_jit_sync,
         "jit_sync_pause_grace_ms": args.jit_sync_pause_grace_ms,
         "jit_sync_inflight_max_ms": args.jit_sync_inflight_max_ms,
@@ -1965,6 +1980,7 @@ def main() -> None:
                     slo_ms=slo_ms,
                     jit_scheduler=jit_scheduler,
                     enable_jit=args.enable_jit,
+                    jit_margin_ms=args.jit_margin_ms,
                     jit_warmup_tracker=jit_warmup_tracker,
                     enable_jit_sync=args.enable_jit_sync,
                     jit_sync_pause_grace_ms=args.jit_sync_pause_grace_ms,
