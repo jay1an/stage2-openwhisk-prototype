@@ -87,15 +87,36 @@ class LogNormalParams:
         return float(norm.sf((math.log(x) - self.mu) / self.sigma))
 
 
-def fenton_wilkinson_sum(distributions: list[LogNormalParams]) -> LogNormalParams:
-    """Approximate the sum of independent lognormals as a lognormal."""
+def fenton_wilkinson_sum(
+    distributions: list[LogNormalParams], rho: float = 0.0
+) -> LogNormalParams:
+    """Approximate the sum of lognormals as a lognormal (Fenton-Wilkinson).
+
+    ``rho`` is a homogeneous pairwise linear correlation applied to every pair
+    of summands. ``rho=0`` recovers the classic independent-sum behaviour. A
+    positive ``rho`` adds the covariance terms to the summed variance,
+    ``Var = sum_i v_i + 2 * rho * sum_{i<j} sqrt(v_i v_j)``, capturing the
+    cross-stage co-movement (a slow workflow is slow across all its stages) that
+    an independent sum ignores and that otherwise leaves the aggregate tail too
+    thin.
+    """
     if not distributions:
         raise ValueError("fenton_wilkinson_sum requires at least one distribution")
+    if not -1.0 <= rho <= 1.0:
+        raise ValueError(f"rho must be in [-1, 1], got {rho}")
     if len(distributions) == 1:
         return distributions[0]
 
     mean_sum = float(sum(dist.mean for dist in distributions))
-    var_sum = float(sum(dist.variance for dist in distributions))
+    variances = [float(dist.variance) for dist in distributions]
+    var_sum = float(sum(variances))
+    if rho != 0.0:
+        stds = [math.sqrt(max(0.0, value)) for value in variances]
+        cross = 0.0
+        for i in range(len(stds)):
+            for j in range(i + 1, len(stds)):
+                cross += stds[i] * stds[j]
+        var_sum += 2.0 * rho * cross
     if mean_sum <= 0.0 or not math.isfinite(mean_sum):
         raise ValueError(f"invalid summed mean: {mean_sum}")
     if var_sum < 0.0 or not math.isfinite(var_sum):
@@ -155,6 +176,7 @@ def add_deterministic_shift(dist: LogNormalParams, shift_ms: float) -> LogNormal
 def aggregate_civic_alert(
     stage_dists: dict[str, LogNormalParams],
     transition_overhead_ms: float = 0.0,
+    rho: float = 0.0,
 ) -> LogNormalParams:
     """Compute civic_alert workflow E2E distribution from per-stage dists.
 
@@ -176,11 +198,11 @@ def aggregate_civic_alert(
     classify = stage_dists["classify_scene"]
     translate = stage_dists["translate_alert"]
 
-    path1_partial = fenton_wilkinson_sum([detect, estimate, match])
+    path1_partial = fenton_wilkinson_sum([detect, estimate, match], rho=rho)
     path2_partial = detect
     classify_scene_start = clark_max(path1_partial, path2_partial, rho=0.0)
-    classify_scene_end = fenton_wilkinson_sum([classify_scene_start, classify])
-    e2e = fenton_wilkinson_sum([classify_scene_end, translate])
+    classify_scene_end = fenton_wilkinson_sum([classify_scene_start, classify], rho=rho)
+    e2e = fenton_wilkinson_sum([classify_scene_end, translate], rho=rho)
     shift_ms = CIVIC_ALERT_CRITICAL_PATH_EDGES * float(transition_overhead_ms)
     return add_deterministic_shift(e2e, shift_ms)
 
@@ -190,6 +212,7 @@ def aggregate_dag(
     stage_dists: dict[str, LogNormalParams],
     transition_overhead_ms: float = 0.0,
     fixed_finish: dict[str, float] | None = None,
+    rho: float = 0.0,
 ) -> LogNormalParams:
     """Aggregate arbitrary DAG latency from per-stage lognormal distributions."""
 
@@ -291,7 +314,9 @@ def aggregate_dag(
             arrival = finish[parents[0]]
             for parent in parents[1:]:
                 arrival = clark_max(arrival, finish[parent], rho=0.0)
-            finish[node_name] = fenton_wilkinson_sum([arrival, stage_dists[node_name]])
+            finish[node_name] = fenton_wilkinson_sum(
+                [arrival, stage_dists[node_name]], rho=rho
+            )
         else:
             finish[node_name] = stage_dists[node_name]
 

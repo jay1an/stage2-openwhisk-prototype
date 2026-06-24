@@ -61,10 +61,13 @@ DEFAULT_TIERS = [
     3840,
 ]
 DEFAULT_SAFETY_FACTORS = [0.0, 0.5, 1.0, 1.5, 2.0]
+# Real-sigma fit from the AMD-free, dellonly concurrent replay (real_45min). The
+# legacy `path2_lognormal_fit_multinode` default was AMD-contaminated (bimodal)
+# AND used the n=8 anchor sigma (~5x too tight); see per-stage-latency memo.
 DEFAULT_LOGNORMAL_PARAMS = (
     Path(__file__).resolve().parents[2]
     / "reports"
-    / "path2_lognormal_fit_multinode"
+    / "lognormal_params_realsigma"
     / "per_stage_lognormal_params.csv"
 )
 DEFAULT_AMDAHL_PARAMS = (

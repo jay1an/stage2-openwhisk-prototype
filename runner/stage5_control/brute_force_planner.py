@@ -79,6 +79,8 @@ def evaluate_candidate(
     slo_ms: float,
     predicted_arrivals: float,
     ref_data: ReferenceData,
+    rho: float = 0.0,
+    contention_factor: float = 1.0,
 ) -> PlanRecord:
     """Evaluate one brute-force candidate using the same cost helper as greedy."""
 
@@ -92,7 +94,7 @@ def evaluate_candidate(
         cold_overhead_per_stage=ref_data.cold_overhead_per_stage,
         p_baseline=ref_data.p_baseline,
     )
-    risk = compute_plan_risk(plan, slo_ms=slo_ms)
+    risk = compute_plan_risk(plan, slo_ms=slo_ms, rho=rho, contention_factor=contention_factor)
     cost = plan_cost_gbsec(
         memory_tier_per_stage=memory_tier_per_stage,
         entry_prewarm_count_value=prewarm_count,
@@ -171,6 +173,8 @@ def brute_force_one_slo(
     decision: SearchDecision,
     tiers: list[int] = DEFAULT_TIERS,
     safety_factors: list[float] = DEFAULT_SAFETY_FACTORS,
+    rho: float = 0.0,
+    contention_factor: float = 1.0,
 ) -> dict[str, Any]:
     """Enumerate the chosen search space and return the best feasible plan."""
 
@@ -190,6 +194,8 @@ def brute_force_one_slo(
             slo_ms=slo_ms,
             predicted_arrivals=predicted_arrivals,
             ref_data=ref_data,
+            rho=rho,
+            contention_factor=contention_factor,
         )
         if record.violation_rate > 0.05:
             continue
@@ -365,6 +371,8 @@ def run_brute_force_suite(
     lognormal_params_path: str | Path = DEFAULT_LOGNORMAL_PARAMS,
     baseline_trace_path: str | Path = DEFAULT_BASELINE_TRACE,
     greedy_summary_path: str | Path = DEFAULT_GREEDY_SUMMARY,
+    rho: float = 0.0,
+    contention_factor: float = 1.0,
 ) -> dict[str, pd.DataFrame]:
     out = _resolve(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -400,6 +408,8 @@ def run_brute_force_suite(
                 predicted_arrivals=5.0,
                 ref_data=ref_data,
                 decision=decision,
+                rho=rho,
+                contention_factor=contention_factor,
             )
         )
     optimal_df = pd.DataFrame(optimal_rows)
@@ -430,6 +440,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--lognormal-params", default=str(DEFAULT_LOGNORMAL_PARAMS))
     parser.add_argument("--baseline-trace", default=str(DEFAULT_BASELINE_TRACE))
     parser.add_argument("--greedy-summary", default=str(DEFAULT_GREEDY_SUMMARY))
+    parser.add_argument("--rho", type=float, default=0.0)
+    parser.add_argument("--contention-factor", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -440,6 +452,8 @@ def main() -> None:
         lognormal_params_path=args.lognormal_params,
         baseline_trace_path=args.baseline_trace,
         greedy_summary_path=args.greedy_summary,
+        rho=args.rho,
+        contention_factor=args.contention_factor,
     )
     print()
     print("brute_force_optimal:")

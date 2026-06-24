@@ -202,8 +202,14 @@ def scale_stage_for_memory_tier(
     base_params_cold: LogNormalParams | None = None,
     splines: dict[str, Any] | None = None,
     cold_overhead_table: dict[tuple[str, int], float] | None = None,
+    contention_factor: float = 1.0,
 ) -> LogNormalParams:
     """Produce a stage lognormal at ``target_memory_mb`` using D3 scaling.
+
+    ``contention_factor`` multiplies the spline-predicted warm mean to account
+    for concurrency contention (measured ~+10% on real Azure replay vs the
+    isolated sweep the spline is fit on). ``1.0`` keeps the isolated mean. It is
+    applied to the warm execution mean only; the cold overhead is unscaled.
 
     ``latency_class`` accepts ``warm``, ``cold``, or ``cold_like``.  The legacy
     Amdahl arguments are retained for callers that still pass the old R3 API;
@@ -219,8 +225,10 @@ def scale_stage_for_memory_tier(
     splines = splines or load_warm_splines()
     cold_overhead_table = cold_overhead_table or load_cleansed_cold_overhead()
 
+    if contention_factor <= 0.0 or not math.isfinite(contention_factor):
+        raise ValueError(f"contention_factor must be positive, got {contention_factor}")
     target_cpu = memory_to_cpu_cores(target_memory_mb)
-    target_warm_mean = spline_predict_warm_mean(stage_name, target_cpu, splines)
+    target_warm_mean = spline_predict_warm_mean(stage_name, target_cpu, splines) * contention_factor
 
     if class_key == "warm":
         params = _require_params(

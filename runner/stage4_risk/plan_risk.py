@@ -94,6 +94,7 @@ def _scaled_stage(
     stage_name: str,
     latency_class: str,
     base_memory_mb: int = BASE_MEMORY_MB,
+    contention_factor: float = 1.0,
 ) -> LogNormalParams:
     return scale_stage_for_memory_tier(
         stage_name=stage_name,
@@ -103,20 +104,33 @@ def _scaled_stage(
         base_params=_base_stage_params(plan, stage_name, latency_class),
         amdahl_params=plan.amdahl_params,
         cold_overhead_ms=plan.cold_overhead_per_stage.get(stage_name),
+        contention_factor=contention_factor,
     )
 
 
-def _scaled_scenario(plan: PlanInput, entry_cold: bool) -> dict[str, LogNormalParams]:
+def _scaled_scenario(
+    plan: PlanInput, entry_cold: bool, contention_factor: float = 1.0
+) -> dict[str, LogNormalParams]:
     stage_dists: dict[str, LogNormalParams] = {}
     for stage_name in STAGES:
         latency_class = "cold_like" if entry_cold and stage_name == ENTRY_STAGE else "warm"
-        stage_dists[stage_name] = _scaled_stage(plan, stage_name, latency_class)
+        stage_dists[stage_name] = _scaled_stage(
+            plan, stage_name, latency_class, contention_factor=contention_factor
+        )
     return stage_dists
 
 
-def compute_plan_risk(plan: PlanInput, slo_ms: float) -> PlanRiskResult:
+def compute_plan_risk(
+    plan: PlanInput, slo_ms: float, rho: float = 0.0, contention_factor: float = 1.0
+) -> PlanRiskResult:
     """
     Compute P(E2E > SLO) for a plan using a two-scenario warm/cold-entry mixture.
+
+    ``rho`` is the homogeneous inter-stage correlation passed to the
+    Fenton-Wilkinson aggregation; ``rho=0`` keeps the legacy independent-sum
+    behaviour. ``contention_factor`` inflates the per-stage warm mean to align
+    the isolated spline with realized concurrent execution (~1.10); ``1.0``
+    keeps the isolated baseline.
     """
     if slo_ms <= 0.0:
         raise ValueError(f"slo_ms must be positive, got {slo_ms}")
@@ -128,8 +142,12 @@ def compute_plan_risk(plan: PlanInput, slo_ms: float) -> PlanRiskResult:
         residual_floor=0.01,
     )
 
-    warm_params = aggregate_civic_alert(_scaled_scenario(plan, entry_cold=False))
-    cold_entry_params = aggregate_civic_alert(_scaled_scenario(plan, entry_cold=True))
+    warm_params = aggregate_civic_alert(
+        _scaled_scenario(plan, entry_cold=False, contention_factor=contention_factor), rho=rho
+    )
+    cold_entry_params = aggregate_civic_alert(
+        _scaled_scenario(plan, entry_cold=True, contention_factor=contention_factor), rho=rho
+    )
     p_warm = warm_params.survival(float(slo_ms))
     p_cold_entry = cold_entry_params.survival(float(slo_ms))
     p_total = (1.0 - p_entry_cold) * p_warm + p_entry_cold * p_cold_entry
