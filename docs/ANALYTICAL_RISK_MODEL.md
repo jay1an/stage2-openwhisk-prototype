@@ -490,3 +490,70 @@ would drastically underestimate variance (and thus risk).
 - Dynamic re-fitting of lognormal parameters online (use offline fit)
 - Multi-stage cold cascade modeling (not needed under JIT assumption)
 - Cold start tail modeling separately (treated uniformly via lognormal)
+
+## 11. Model alignment to realized concurrent execution (2026-06)
+
+Sections 2–4 fit per-stage lognormals from a *clean isolated* sweep and sum them
+assuming independence. Validation against the real concurrent replay
+(`stage3_latency_civic_alert_real_45min`, 1280MB, all-warm, N=3632) showed the
+predicted E2E tail was systematically too thin: model p95 18074 ms vs real 20017 ms
+(1943 ms underfit), even with transitions calibrated. Decomposed by incrementally
+applying each fix (`reports/warmtail_underfit_decomp`):
+
+| cause | p95 contribution | share |
+|---|---|---|
+| cross-stage correlation (the §10 "independence" deferral) | 1002 ms | 52% |
+| per-stage sigma too small (n=8 anchor fit) | 770 ms | 40% |
+| lognormal family tail-miss | 171 ms | 9% |
+
+### 11.1 sigma refit from a large sample
+The §2 fit used `latency_samples_for_lognormal_1280_anchor.csv` — only **8 warm
+samples per stage** — giving warm sigma ≈ 0.016 (CV 1.6%). On the full concurrent
+trace (~3900 warm/stage) the real warm CV is ~0.075–0.079, **~5× wider**; KS at n=8
+has no power and the anchor was an unrepresentatively clean subset. New params:
+`reports/lognormal_params_realsigma/per_stage_lognormal_params.csv` (warm sigma
+0.071–0.077). `DEFAULT_LOGNORMAL_PARAMS` repointed off the AMD-multinode (bimodal)
+file to this clean single-node fit. Consumption: `scale_lognormal_warm` takes **only
+sigma** from the params; the mean comes from the D3 spline (the file's mu is inert,
+so no double-count with 11.3).
+
+### 11.2 cross-stage correlation in Fenton-Wilkinson
+Stages of one workflow are positively correlated (a workflow that lands on a busy
+node is slow across all its stages). Measured mean pairwise rho = **0.67** (range
+0.60–0.73, 3632 paired workflows). FW extended with a homogeneous-rho covariance
+term:
+
+    Var(Σ) = Σ_i v_i + 2·rho·Σ_{i<j} sqrt(v_i·v_j)
+
+(`fenton_wilkinson_sum(..., rho)`, threaded through `compute_plan_risk(--rho)` and
+the brute-force planner; `rho=0` recovers the legacy independent sum). Resolves the
+§10 "path correlation assumed independent" deferral.
+
+### 11.3 contention mean factor
+The spline predicts the *isolated* warm mean; real concurrent execution is ~+10%
+slower (measured +6.7–12.4% across stages/tiers). Applied as a `contention_factor`
+(default 1.10, `--contention-factor`) multiplying the spline mean only.
+
+### 11.4 distribution shape (measured, not assumed)
+On ~3900 warm executions/stage the per-stage shape is strongly **right-skewed**
+(skew ≈ 2.1, excess kurtosis ≈ 8, max/median ≈ 1.7) and **unimodal** (single-node;
+the multinode bimodality is gone). Lognormal beats normal head-to-head (5/5 lower
+KS), but the real tail is heavier than a lognormal of the fitted sigma (skew 2.1 vs
+the lognormal's ~0.23), so p99 stays ~6–8% under after sigma+rho. That residual is
+left to a safety margin / future heavier-tail or adaptive model.
+
+### 11.5 contention is a function of concurrency (the drift gate)
+The +10% is not constant: measured slowdown correlates with instantaneous
+concurrency (corr 0.48). Concurrency ≤ 6 → +0.5%; 16–30 → +9% (pure-CPU portion
++8.8%; action_duration diluted by ~25% io_wait). This is the empirical basis for an
+optional online drift-adaptive layer (track the factor from observed load); the
+static +10% is its constant approximation (over-corrects at low load, under at high).
+
+### 11.6 validated outcome
+Re-planning with sigma+rho+contention chose a premium tier vector
+3072/2304/2304/2816/1792 @ 28.7 GB-s (predicted violation 4.68%); the realized
+two-arm run measured **premium 97.92%** (2.08% violation, inside the ≥95% SLO), the
+model now slightly conservative instead of over-optimistic. Caveats: single run
+(needs seed repeats); and the corrected plan's *necessity* over the old optimistic
+plan is shown cleanly only under contention (a high-concurrency arm where the old
+plan fails and the corrected one holds).

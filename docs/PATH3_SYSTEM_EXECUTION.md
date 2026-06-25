@@ -1132,8 +1132,61 @@ trace so cold start becomes a real cost and JIT/prewarm value shows.
 
 ---
 
+## 13. Reservation invoker + warm-pool closed loop + realized SLO (2026-06)
+
+### 13.1 Cross-workflow steal root cause + reservation invoker
+The realized SLO fat tail was traced (isolated-vs-concurrent A/B) to cross-workflow
+warm-pool **stealing**: a freshly warmed container can be grabbed by another workflow
+during the warmup→dispatch gap, sending the owner cold (isolated downstream cold 0%
+vs concurrent 6.25%). Fix: a custom-compiled invoker (`owlocal/invoker:res2`, from
+apache/openwhisk) whose ContainerPool reserves a freshly warmed container for its
+owning request, keyed on `__ow_reservation_key` read from message content
+(content-passthrough — no Controller/Message change); lease TTL via env
+`RESERVATION_TTL_MS` (default 5000). Result: **downstream cold 10.4% → 0%**.
+
+### 13.2 /poolState read interface
+The same invoker exposes `GET /poolState` (open route on the invoker HTTP server),
+returning per-action@tier `{free, busy, warming, oldestFreeIdleMs, memoryMB}`. This
+is the "eyes" for closed-loop pool control (query real state → top up the deficit)
+instead of firing warmup invocations blind.
+
+### 13.3 Critical-prefix warm pool — A/B/C verdict
+A demand-sized always-warm pool for the critical prefix (detect+estimate), three
+arms (OFF / blind-demand / closed-loop) over 120 workflows: blind demand already
+reaches premium 91.67%; the closed-loop did **not** beat it (also 91.67%, higher
+cost) because the blind-demand failure it was built to fix did not reproduce.
+Verdict: the **pool lever is maxed at ~91.67%**; the residual gap to 95% was a
+**model** (over-optimistic planner) problem, closed by Risk-Model §11
+(sigma+rho+contention → realized premium 97.92%). Closed-loop kept behind a flag,
+not default.
+
+### 13.4 Effective capacity is CPU-bound (~160 GB), not 200 GB
+Action containers are K8s pods (KubernetesContainerFactory). cpu-scaling sets pod
+CPU = 200m per 256MB = **800 millicpu/GB**; the node is 128 cores / 251 GB =
+**510 millicpu/GB**. Since 800 > 510, CPU saturates first: at 128 cores only ~160 GB
+of containers are placed, under the 200 GB userMemory limit (~90 GB RAM left idle).
+Transient "pending" pods at peak are `Insufficient cpu`, not memory. Implication:
+size pools/plans against ~160 GB effective; pending is a CPU-headroom signal.
+
+### 13.5 Next: online evaluation protocol (design locked, not built)
+Prediction handles only **entry arrivals** (feeds entry-prewarm timing + pool K_t);
+downstream JIT is plan/elapsed-driven, no forecast needed. Three layers
+**static / forecaster / oracle** (F−static = prediction value, oracle−F =
+imperfection cost); causal forecaster = CoV triage (forecast only regular functions,
+CoV ≤ 2) + seasonal + lag GBM quantile regression for K_t + histogram method for
+next-arrival. Trace: pick regular functions from the two-week Azure 2021 trace
+(aggregate is unpredictable, held-out R² negative). Cost unified in USD (AWS Lambda
+$1.6667e-5/GB-s + $2e-7/req). Three eval workloads (ML inference / video transcode /
+ETL) share one trace; each needs its own resource sweep first. Optional drift-
+adaptive layer per §11.5.
+
 ## Changelog
 
+- 2026-06-25: Model alignment to realized concurrency (sigma+rho+contention,
+  Risk-Model §11) closed the planner's over-optimism — corrected re-plan realized
+  premium 97.92% (≥95%). Plus reservation invoker (steal fix, downstream cold
+  10.4%→0%), `/poolState` closed-loop interface, prefix-pool A/B/C (pool lever maxed
+  ~91.67%), CPU-bound effective capacity ~160 GB. See Section 13.
 - 2026-06-09: T5.2b measurement investigation (Section 12). Warm-exec gap traced to
   (A) worker>cpu-limit CFS throttle and (B) shared-node all-core turbo suppression
   (co-tenant), NOT a planning flaw (tier sizing 4/5 sound). Re-alignment: workers=
