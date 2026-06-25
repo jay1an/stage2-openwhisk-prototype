@@ -7,12 +7,15 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import random
 import statistics
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import datetime
@@ -215,9 +218,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="update civic actions even when memory/timeout/kind already match",
     )
+    # USD pricing = AWS Lambda x86 (our cpu-scaling makes CPU memory-proportional,
+    # exactly like Lambda, so GB-s captures compute; vcpu kept 0 to avoid double-count).
     parser.add_argument("--price-per-vcpu-second", type=float, default=0.0)
-    parser.add_argument("--price-per-gb-second", type=float, default=0.0)
-    parser.add_argument("--price-per-request", type=float, default=0.0)
+    parser.add_argument("--price-per-gb-second", type=float, default=1.6667e-5)
+    parser.add_argument("--price-per-request", type=float, default=2e-7)
     parser.add_argument(
         "--out-dir",
         default="",
@@ -252,6 +257,66 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=2.5,
         help="oracle entry warmup lead time before each scheduled arrival",
+    )
+    parser.add_argument(
+        "--prewarm-pool-stages",
+        default="",
+        help=(
+            "comma-separated stage names to keep in a shared keyless warm pool; "
+            "empty disables the pool"
+        ),
+    )
+    parser.add_argument(
+        "--prewarm-pool-interval-sec",
+        type=float,
+        default=7.0,
+        help="seconds between keyless warmup refresh rounds for the prefix pool",
+    )
+    parser.add_argument(
+        "--prewarm-pool-mode",
+        choices=["static", "demand"],
+        default="static",
+        help="static keeps peak K alive throughout; demand sizes K from upcoming arrivals",
+    )
+    parser.add_argument(
+        "--prewarm-pool-lookahead-sec",
+        type=float,
+        default=6.0,
+        help="demand-mode lookahead window for predicted stage starts",
+    )
+    parser.add_argument(
+        "--prewarm-pool-size",
+        default="auto",
+        help=(
+            "pool size K per (stage,class), or 'auto' for peak simultaneous "
+            "stage demand plus 20%%"
+        ),
+    )
+    parser.add_argument(
+        "--prewarm-pool-max-size",
+        type=int,
+        default=16,
+        help="cap for auto pool size per (stage,class)",
+    )
+    parser.add_argument(
+        "--prewarm-pool-min-size",
+        type=int,
+        default=3,
+        help=(
+            "closed-loop demand-mode floor per (stage,class); ignored when "
+            "--prewarm-pool-closed-loop is off"
+        ),
+    )
+    parser.add_argument(
+        "--prewarm-pool-closed-loop",
+        action="store_true",
+        default=False,
+        help="size demand-mode pool by querying invoker /poolState before firing warmups",
+    )
+    parser.add_argument(
+        "--invoker-poolstate-url",
+        default="",
+        help="optional explicit invoker poolState URL; empty auto-discovers owdev-invoker-0",
     )
     parser.add_argument("--premium-ratio", type=float, default=0.5)
     parser.add_argument("--slo-class-seed", type=int, default=20260609)
@@ -372,6 +437,14 @@ def preassign_slo_classes(
         slo_class = assign_slo_class(rng, premium_ratio)
         row["slo_class"] = slo_class
         row["slo_ms"] = float(slo_ms_by_class[slo_class])
+
+
+def parse_stage_list(value: str) -> set[str]:
+    stages = {item.strip() for item in str(value or "").split(",") if item.strip()}
+    unknown = sorted(stages - set(STAGE_ORDER))
+    if unknown:
+        raise ValueError(f"unknown --prewarm-pool-stages values: {unknown}")
+    return stages
 
 
 def cpu_cores_for_memory(memory_mb: int) -> float:
@@ -693,6 +766,554 @@ class WarmupStatusTracker:
             event = status["event"]
         event.wait(timeout=max(0.0, timeout))
         return self.get_status(request_id, stage_name, tier)
+
+
+def load_clean_warm_means() -> dict[tuple[str, int], float]:
+    path = ROOT / "reports" / "sweep_14tier_clean" / "warm_stage_stats.csv"
+    if not path.exists():
+        return {}
+    means: dict[tuple[str, int], float] = {}
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        for row in csv.DictReader(handle):
+            try:
+                means[(str(row["stage_name"]), int(float(row["tier_mb"])))] = float(
+                    row["warm_mean_ms"]
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+    return means
+
+
+def topological_stage_names(workflow: WorkflowSpec) -> list[str]:
+    remaining = list(workflow.nodes)
+    seen = set()
+    ordered: list[str] = []
+    while remaining:
+        progressed = False
+        for stage_name in list(remaining):
+            if all(parent in seen for parent in workflow.nodes[stage_name].parents):
+                ordered.append(stage_name)
+                seen.add(stage_name)
+                remaining.remove(stage_name)
+                progressed = True
+        if not progressed:
+            raise RuntimeError(f"workflow has a cycle or missing parent: {remaining}")
+    return ordered
+
+
+def peak_overlap(intervals: list[tuple[float, float]]) -> int:
+    events: list[tuple[float, int]] = []
+    for start, end in intervals:
+        events.append((float(start), 1))
+        events.append((float(end), -1))
+    current = 0
+    peak = 0
+    for _, delta in sorted(events, key=lambda item: (item[0], item[1])):
+        current += delta
+        peak = max(peak, current)
+    return peak
+
+
+def parse_pool_size(value: str) -> int | None:
+    raw = str(value or "auto").strip().lower()
+    if raw == "auto":
+        return None
+    try:
+        parsed = int(raw)
+    except ValueError as exc:
+        raise ValueError("--prewarm-pool-size must be 'auto' or a positive integer") from exc
+    if parsed < 1:
+        raise ValueError("--prewarm-pool-size must be >= 1")
+    return parsed
+
+
+def discover_invoker_poolstate_url() -> str:
+    pod_ip = subprocess.check_output(
+        [
+            "kubectl",
+            "get",
+            "pod",
+            "owdev-invoker-0",
+            "-n",
+            "openwhisk",
+            "-o",
+            "jsonpath={.status.podIP}",
+        ],
+        text=True,
+    ).strip()
+    if not pod_ip:
+        raise RuntimeError("could not discover owdev-invoker-0 pod IP for /poolState")
+    return f"http://{pod_ip}:8080/poolState"
+
+
+def normalize_action_for_poolstate(action_name: object) -> str:
+    raw = str(action_name or "")
+    if "/" in raw:
+        return raw.rstrip("/").split("/")[-1]
+    return raw
+
+
+def estimate_stage_offsets_by_class(
+    *,
+    workflow: WorkflowSpec,
+    plan_by_class: dict[str, dict[str, int]],
+    warm_means: dict[tuple[str, int], float],
+) -> dict[str, dict[str, tuple[float, float]]]:
+    topo = topological_stage_names(workflow)
+    output: dict[str, dict[str, tuple[float, float]]] = {}
+    for slo_class, plan in plan_by_class.items():
+        starts: dict[str, float] = {}
+        finishes: dict[str, float] = {}
+        durations: dict[str, float] = {}
+        for stage_name in topo:
+            tier = int(plan[stage_name])
+            duration_ms = warm_means.get((stage_name, tier), 5000.0)
+            durations[stage_name] = max(0.001, duration_ms / 1000.0)
+            parents = workflow.nodes[stage_name].parents
+            starts[stage_name] = max((finishes[parent] for parent in parents), default=0.0)
+            finishes[stage_name] = starts[stage_name] + durations[stage_name]
+        output[slo_class] = {
+            stage_name: (starts[stage_name], durations[stage_name]) for stage_name in topo
+        }
+    return output
+
+
+def build_prewarm_pool_targets(
+    *,
+    workflow: WorkflowSpec,
+    schedule_rows: list[dict[str, Any]],
+    plan_by_class: dict[str, dict[str, int]],
+    pooled_stages: set[str],
+    pool_size_arg: str,
+    pool_max_size: int,
+) -> list[dict[str, Any]]:
+    if not pooled_stages:
+        return []
+    explicit_size = parse_pool_size(pool_size_arg)
+    warm_means = load_clean_warm_means()
+    offsets = estimate_stage_offsets_by_class(
+        workflow=workflow,
+        plan_by_class=plan_by_class,
+        warm_means=warm_means,
+    )
+    targets: list[dict[str, Any]] = []
+    for slo_class in ["premium", "free"]:
+        rows = [
+            row for row in schedule_rows if str(row.get("slo_class", "")).lower() == slo_class
+        ]
+        if not rows:
+            continue
+        for stage_name in STAGE_ORDER:
+            if stage_name not in pooled_stages:
+                continue
+            stage_offset, duration_s = offsets[slo_class][stage_name]
+            intervals = []
+            predicted_start_offsets_s = []
+            for row in rows:
+                arrival_s = int(float(row["target_offset_ms"])) / 1000.0
+                predicted_start_s = arrival_s + stage_offset
+                predicted_start_offsets_s.append(predicted_start_s)
+                intervals.append((predicted_start_s, predicted_start_s + duration_s))
+            peak = peak_overlap(intervals)
+            if explicit_size is None:
+                pool_size = max(1, math.ceil(float(peak) * 1.2))
+                if pool_max_size > 0:
+                    pool_size = min(pool_size, int(pool_max_size))
+            else:
+                pool_size = explicit_size
+            tier_mb = int(plan_by_class[slo_class][stage_name])
+            node = workflow.nodes[stage_name]
+            targets.append(
+                {
+                    "stage_name": stage_name,
+                    "slo_class": slo_class,
+                    "tier_mb": tier_mb,
+                    "cpu_cores": cpu_cores_for_memory(tier_mb),
+                    "action_name": suffix_action_name(node.action, f"_{tier_mb}"),
+                    "pool_size": pool_size,
+                    "pool_max_size": int(pool_max_size),
+                    "estimated_peak": peak,
+                    "estimated_stage_start_offset_s": stage_offset,
+                    "estimated_stage_duration_s": duration_s,
+                    "predicted_start_offsets_s": sorted(predicted_start_offsets_s),
+                }
+            )
+    return targets
+
+
+class PrefixPrewarmPool:
+    def __init__(
+        self,
+        *,
+        client: OpenWhiskClient,
+        workflow_name: str,
+        targets: list[dict[str, Any]],
+        interval_sec: float,
+        mode: str = "static",
+        lookahead_sec: float = 6.0,
+        idle_ttl_sec: float = 10.0,
+        min_size: int = 0,
+        closed_loop: bool = False,
+        poolstate_url: str = "",
+    ):
+        self.client = client
+        self.workflow_name = workflow_name
+        self.targets = list(targets)
+        self.interval_sec = float(interval_sec)
+        self.mode = str(mode)
+        self.lookahead_sec = float(lookahead_sec)
+        self.idle_ttl_sec = float(idle_ttl_sec)
+        self.min_size = max(0, int(min_size))
+        self.closed_loop = bool(closed_loop)
+        self.poolstate_url = str(poolstate_url or "")
+        self.stop_event = threading.Event()
+        self.lock = threading.Lock()
+        worker_sum = sum(
+            int(target.get("pool_max_size") if self.mode == "demand" else target["pool_size"])
+            for target in self.targets
+        )
+        self.executor = ThreadPoolExecutor(max_workers=max(1, worker_sum))
+        self.thread: threading.Thread | None = None
+        self.started_monotonic = 0.0
+        self.stopped_monotonic = 0.0
+        self.round_count = 0
+        self.warmup_count = 0
+        self.error_count = 0
+        self.last_account_monotonic = 0.0
+        self.current_sizes: dict[str, int] = {}
+        self.cohorts_by_key: dict[str, list[tuple[float, int]]] = defaultdict(list)
+        self.idle_gb_seconds_by_key: dict[str, float] = defaultdict(float)
+        self.k_history: list[dict[str, Any]] = []
+        self.poolstate_query_count = 0
+        self.poolstate_error_count = 0
+        self.poolstate_match_count = 0
+        self.poolstate_miss_count = 0
+        self.poolstate_last_error = ""
+
+    def start(self) -> None:
+        if not self.targets:
+            return
+        self.started_monotonic = time.monotonic()
+        self.last_account_monotonic = self.started_monotonic
+        self._fire_round(wait=True)
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        if not self.targets:
+            return
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=max(1.0, self.interval_sec + 1.0))
+        stop_time = time.monotonic()
+        with self.lock:
+            self._account_until_locked(stop_time)
+        self.stopped_monotonic = stop_time
+        self.executor.shutdown(wait=True)
+
+    def _run(self) -> None:
+        while not self.stop_event.wait(max(0.1, self.interval_sec)):
+            self._fire_round(wait=False)
+
+    def _invoke_one(self, target: dict[str, Any], slot: int) -> None:
+        params = {
+            "__warmup": True,
+            "workflow_name": self.workflow_name,
+            "stage_name": target["stage_name"],
+            "allocated_memory_mb": target["tier_mb"],
+            "allocated_cpu_cores": target["cpu_cores"],
+            "prewarm_pool": True,
+            "prewarm_pool_slo_class": target["slo_class"],
+            "prewarm_pool_slot": slot,
+        }
+        try:
+            activation = self.client.invoke_activation(target["action_name"], params)
+            response = activation.get("response", {})
+            if not response or response.get("status") not in ("", "success"):
+                with self.lock:
+                    self.error_count += 1
+        except Exception as exc:
+            with self.lock:
+                self.error_count += 1
+            print(
+                f"prefix pool warmup failed action={target['action_name']} "
+                f"stage={target['stage_name']} class={target['slo_class']}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def _target_key(self, target: dict[str, Any]) -> str:
+        return (
+            f"{target['slo_class']}:{target['stage_name']}:"
+            f"{int(target['tier_mb'])}"
+        )
+
+    def _desired_size(self, target: dict[str, Any], now: float) -> tuple[int, int]:
+        if self.mode == "static":
+            return int(target["pool_size"]), int(target.get("estimated_peak", 0))
+        elapsed = max(0.0, now - self.started_monotonic)
+        window_end = elapsed + max(0.0, self.lookahead_sec)
+        starts = target.get("predicted_start_offsets_s", [])
+        demand = sum(1 for value in starts if elapsed <= float(value) <= window_end)
+        if demand <= 0:
+            if self.closed_loop and self.min_size > 0:
+                max_size = int(target.get("pool_max_size") or target.get("pool_size") or self.min_size)
+                return min(max_size, self.min_size), 0
+            return 0, 0
+        desired = max(int(math.ceil(float(demand) * 1.3)), int(demand) + 2)
+        max_size = int(target.get("pool_max_size") or target.get("pool_size") or desired)
+        if self.closed_loop and self.min_size > 0:
+            desired = max(desired, self.min_size)
+        return min(max_size, desired), int(demand)
+
+    def _poolstate_lookup_keys(self, action_name: object, memory_mb: object) -> list[tuple[str, int]]:
+        memory = int(float(memory_mb))
+        action = str(action_name or "")
+        normalized = normalize_action_for_poolstate(action)
+        keys = [(action, memory)]
+        if normalized != action:
+            keys.append((normalized, memory))
+        return keys
+
+    def _query_pool_state(self) -> dict[tuple[str, int], dict[str, Any]] | None:
+        if not self.poolstate_url:
+            return None
+        try:
+            with urllib.request.urlopen(self.poolstate_url, timeout=2.0) as response:
+                payload = response.read().decode("utf-8")
+            rows = json.loads(payload)
+            if not isinstance(rows, list):
+                raise ValueError("/poolState response is not a JSON list")
+            state: dict[tuple[str, int], dict[str, Any]] = {}
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                action = str(row.get("action", ""))
+                try:
+                    memory = int(float(row.get("memoryMB")))
+                except (TypeError, ValueError):
+                    continue
+                normalized = normalize_action_for_poolstate(action)
+                parsed = {
+                    "action": action,
+                    "free": int(float(row.get("free", 0) or 0)),
+                    "busy": int(float(row.get("busy", 0) or 0)),
+                    "warming": int(float(row.get("warming", 0) or 0)),
+                    "memoryMB": memory,
+                    "oldestFreeIdleMs": float(row.get("oldestFreeIdleMs", 0) or 0.0),
+                }
+                state[(action, memory)] = parsed
+                state[(normalized, memory)] = parsed
+            with self.lock:
+                self.poolstate_query_count += 1
+                self.poolstate_last_error = ""
+            return state
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+            with self.lock:
+                self.poolstate_query_count += 1
+                self.poolstate_error_count += 1
+                self.poolstate_last_error = str(exc)
+            print(
+                f"prefix pool /poolState query failed url={self.poolstate_url}: {exc}; "
+                "falling back to blind warmup for this round",
+                file=sys.stderr,
+                flush=True,
+            )
+            return None
+
+    def _target_pool_state(
+        self,
+        pool_state: dict[tuple[str, int], dict[str, Any]] | None,
+        target: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if not pool_state:
+            return None
+        for key in self._poolstate_lookup_keys(target["action_name"], target["tier_mb"]):
+            row = pool_state.get(key)
+            if row is not None:
+                return row
+        return None
+
+    def _account_until_locked(self, now: float) -> None:
+        if self.mode != "demand":
+            self.last_account_monotonic = now
+            return
+        if self.last_account_monotonic <= 0.0:
+            self.last_account_monotonic = now
+            return
+        delta_s = max(0.0, now - self.last_account_monotonic)
+        if delta_s <= 0.0:
+            return
+        target_by_key = {self._target_key(target): target for target in self.targets}
+        for key, size in self.current_sizes.items():
+            target = target_by_key.get(key)
+            if target is None:
+                continue
+            self.idle_gb_seconds_by_key[key] += (
+                int(size) * (int(target["tier_mb"]) / 1024.0) * delta_s
+            )
+        self.last_account_monotonic = now
+
+    def _live_size_locked(self, key: str, now: float) -> int:
+        live = [
+            (expire_at, size)
+            for expire_at, size in self.cohorts_by_key.get(key, [])
+            if float(expire_at) > now
+        ]
+        self.cohorts_by_key[key] = live
+        return max((int(size) for _, size in live), default=0)
+
+    def _fire_round(self, *, wait: bool) -> None:
+        now = time.monotonic()
+        pool_state = self._query_pool_state() if self.closed_loop else None
+        futures = []
+        desired_by_key: dict[str, int] = {}
+        observed_by_key: dict[str, int] = {}
+        history_rows = []
+        matched = 0
+        missed = 0
+        for target in self.targets:
+            desired_size, demand = self._desired_size(target, now)
+            key = self._target_key(target)
+            desired_by_key[key] = desired_size
+            state = self._target_pool_state(pool_state, target)
+            state_free = int(state.get("free", 0)) if state is not None else 0
+            state_busy = int(state.get("busy", 0)) if state is not None else 0
+            state_warming = int(state.get("warming", 0)) if state is not None else 0
+            state_oldest_free_idle_ms = (
+                float(state.get("oldestFreeIdleMs", 0.0)) if state is not None else 0.0
+            )
+            state_total = state_free + state_busy + state_warming
+            observed_by_key[key] = state_total
+            if self.closed_loop and pool_state is not None:
+                if state is None:
+                    missed += 1
+                else:
+                    matched += 1
+            if self.closed_loop and state is not None:
+                available = state_free + state_warming
+                fire_count = max(0, desired_size - available)
+                refresh_threshold_ms = max(
+                    0.0,
+                    (self.idle_ttl_sec - 2.0 * self.interval_sec) * 1000.0,
+                )
+                if state_free > 0 and state_oldest_free_idle_ms > refresh_threshold_ms:
+                    fire_count = max(fire_count, min(desired_size, state_free))
+                fire_count = min(
+                    fire_count,
+                    int(target.get("pool_max_size") or target.get("pool_size") or fire_count),
+                )
+            else:
+                available = 0
+                fire_count = desired_size
+            history_rows.append(
+                {
+                    "elapsed_s": now - self.started_monotonic,
+                    "stage_name": target["stage_name"],
+                    "slo_class": target["slo_class"],
+                    "tier_mb": int(target["tier_mb"]),
+                    "action_name": target["action_name"],
+                    "pool_closed_loop": self.closed_loop,
+                    "predicted_demand": demand,
+                    "pool_size": desired_size,
+                    "poolstate_matched": bool(state is not None),
+                    "poolstate_free": state_free,
+                    "poolstate_busy": state_busy,
+                    "poolstate_warming": state_warming,
+                    "poolstate_total": state_total,
+                    "poolstate_oldest_free_idle_ms": state_oldest_free_idle_ms,
+                    "pool_available_free_plus_warming": available,
+                    "pool_fire_count": fire_count,
+                }
+            )
+            for slot in range(fire_count):
+                futures.append(self.executor.submit(self._invoke_one, target, slot))
+        with self.lock:
+            self._account_until_locked(now)
+            if self.closed_loop and pool_state is not None:
+                self.current_sizes = dict(observed_by_key)
+            elif self.mode == "demand":
+                for key, desired_size in desired_by_key.items():
+                    if desired_size > 0:
+                        self.cohorts_by_key[key].append(
+                            (now + max(0.0, self.idle_ttl_sec), int(desired_size))
+                        )
+                self.current_sizes = {
+                    key: self._live_size_locked(key, now) for key in desired_by_key
+                }
+            else:
+                self.current_sizes = {
+                    self._target_key(target): int(target["pool_size"])
+                    for target in self.targets
+                }
+            self.k_history.extend(history_rows)
+            self.round_count += 1
+            self.warmup_count += len(futures)
+            self.poolstate_match_count += matched
+            self.poolstate_miss_count += missed
+        if wait and futures:
+            wait_futures, _ = wait_for_futures(futures)
+            del wait_futures
+
+    def active_seconds(self) -> float:
+        end = self.stopped_monotonic or time.monotonic()
+        if self.started_monotonic <= 0.0:
+            return 0.0
+        return max(0.0, end - self.started_monotonic)
+
+    def summary_rows(self) -> list[dict[str, Any]]:
+        active_s = self.active_seconds()
+        rows = []
+        for target in self.targets:
+            pool_size = int(target["pool_size"])
+            memory_gb = int(target["tier_mb"]) / 1024.0
+            key = self._target_key(target)
+            history_sizes = [
+                int(row["pool_size"])
+                for row in self.k_history
+                if row["stage_name"] == target["stage_name"]
+                and row["slo_class"] == target["slo_class"]
+                and int(row["tier_mb"]) == int(target["tier_mb"])
+            ]
+            if self.mode == "demand":
+                idle_gb_seconds = float(self.idle_gb_seconds_by_key.get(key, 0.0))
+            else:
+                idle_gb_seconds = pool_size * memory_gb * active_s
+            rows.append(
+                {
+                    **{key: value for key, value in target.items() if key != "predicted_start_offsets_s"},
+                    "pool_mode": self.mode,
+                    "pool_closed_loop": self.closed_loop,
+                    "pool_min_size": self.min_size,
+                    "poolstate_url": self.poolstate_url,
+                    "active_seconds": active_s,
+                    "pool_idle_gb_seconds": idle_gb_seconds,
+                    "pool_k_min": min(history_sizes) if history_sizes else pool_size,
+                    "pool_k_median": statistics.median(history_sizes) if history_sizes else pool_size,
+                    "pool_k_max": max(history_sizes) if history_sizes else pool_size,
+                    "pool_round_count": self.round_count,
+                    "pool_warmup_count_total": self.warmup_count,
+                    "pool_error_count_total": self.error_count,
+                    "poolstate_query_count_total": self.poolstate_query_count,
+                    "poolstate_error_count_total": self.poolstate_error_count,
+                    "poolstate_match_count_total": self.poolstate_match_count,
+                    "poolstate_miss_count_total": self.poolstate_miss_count,
+                    "poolstate_last_error": self.poolstate_last_error,
+                }
+            )
+        return rows
+
+    def total_idle_gb_seconds(self) -> float:
+        return sum(as_float(row.get("pool_idle_gb_seconds")) for row in self.summary_rows())
+
+    def kt_rows(self) -> list[dict[str, Any]]:
+        return list(self.k_history)
+
+
+def wait_for_futures(futures: list[Future]) -> tuple[set[Future], set[Future]]:
+    if not futures:
+        return set(), set()
+    return wait(set(futures))
 
 
 def build_detail_records(
@@ -1236,6 +1857,7 @@ def summarize_cost(
     price_per_gb_second: float,
     price_per_vcpu_second: float,
     price_per_request: float,
+    pool_idle_gb_seconds: float = 0.0,
 ) -> list[dict[str, Any]]:
     execution_gb_seconds = sum(
         as_float(row.get("execution_gb_seconds")) for row in workflows
@@ -1253,66 +1875,74 @@ def summarize_cost(
     execution_cpu_cost = execution_vcpu_seconds * float(price_per_vcpu_second)
     idle_memory_cost = idle_gb_seconds * float(price_per_gb_second)
     idle_cpu_cost = idle_vcpu_seconds * float(price_per_vcpu_second)
+    pool_idle_gb_seconds = float(pool_idle_gb_seconds)
+    pool_memory_cost = pool_idle_gb_seconds * float(price_per_gb_second)
     request_cost = sum(as_float(row.get("request_count")) for row in workflows) * float(
         price_per_request
     )
     lambda_style_cost = execution_gb_seconds * float(price_per_gb_second) + request_cost
     provider_style_total_cost = (
-        (execution_gb_seconds + idle_gb_seconds) * float(price_per_gb_second)
+        (execution_gb_seconds + idle_gb_seconds + pool_idle_gb_seconds)
+        * float(price_per_gb_second)
         + execution_vcpu_seconds * float(price_per_vcpu_second)
         + request_cost
     )
-    return [
-        {
-            "memory_mb": memory_mb,
-            "memory_gb": memory_mb / 1024.0,
-            "cpu_cores": cpu_cores,
-            "keepalive_sec": keepalive_sec,
-            "workflow_count": len(workflows),
-            "request_count": sum(as_float(row.get("request_count")) for row in workflows),
-            "container_count": len(container_idle_records),
-            "execution_gb_seconds_total": execution_gb_seconds,
-            "execution_vcpu_seconds_total": execution_vcpu_seconds,
-            "idle_gb_seconds_total": idle_gb_seconds,
-            "idle_vcpu_seconds_total": idle_vcpu_seconds,
-            "total_gb_seconds_including_idle": execution_gb_seconds + idle_gb_seconds,
-            "total_vcpu_seconds_including_idle": execution_vcpu_seconds + idle_vcpu_seconds,
-            "reported_between_idle_ms_total": sum(
-                as_float(row.get("reported_between_idle_ms")) for row in container_idle_records
-            ),
-            "computed_between_idle_ms_total": sum(
-                as_float(row.get("computed_between_idle_ms")) for row in container_idle_records
-            ),
-            "assumed_tail_idle_ms_total": sum(
-                as_float(row.get("assumed_tail_idle_ms")) for row in container_idle_records
-            ),
-            "total_idle_ms": sum(
-                as_float(row.get("total_idle_ms")) for row in container_idle_records
-            ),
-            "price_per_gb_second": price_per_gb_second,
-            "price_per_vcpu_second": price_per_vcpu_second,
-            "price_per_request": price_per_request,
-            "lambda_style_gb_seconds": execution_gb_seconds,
-            "lambda_style_cost": lambda_style_cost,
-            "provider_style_total_cost": provider_style_total_cost,
-            "execution_memory_cost_total": execution_memory_cost,
-            "execution_cpu_cost_total": execution_cpu_cost,
-            "idle_memory_cost_total": idle_memory_cost,
-            "idle_cpu_cost_total": idle_cpu_cost,
-            "memory_cost_total": execution_memory_cost + idle_memory_cost,
-            "cpu_cost_total": execution_cpu_cost + idle_cpu_cost,
-            "request_cost_total": request_cost,
-            "execution_total_cost": execution_memory_cost + execution_cpu_cost + request_cost,
-            "idle_total_cost": idle_memory_cost + idle_cpu_cost,
-            "total_cost": (
-                execution_memory_cost
-                + execution_cpu_cost
-                + idle_memory_cost
-                + idle_cpu_cost
-                + request_cost
-            ),
-        }
-    ]
+    row = {
+        "memory_mb": memory_mb,
+        "memory_gb": memory_mb / 1024.0,
+        "cpu_cores": cpu_cores,
+        "keepalive_sec": keepalive_sec,
+        "workflow_count": len(workflows),
+        "request_count": sum(as_float(row.get("request_count")) for row in workflows),
+        "container_count": len(container_idle_records),
+        "execution_gb_seconds_total": execution_gb_seconds,
+        "execution_vcpu_seconds_total": execution_vcpu_seconds,
+        "idle_gb_seconds_total": idle_gb_seconds,
+        "idle_vcpu_seconds_total": idle_vcpu_seconds,
+        "total_gb_seconds_including_idle": (
+            execution_gb_seconds + idle_gb_seconds + pool_idle_gb_seconds
+        ),
+        "total_vcpu_seconds_including_idle": execution_vcpu_seconds + idle_vcpu_seconds,
+        "reported_between_idle_ms_total": sum(
+            as_float(row.get("reported_between_idle_ms")) for row in container_idle_records
+        ),
+        "computed_between_idle_ms_total": sum(
+            as_float(row.get("computed_between_idle_ms")) for row in container_idle_records
+        ),
+        "assumed_tail_idle_ms_total": sum(
+            as_float(row.get("assumed_tail_idle_ms")) for row in container_idle_records
+        ),
+        "total_idle_ms": sum(
+            as_float(row.get("total_idle_ms")) for row in container_idle_records
+        ),
+        "price_per_gb_second": price_per_gb_second,
+        "price_per_vcpu_second": price_per_vcpu_second,
+        "price_per_request": price_per_request,
+        "lambda_style_gb_seconds": execution_gb_seconds,
+        "lambda_style_cost": lambda_style_cost,
+        "provider_style_total_cost": provider_style_total_cost,
+        "execution_memory_cost_total": execution_memory_cost,
+        "execution_cpu_cost_total": execution_cpu_cost,
+        "idle_memory_cost_total": idle_memory_cost,
+        "idle_cpu_cost_total": idle_cpu_cost,
+        "memory_cost_total": execution_memory_cost + idle_memory_cost + pool_memory_cost,
+        "cpu_cost_total": execution_cpu_cost + idle_cpu_cost,
+        "request_cost_total": request_cost,
+        "execution_total_cost": execution_memory_cost + execution_cpu_cost + request_cost,
+        "idle_total_cost": idle_memory_cost + idle_cpu_cost + pool_memory_cost,
+        "total_cost": (
+            execution_memory_cost
+            + execution_cpu_cost
+            + idle_memory_cost
+            + pool_memory_cost
+            + idle_cpu_cost
+            + request_cost
+        ),
+    }
+    if pool_idle_gb_seconds > 0.0:
+        row["prewarm_pool_idle_gb_seconds_total"] = pool_idle_gb_seconds
+        row["prewarm_pool_memory_cost_total"] = pool_memory_cost
+    return [row]
 
 
 def run_scheduled_workflow(
@@ -1439,7 +2069,30 @@ def invoke_replay_warmup(
     tracker: WarmupStatusTracker | None = None,
     warmup_records: dict[int, dict[str, Any]] | None = None,
     warmup_records_lock: threading.Lock | None = None,
+    pooled_jit_stages: set[str] | None = None,
 ) -> None:
+    request_id = str(task.metadata.get("request_id", ""))
+    stage_name = str(task.metadata.get("stage_name", ""))
+    warmup_tier = str(task.metadata.get("tier_mb", ""))
+    if (
+        pooled_jit_stages
+        and stage_name in pooled_jit_stages
+        and task.metadata.get("prewarm_kind") != "entry_oracle"
+    ):
+        issued = time.monotonic()
+        if tracker is not None and request_id and stage_name:
+            tracker.mark_issued(request_id, stage_name, warmup_tier, issued)
+            tracker.mark_completed(
+                request_id,
+                stage_name,
+                warmup_tier,
+                time.monotonic(),
+                activation_id="",
+                container_id="",
+                error="pooled_stage_jit_suppressed",
+            )
+        return
+
     params = {
         "__warmup": True,
         "request_id": task.metadata.get("request_id", ""),
@@ -1464,9 +2117,6 @@ def invoke_replay_warmup(
     error = ""
     sent_ms = now_ms()
     warmup_sent_monotonic = time.monotonic()
-    request_id = str(task.metadata.get("request_id", ""))
-    stage_name = str(task.metadata.get("stage_name", ""))
-    warmup_tier = str(task.metadata.get("tier_mb", ""))
     if tracker is not None and request_id and stage_name:
         tracker.mark_issued(request_id, stage_name, warmup_tier, warmup_sent_monotonic)
     try:
@@ -1542,11 +2192,19 @@ def make_replay_warmup_callback(
     tracker: WarmupStatusTracker | None = None,
     warmup_records: dict[int, dict[str, Any]] | None = None,
     warmup_records_lock: threading.Lock | None = None,
+    pooled_jit_stages: set[str] | None = None,
 ):
     def callback(task: Any) -> None:
         worker = threading.Thread(
             target=invoke_replay_warmup,
-            args=(client, task, tracker, warmup_records, warmup_records_lock),
+            args=(
+                client,
+                task,
+                tracker,
+                warmup_records,
+                warmup_records_lock,
+                pooled_jit_stages,
+            ),
             daemon=True,
         )
         worker.start()
@@ -1606,6 +2264,7 @@ def prepare_outputs(
     out_dir: Path,
     overwrite: bool,
     include_per_class: bool = False,
+    include_prewarm_pool: bool = False,
 ) -> dict[str, Path]:
     paths = {
         "trace": out_dir / "raw_trace.csv",
@@ -1619,6 +2278,9 @@ def prepare_outputs(
     }
     if include_per_class:
         paths["per_class_summary"] = out_dir / "per_class_summary.csv"
+    if include_prewarm_pool:
+        paths["prewarm_pool_summary"] = out_dir / "prewarm_pool_summary.csv"
+        paths["prewarm_pool_kt"] = out_dir / "prewarm_pool_kt.csv"
     out_dir.mkdir(parents=True, exist_ok=True)
     existing = [path for path in paths.values() if path.exists()]
     if existing and not overwrite:
@@ -1741,11 +2403,32 @@ def main() -> None:
         raise ValueError("--jit-sync-inflight-max-ms must be >= 0")
     if args.entry_prewarm_lead_sec < 0.0:
         raise ValueError("--entry-prewarm-lead-sec must be >= 0")
+    if args.prewarm_pool_interval_sec <= 0.0:
+        raise ValueError("--prewarm-pool-interval-sec must be > 0")
+    if args.prewarm_pool_lookahead_sec < 0.0:
+        raise ValueError("--prewarm-pool-lookahead-sec must be >= 0")
+    if args.prewarm_pool_max_size < 1:
+        raise ValueError("--prewarm-pool-max-size must be >= 1")
+    if args.prewarm_pool_min_size < 0:
+        raise ValueError("--prewarm-pool-min-size must be >= 0")
+    if args.prewarm_pool_closed_loop and args.prewarm_pool_mode != "demand":
+        raise ValueError("--prewarm-pool-closed-loop currently requires --prewarm-pool-mode demand")
+    prewarm_pool_stages = parse_stage_list(args.prewarm_pool_stages)
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(args.out_dir) if args.out_dir else ROOT / "reports" / f"civic_azure_replay_{run_id}"
-    multi_slo_active = bool(args.enable_jit or args.enable_dynamic or args.enable_entry_prewarm)
-    paths = prepare_outputs(out_dir, args.overwrite, include_per_class=multi_slo_active)
+    multi_slo_active = bool(
+        args.enable_jit
+        or args.enable_dynamic
+        or args.enable_entry_prewarm
+        or prewarm_pool_stages
+    )
+    paths = prepare_outputs(
+        out_dir,
+        args.overwrite,
+        include_per_class=multi_slo_active,
+        include_prewarm_pool=bool(prewarm_pool_stages),
+    )
     auth = auth_from_args(args.auth)
     base_workflow = load_workflow(args.workflow)
     action_suffix = "" if multi_slo_active else resolve_action_suffix(args)
@@ -1767,6 +2450,8 @@ def main() -> None:
     entry_prewarm_records: dict[int, dict[str, Any]] = {}
     entry_prewarm_records_lock = threading.Lock()
     entry_prewarm_scheduled = 0
+    prewarm_pool: PrefixPrewarmPool | None = None
+    prewarm_pool_targets: list[dict[str, Any]] = []
 
     if multi_slo_active:
         plan_by_class = load_plan_by_class(args.plan_csv)
@@ -1809,6 +2494,7 @@ def main() -> None:
                 jit_warmup_tracker,
                 entry_prewarm_records,
                 entry_prewarm_records_lock,
+                prewarm_pool_stages,
             )
         )
         jit_scheduler.start()
@@ -1846,6 +2532,15 @@ def main() -> None:
         "enable_dynamic": args.enable_dynamic,
         "enable_entry_prewarm": args.enable_entry_prewarm,
         "entry_prewarm_lead_sec": args.entry_prewarm_lead_sec,
+        "prewarm_pool_stages": sorted(prewarm_pool_stages),
+        "prewarm_pool_mode": args.prewarm_pool_mode,
+        "prewarm_pool_interval_sec": args.prewarm_pool_interval_sec,
+        "prewarm_pool_lookahead_sec": args.prewarm_pool_lookahead_sec,
+        "prewarm_pool_size": args.prewarm_pool_size,
+        "prewarm_pool_max_size": args.prewarm_pool_max_size,
+        "prewarm_pool_min_size": args.prewarm_pool_min_size,
+        "prewarm_pool_closed_loop": args.prewarm_pool_closed_loop,
+        "invoker_poolstate_url": args.invoker_poolstate_url,
         "plan_csv": str(args.plan_csv),
         "premium_ratio": args.premium_ratio,
         "slo_class_seed": args.slo_class_seed,
@@ -1874,9 +2569,62 @@ def main() -> None:
             f"multi_slo=on enable_jit={args.enable_jit} enable_dynamic={args.enable_dynamic} "
             f"enable_jit_sync={args.enable_jit_sync} "
             f"enable_entry_prewarm={args.enable_entry_prewarm} "
+            f"prewarm_pool_stages={sorted(prewarm_pool_stages) or '<none>'} "
+            f"prewarm_pool_mode={args.prewarm_pool_mode} "
+            f"prewarm_pool_closed_loop={args.prewarm_pool_closed_loop} "
             f"premium_ratio={args.premium_ratio} seed={args.slo_class_seed}"
         )
     print("No additional schedule compression will be applied.")
+
+    if prewarm_pool_stages:
+        pool_client = OpenWhiskClient(
+            apihost=args.apihost,
+            auth=auth,
+            namespace=workflow.namespace,
+            timeout_sec=args.invoke_timeout_sec,
+        )
+        prewarm_pool_targets = build_prewarm_pool_targets(
+            workflow=base_workflow,
+            schedule_rows=schedule_rows,
+            plan_by_class=plan_by_class,
+            pooled_stages=prewarm_pool_stages,
+            pool_size_arg=args.prewarm_pool_size,
+            pool_max_size=args.prewarm_pool_max_size,
+        )
+        if not prewarm_pool_targets:
+            raise RuntimeError("--prewarm-pool-stages produced no pool targets")
+        poolstate_url = ""
+        if args.prewarm_pool_closed_loop:
+            poolstate_url = args.invoker_poolstate_url.strip() or discover_invoker_poolstate_url()
+            metadata["invoker_poolstate_url"] = poolstate_url
+            paths["metadata"].write_text(
+                json.dumps(metadata, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            print(f"prewarm_pool_closed_loop=on poolstate_url={poolstate_url}", flush=True)
+        prewarm_pool = PrefixPrewarmPool(
+            client=pool_client,
+            workflow_name=base_workflow.workflow_name,
+            targets=prewarm_pool_targets,
+            interval_sec=args.prewarm_pool_interval_sec,
+            mode=args.prewarm_pool_mode,
+            lookahead_sec=args.prewarm_pool_lookahead_sec,
+            idle_ttl_sec=args.keepalive_sec,
+            min_size=args.prewarm_pool_min_size,
+            closed_loop=args.prewarm_pool_closed_loop,
+            poolstate_url=poolstate_url,
+        )
+        metadata["prewarm_pool_targets"] = prewarm_pool_targets
+        paths["metadata"].write_text(
+            json.dumps(metadata, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        print(
+            "prewarm_pool=on targets="
+            + json.dumps(prewarm_pool_targets, sort_keys=True),
+            flush=True,
+        )
+        prewarm_pool.start()
 
     store = CsvTraceStore(str(paths["trace"]))
     workflow_records: list[dict[str, Any]] = []
@@ -1886,7 +2634,8 @@ def main() -> None:
     completed = 0
     base_ms = now_ms()
     base_monotonic = time.monotonic()
-    if args.enable_entry_prewarm:
+    entry_prewarm_suppressed = bool(args.enable_entry_prewarm and workflow.entry in prewarm_pool_stages)
+    if args.enable_entry_prewarm and not entry_prewarm_suppressed:
         if jit_scheduler is None:
             raise RuntimeError("entry prewarm requires an active JIT scheduler")
         entry_prewarm_scheduled = schedule_entry_prewarm_tasks(
@@ -1905,6 +2654,17 @@ def main() -> None:
         print(
             f"entry_prewarm=on scheduled={entry_prewarm_scheduled} "
             f"lead_sec={args.entry_prewarm_lead_sec}",
+            flush=True,
+        )
+    elif entry_prewarm_suppressed:
+        metadata["entry_prewarm_scheduled"] = 0
+        metadata["entry_prewarm_suppressed_by_pool"] = True
+        paths["metadata"].write_text(
+            json.dumps(metadata, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        print(
+            f"entry_prewarm=suppressed_by_pool stage={workflow.entry}",
             flush=True,
         )
 
@@ -2016,6 +2776,8 @@ def main() -> None:
                     entry_prewarm_records_lock=entry_prewarm_records_lock,
                 )
     finally:
+        if prewarm_pool is not None:
+            prewarm_pool.stop()
         if jit_scheduler is not None:
             jit_scheduler.stop()
 
@@ -2036,11 +2798,20 @@ def main() -> None:
         price_per_gb_second=args.price_per_gb_second,
         price_per_vcpu_second=args.price_per_vcpu_second,
         price_per_request=args.price_per_request,
+        pool_idle_gb_seconds=(
+            prewarm_pool.total_idle_gb_seconds() if prewarm_pool is not None else 0.0
+        ),
     )
     write_csv(paths["workflow_summary"], list(workflow_summary[0]), workflow_summary)
     write_csv(paths["stage_summary"], list(stage_summary[0]), stage_summary)
     write_csv(paths["container_idle_detail"], CONTAINER_IDLE_COLUMNS, container_idle_records)
     write_csv(paths["cost_summary"], list(cost_summary[0]), cost_summary)
+    if prewarm_pool is not None:
+        pool_rows = prewarm_pool.summary_rows()
+        write_csv(paths["prewarm_pool_summary"], list(pool_rows[0]), pool_rows)
+        kt_rows = prewarm_pool.kt_rows()
+        if kt_rows:
+            write_csv(paths["prewarm_pool_kt"], list(kt_rows[0]), kt_rows)
     if multi_slo_active:
         per_class_summary = summarize_per_class(
             workflow_records,
