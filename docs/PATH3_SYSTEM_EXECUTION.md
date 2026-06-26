@@ -1172,16 +1172,37 @@ size pools/plans against ~160 GB effective; pending is a CPU-headroom signal.
 Prediction handles only **entry arrivals** (feeds entry-prewarm timing + pool K_t);
 downstream JIT is plan/elapsed-driven, no forecast needed. Three layers
 **static / forecaster / oracle** (F−static = prediction value, oracle−F =
-imperfection cost); causal forecaster = CoV triage (forecast only regular functions,
-CoV ≤ 2) + seasonal + lag GBM quantile regression for K_t + histogram method for
-next-arrival. Trace: pick regular functions from the two-week Azure 2021 trace
-(aggregate is unpredictable, held-out R² negative). Cost unified in USD (AWS Lambda
+imperfection cost); causal forecaster = seasonal + lag GBM quantile regression for
+K_t + histogram method for next-arrival, applied to the diurnal **aggregate** signal
+(see §13.6 — single-function CoV triage was dropped: the trace's predictable single
+functions are flat clockwork, and the aggregate is the varying-and-predictable signal,
+HGBR-predictable). Cost unified in USD (AWS Lambda
 $1.6667e-5/GB-s + $2e-7/req). Three eval workloads (ML inference / video transcode /
 ETL) share one trace; each needs its own resource sweep first. Optional drift-
 adaptive layer per §11.5.
 
+### 13.6 Evaluation trace selected (2026-06-25)
+The eval trace drives workflow **entry arrivals** only (downstream stages are
+plan/JIT-driven, no forecast). Source: the two-week Azure 2021 invocation trace.
+Finding (after two failed single-function attempts): this trace's individual
+*predictable* functions are all 24/7 **flat clockwork** (hour-of-day rate CoV ≈ 0.002)
+— useless for the eval, because a flat load is trivially matched by static keepalive
+(forecaster gains nothing). The robust discriminator is the **hour-of-day rate
+profile**, NOT count_cov (which low-rate sparsity inflates). The **aggregate**, by
+contrast, is both varying and predictable, so the eval trace =
+**aggregate Bernoulli-downsampled to peak concurrency ~12** (sliding W=18s):
+preserves a real diurnal cycle (hour-CoV 0.389, peak/trough 3.34x), stays predictable
+(HGBR causal held-out R² 0.33 @60s / 0.42 @900s), zero timestamp stacking. Arrival =
+`end_timestamp − duration`; 14 days split train(12)/held-out(2); one trace reused
+across all 3 eval workloads. Files: `reports/trace_selection_v3/regular_aggregate_FINAL_*`
+(+ an irregular high-burst contrast). Forecaster is evaluated separately later; the
+near-term runs use the omniscient oracle.
+
 ## Changelog
 
+- 2026-06-25: Eval trace selected — aggregate Bernoulli-downsampled to peak concurrency
+  ~12 (diurnal + predictable, R² 0.33–0.42); the trace's per-function predictables were
+  all flat clockwork (see 13.6).
 - 2026-06-25: Model alignment to realized concurrency (sigma+rho+contention,
   Risk-Model §11) closed the planner's over-optimism — corrected re-plan realized
   premium 97.92% (≥95%). Plus reservation invoker (steal fix, downstream cold
