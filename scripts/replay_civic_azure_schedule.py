@@ -320,8 +320,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--premium-ratio", type=float, default=0.5)
     parser.add_argument("--slo-class-seed", type=int, default=20260609)
-    parser.add_argument("--slo-premium-ms", type=float, default=15000.0)
-    parser.add_argument("--slo-free-ms", type=float, default=20000.0)
+    parser.add_argument("--slo-premium-ms", type=float, default=18000.0)
+    parser.add_argument("--slo-free-ms", type=float, default=24000.0)
     return parser.parse_args()
 
 
