@@ -3,7 +3,7 @@ import json
 import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from typing import TYPE_CHECKING, Dict, Iterable, List
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List
 
 from .openwhisk_client import OpenWhiskClient
 from .resource_profiles import memory_to_cpu_cores as profile_memory_to_cpu_cores
@@ -161,6 +161,11 @@ def _runtime_upgrade_decision(
     dynamic_config: "PlannerConfig | None",
     dynamic_ref_data: "ReferenceData | None",
     eligible_stage_names: Iterable[str] | None = None,
+    jit_lead_ms_by_stage: dict[str, float] | None = None,
+    jit_margin_ms: float = 0.0,
+    now_ms_since_workflow_start: float | None = None,
+    predicted_start_ms_by_stage: dict[str, float] | None = None,
+    predicted_completion_ms_by_stage: dict[str, float] | None = None,
 ) -> dict[str, int] | None:
     if normalized_plan is None or dynamic_config is None or dynamic_ref_data is None:
         return None
@@ -196,6 +201,11 @@ def _runtime_upgrade_decision(
         current_tiers=dict(normalized_plan),
         completed_finish_ms=completed_finish_ms,
         pending_stages=pending_stages,
+        jit_lead_ms_by_stage=jit_lead_ms_by_stage,
+        jit_margin_ms=jit_margin_ms,
+        now_ms_since_workflow_start=now_ms_since_workflow_start,
+        predicted_start_ms_by_stage=predicted_start_ms_by_stage,
+        predicted_completion_ms_by_stage=predicted_completion_ms_by_stage,
     )
 
 
@@ -651,6 +661,45 @@ def run_one_workflow(
                 eligible.add(stage_name)
         return eligible
 
+    def dynamic_candidate_stage_names() -> set[str]:
+        if not jit_active:
+            return set()
+        return {stage_name for stage_name in topo_order if stage_name != workflow.entry}
+
+    def jit_timing_snapshot() -> dict[str, Any]:
+        if not jit_active:
+            return {
+                "lead_ms_by_stage": {},
+                "start_ms_by_stage": {},
+                "completion_ms_by_stage": {},
+                "now_ms_since_workflow_start": None,
+            }
+        now = time.monotonic()
+        predicted_start, predicted_completion = compute_predicted_times()
+        now_ms_since_workflow_start = (now - workflow_start_monotonic) * 1000.0
+        start_ms_by_stage = {
+            stage_name: (float(predicted_start[stage_name]) - workflow_start_monotonic) * 1000.0
+            for stage_name in topo_order
+        }
+        completion_ms_by_stage = {
+            stage_name: (float(predicted_completion[stage_name]) - workflow_start_monotonic)
+            * 1000.0
+            for stage_name in topo_order
+        }
+        return {
+            "lead_ms_by_stage": {
+                stage_name: (float(predicted_start[stage_name]) - now) * 1000.0
+                for stage_name in topo_order
+                if stage_name != workflow.entry
+                and stage_name not in completed
+                and stage_name not in running
+                and stage_name not in started_at
+            },
+            "start_ms_by_stage": start_ms_by_stage,
+            "completion_ms_by_stage": completion_ms_by_stage,
+            "now_ms_since_workflow_start": now_ms_since_workflow_start,
+        }
+
     def wait_for_stage_warmup(stage_name: str) -> dict:
         sync_info = {
             "jit_sync_enabled": jit_sync_active,
@@ -756,7 +805,8 @@ def run_one_workflow(
         descendants = _runtime_descendant_stage_names(workflow, stage_name)
         if not descendants:
             return
-        eligible = descendants.intersection(prewarmable_stage_names())
+        eligible = descendants.intersection(dynamic_candidate_stage_names())
+        timing_snapshot = jit_timing_snapshot()
         changes = _runtime_upgrade_decision(
             workflow=workflow,
             normalized_plan=normalized_plan,
@@ -768,6 +818,11 @@ def run_one_workflow(
             dynamic_config=dynamic_config,
             dynamic_ref_data=dynamic_ref_data,
             eligible_stage_names=eligible,
+            jit_lead_ms_by_stage=timing_snapshot["lead_ms_by_stage"],
+            jit_margin_ms=jit_margin_ms,
+            now_ms_since_workflow_start=timing_snapshot["now_ms_since_workflow_start"],
+            predicted_start_ms_by_stage=timing_snapshot["start_ms_by_stage"],
+            predicted_completion_ms_by_stage=timing_snapshot["completion_ms_by_stage"],
         )
         if changes:
             normalized_plan.update(changes)
@@ -878,6 +933,7 @@ def run_one_workflow(
                 completed[node_name] = row["_result"]
                 del running[node_name]
                 if dynamic_active:
+                    timing_snapshot = jit_timing_snapshot()
                     changes = _runtime_upgrade_decision(
                         workflow=workflow,
                         normalized_plan=normalized_plan,
@@ -888,7 +944,16 @@ def run_one_workflow(
                         workflow_start_monotonic=workflow_start_monotonic,
                         dynamic_config=dynamic_config,
                         dynamic_ref_data=dynamic_ref_data,
-                        eligible_stage_names=prewarmable_stage_names(),
+                        eligible_stage_names=dynamic_candidate_stage_names(),
+                        jit_lead_ms_by_stage=timing_snapshot["lead_ms_by_stage"],
+                        jit_margin_ms=jit_margin_ms,
+                        now_ms_since_workflow_start=timing_snapshot[
+                            "now_ms_since_workflow_start"
+                        ],
+                        predicted_start_ms_by_stage=timing_snapshot["start_ms_by_stage"],
+                        predicted_completion_ms_by_stage=timing_snapshot[
+                            "completion_ms_by_stage"
+                        ],
                     )
                     if changes:
                         normalized_plan.update(changes)

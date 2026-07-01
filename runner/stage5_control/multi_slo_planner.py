@@ -305,6 +305,7 @@ def _warm_stage_dist(
     stage_name: str,
     memory_mb: int,
     ref_data: ReferenceData,
+    contention_factor: float = 1.0,
 ) -> LogNormalParams:
     try:
         base_params = ref_data.lognormal_params[stage_name]["warm"]
@@ -319,6 +320,7 @@ def _warm_stage_dist(
         amdahl_params=ref_data.amdahl_params,
         cold_overhead_ms=None,
         splines=ref_data.warm_splines,
+        contention_factor=contention_factor,
     )
 
 
@@ -327,6 +329,7 @@ def _cold_like_stage_dist(
     stage_name: str,
     memory_mb: int,
     ref_data: ReferenceData,
+    contention_factor: float = 1.0,
 ) -> LogNormalParams:
     try:
         base_params = ref_data.lognormal_params[stage_name]["cold_like"]
@@ -340,6 +343,7 @@ def _cold_like_stage_dist(
         base_params=base_params,
         amdahl_params=ref_data.amdahl_params,
         splines=ref_data.warm_splines,
+        contention_factor=contention_factor,
     )
 
 
@@ -348,6 +352,7 @@ def _dynamic_stage_dists(
     memory_tier_per_stage: dict[str, int],
     ref_data: ReferenceData,
     cold_upgrade_stages: set[str] | None = None,
+    contention_factor: float = 1.0,
 ) -> dict[str, LogNormalParams]:
     cold_upgrade_stages = cold_upgrade_stages or set()
     stage_dists: dict[str, LogNormalParams] = {}
@@ -357,12 +362,14 @@ def _dynamic_stage_dists(
                 stage_name=stage_name,
                 memory_mb=int(memory_mb),
                 ref_data=ref_data,
+                contention_factor=contention_factor,
             )
         else:
             dist = _warm_stage_dist(
                 stage_name=stage_name,
                 memory_mb=int(memory_mb),
                 ref_data=ref_data,
+                contention_factor=contention_factor,
             )
         stage_dists[stage_name] = dist
     return stage_dists
@@ -376,6 +383,8 @@ def _dynamic_conditional_risk(
     memory_tier_per_stage: dict[str, int],
     completed_finish_ms: dict[str, float],
     cold_upgrade_stages: set[str] | None = None,
+    rho: float = 0.0,
+    contention_factor: float = 1.0,
 ) -> float:
     return conditional_risk(
         workflow=workflow,
@@ -383,9 +392,11 @@ def _dynamic_conditional_risk(
             memory_tier_per_stage=memory_tier_per_stage,
             ref_data=ref_data,
             cold_upgrade_stages=cold_upgrade_stages,
+            contention_factor=contention_factor,
         ),
         completed_finish_ms=completed_finish_ms,
         slo_ms=config.slo_ms,
+        rho=rho,
     )
 
 
@@ -410,13 +421,18 @@ def dynamic_upgrade(
     current_tiers: dict[str, int],
     completed_finish_ms: dict[str, float],
     pending_stages: list[str],
+    jit_lead_ms_by_stage: dict[str, float] | None = None,
+    jit_margin_ms: float = 0.0,
+    min_jit_slack_ms: float = 1000.0,
+    max_changed_stages: int = 3,
+    allow_partial: bool = False,
+    now_ms_since_workflow_start: float | None = None,
+    predicted_start_ms_by_stage: dict[str, float] | None = None,
+    predicted_completion_ms_by_stage: dict[str, float] | None = None,
+    rho: float = 0.67,
+    contention_factor: float = 1.10,
 ) -> dict[str, int] | None:
-    """Choose UP-only runtime tier upgrades for not-yet-started stages.
-
-    Current-tier pending stages are assumed to remain JIT-warmed, so they use
-    warm distributions.  Upgrade candidates are not prewarmed and therefore
-    use the same per-tier cold_like scaling path as the offline risk model.
-    """
+    """Choose JIT-safe UP-only runtime tier upgrades for not-yet-started stages."""
 
     _validate_dynamic_inputs(
         config=config,
@@ -428,91 +444,27 @@ def dynamic_upgrade(
     if not pending_stages:
         return None
 
-    tier_index_by_memory = {
-        int(memory_mb): index for index, memory_mb in enumerate(config.tiers)
-    }
-    dag_order = {stage_name: index for index, stage_name in enumerate(config.stages)}
-    original_tiers = {
-        stage_name: int(memory_mb) for stage_name, memory_mb in current_tiers.items()
-    }
-    working_tiers = dict(original_tiers)
-    pending_set = set(pending_stages)
-    pending_order = [stage_name for stage_name in config.stages if stage_name in pending_set]
-    cold_upgrade_stages: set[str] = set()
+    from runner.stage5_control.risk_price_dynamic import risk_price_dynamic_upgrade
 
-    current_risk = _dynamic_conditional_risk(
+    return risk_price_dynamic_upgrade(
         config=config,
         ref_data=ref_data,
         workflow=workflow,
-        memory_tier_per_stage=working_tiers,
+        current_tiers=current_tiers,
         completed_finish_ms=completed_finish_ms,
-        cold_upgrade_stages=cold_upgrade_stages,
+        pending_stages=pending_stages,
+        jit_lead_ms_by_stage=jit_lead_ms_by_stage,
+        jit_margin_ms=jit_margin_ms,
+        min_jit_slack_ms=min_jit_slack_ms,
+        max_changed_stages=max_changed_stages,
+        allow_partial=allow_partial,
+        now_ms_since_workflow_start=now_ms_since_workflow_start,
+        predicted_start_ms_by_stage=predicted_start_ms_by_stage,
+        predicted_completion_ms_by_stage=predicted_completion_ms_by_stage,
+        rho=rho,
+        contention_factor=contention_factor,
+        require_jit_coverage=True,
     )
-    if current_risk <= config.max_violation_rate:
-        return None
-
-    current_cost = _dynamic_plan_cost(
-        config=config,
-        ref_data=ref_data,
-        memory_tier_per_stage=working_tiers,
-    )
-
-    while current_risk > config.max_violation_rate:
-        candidates: list[dict[str, Any]] = []
-        for stage_name in pending_order:
-            current_tier = int(working_tiers[stage_name])
-            tier_index = tier_index_by_memory[current_tier]
-            if tier_index >= len(config.tiers) - 1:
-                continue
-
-            candidate_tiers = dict(working_tiers)
-            candidate_tiers[stage_name] = int(config.tiers[tier_index + 1])
-            candidate_cold_upgrades = set(cold_upgrade_stages)
-            candidate_cold_upgrades.add(stage_name)
-            candidate_risk = _dynamic_conditional_risk(
-                config=config,
-                ref_data=ref_data,
-                workflow=workflow,
-                memory_tier_per_stage=candidate_tiers,
-                completed_finish_ms=completed_finish_ms,
-                cold_upgrade_stages=candidate_cold_upgrades,
-            )
-            candidate_cost = _dynamic_plan_cost(
-                config=config,
-                ref_data=ref_data,
-                memory_tier_per_stage=candidate_tiers,
-            )
-            candidates.append(
-                {
-                    "stage_name": stage_name,
-                    "new_tier": candidate_tiers[stage_name],
-                    "risk": candidate_risk,
-                    "risk_delta": current_risk - candidate_risk,
-                    "cost_delta": candidate_cost - current_cost,
-                    "dag_order_index": dag_order[stage_name],
-                    "memory_tier_per_stage": candidate_tiers,
-                    "cold_upgrade_stages": candidate_cold_upgrades,
-                    "cost": candidate_cost,
-                }
-            )
-
-        improving = [candidate for candidate in candidates if candidate["risk_delta"] > 0.0]
-        if not improving:
-            break
-        improving.sort(key=lambda item: _candidate_sort_key(item, "risk_delta"))
-        chosen = improving[0]
-
-        working_tiers = dict(chosen["memory_tier_per_stage"])
-        cold_upgrade_stages = set(chosen["cold_upgrade_stages"])
-        current_risk = float(chosen["risk"])
-        current_cost = float(chosen["cost"])
-
-    changed = {
-        stage_name: int(working_tiers[stage_name])
-        for stage_name in pending_stages
-        if int(working_tiers[stage_name]) != int(original_tiers[stage_name])
-    }
-    return changed or None
 
 
 def _state_to_memory(state: dict[str, int], tiers: list[int]) -> dict[str, int]:

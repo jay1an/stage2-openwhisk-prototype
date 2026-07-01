@@ -338,12 +338,14 @@ def conditional_risk(
     completed_finish_ms: dict[str, float],
     slo_ms: float,
     transition_overhead_ms: float = 0.0,
+    rho: float = 0.0,
 ) -> float:
     e2e = aggregate_dag(
         workflow,
         stage_dists,
         transition_overhead_ms=transition_overhead_ms,
         fixed_finish=completed_finish_ms,
+        rho=rho,
     )
     return e2e.survival(slo_ms)
 
