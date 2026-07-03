@@ -371,6 +371,8 @@ def run_brute_force_suite(
     lognormal_params_path: str | Path = DEFAULT_LOGNORMAL_PARAMS,
     baseline_trace_path: str | Path = DEFAULT_BASELINE_TRACE,
     greedy_summary_path: str | Path = DEFAULT_GREEDY_SUMMARY,
+    slo_premium_ms: float = 18000.0,
+    slo_free_ms: float = 24000.0,
     rho: float = 0.0,
     contention_factor: float = 1.0,
 ) -> dict[str, pd.DataFrame]:
@@ -399,7 +401,7 @@ def run_brute_force_suite(
     print(timing_df.round(6).to_string(index=False), flush=True)
 
     optimal_rows = []
-    for slo_class, slo_ms in [("premium", 15000.0), ("free", 20000.0)]:
+    for slo_class, slo_ms in [("premium", slo_premium_ms), ("free", slo_free_ms)]:
         print(f"enumerating {slo_class} slo={slo_ms} decision={decision.decision}", flush=True)
         optimal_rows.append(
             brute_force_one_slo(
@@ -440,6 +442,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--lognormal-params", default=str(DEFAULT_LOGNORMAL_PARAMS))
     parser.add_argument("--baseline-trace", default=str(DEFAULT_BASELINE_TRACE))
     parser.add_argument("--greedy-summary", default=str(DEFAULT_GREEDY_SUMMARY))
+    parser.add_argument("--slo-premium-ms", type=float, default=18000.0)
+    parser.add_argument("--slo-free-ms", type=float, default=24000.0)
     parser.add_argument("--rho", type=float, default=0.0)
     parser.add_argument("--contention-factor", type=float, default=1.0)
     return parser.parse_args()
@@ -452,6 +456,8 @@ def main() -> None:
         lognormal_params_path=args.lognormal_params,
         baseline_trace_path=args.baseline_trace,
         greedy_summary_path=args.greedy_summary,
+        slo_premium_ms=args.slo_premium_ms,
+        slo_free_ms=args.slo_free_ms,
         rho=args.rho,
         contention_factor=args.contention_factor,
     )

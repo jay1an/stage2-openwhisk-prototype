@@ -31,6 +31,12 @@ from runner.stage5_control.multi_slo_planner import (
     load_reference_data,
     plan_cost_gbsec,
 )
+from runner.stage5_control.orion_planner import (
+    orion_plan,
+    orion_result_row,
+    run_orion_self_checks,
+)
+from runner.workflow import load_workflow
 
 
 DEFAULT_OUT_DIR = (
@@ -39,11 +45,13 @@ DEFAULT_OUT_DIR = (
 DEFAULT_BRUTE_FORCE = (
     Path(__file__).resolve().parents[3]
     / "reports"
-    / "replan_sigma_rho_mean"
+    / "replan_1824_brute"
     / "brute_force_optimal.csv"
 )
+DEFAULT_WORKFLOW = Path(__file__).resolve().parents[3] / "configs" / "civic_alert_flow.yaml"
 DEFAULT_RHO = 0.67
 DEFAULT_CONTENTION_FACTOR = 1.10
+DEFAULT_LAMBDA_GRID = (0.0, 1.0, 4.0, 16.0, 64.0)
 EPS = 1e-12
 
 
@@ -414,6 +422,35 @@ def build_lambda_grid(effects: list[dict[str, Any]]) -> list[float]:
     return finite
 
 
+def parse_lambda_grid(value: str) -> list[float] | None:
+    normalized = value.strip()
+    if normalized.lower() == "auto":
+        return None
+    parts = [part for part in normalized.replace(",", " ").split() if part]
+    if not parts:
+        raise ValueError("lambda grid must contain at least one value or be 'auto'")
+    lambdas = [float(part) for part in parts]
+    for item in lambdas:
+        if not math.isfinite(item) or item < 0.0:
+            raise ValueError(f"lambda values must be finite and non-negative, got {item}")
+    return sorted(set(lambdas))
+
+
+def resolve_lambda_grid(
+    effects: list[dict[str, Any]],
+    lambda_values: Iterable[float] | None,
+) -> list[float]:
+    if lambda_values is None:
+        return build_lambda_grid(effects)
+    lambdas = sorted({float(value) for value in lambda_values})
+    if not lambdas:
+        raise ValueError("lambda_values must contain at least one value")
+    for value in lambdas:
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"lambda values must be finite and non-negative, got {value}")
+    return lambdas
+
+
 def choose_by_lambda(
     *,
     ctx: EvalContext,
@@ -526,7 +563,12 @@ def local_cost_improve(
     return state_key
 
 
-def risk_price_plan(ctx: EvalContext, *, pairwise: bool) -> PlanResult:
+def risk_price_plan(
+    ctx: EvalContext,
+    *,
+    pairwise: bool,
+    lambda_values: Iterable[float] | None = DEFAULT_LAMBDA_GRID,
+) -> PlanResult:
     start_key = initial_state_key(ctx.config)
     start_eval = ctx.evaluate(start_key)
     if is_feasible(start_eval, ctx.config):
@@ -541,7 +583,7 @@ def risk_price_plan(ctx: EvalContext, *, pairwise: bool) -> PlanResult:
         )
 
     effects = single_change_candidates(ctx=ctx, state_key=start_key, all_higher=True)
-    lambdas = build_lambda_grid(effects)
+    lambdas = resolve_lambda_grid(effects, lambda_values)
     candidate_keys: set[tuple[int, ...]] = set()
     trace: list[dict[str, Any]] = [trace_row(step=0, action="init", evaluation=start_eval)]
 
@@ -761,11 +803,15 @@ def run_suite(
     *,
     out_dir: str | Path = DEFAULT_OUT_DIR,
     brute_force_path: str | Path = DEFAULT_BRUTE_FORCE,
+    workflow_path: str | Path = DEFAULT_WORKFLOW,
     lognormal_params_path: str | Path = DEFAULT_LOGNORMAL_PARAMS,
     baseline_trace_path: str | Path = DEFAULT_BASELINE_TRACE,
     predicted_arrivals: float = 5.0,
+    slo_premium_ms: float = 18000.0,
+    slo_free_ms: float = 24000.0,
     rho: float = DEFAULT_RHO,
     contention_factor: float = DEFAULT_CONTENTION_FACTOR,
+    lambda_values: Iterable[float] | None = DEFAULT_LAMBDA_GRID,
     beam_widths: list[int] | None = None,
 ) -> dict[str, pd.DataFrame]:
     beam_widths = beam_widths or [3, 5]
@@ -775,12 +821,33 @@ def run_suite(
         lognormal_params_path=lognormal_params_path,
         baseline_trace_path=baseline_trace_path,
     )
+    workflow = load_workflow(str(resolve(workflow_path)))
     brute_rows = load_brute_force_rows(resolve(brute_force_path))
     method_rows: list[dict[str, Any]] = []
     trace_rows: list[dict[str, Any]] = []
 
+    selfcheck_config = PlannerConfig(
+        slo_ms=float(slo_premium_ms),
+        max_violation_rate=0.05,
+        predicted_arrivals=predicted_arrivals,
+        tiers=list(DEFAULT_TIERS),
+        safety_factors=list(DEFAULT_SAFETY_FACTORS),
+        stages=list(STAGES),
+    )
+    orion_selfcheck = run_orion_self_checks(
+        workflow=workflow,
+        config=selfcheck_config,
+        ref_data=ref_data,
+    )
+    selfcheck_df = pd.DataFrame([orion_selfcheck])
+    selfcheck_df.to_csv(out / "orion_selfcheck.csv", index=False)
+    print("orion_selfcheck:")
+    print(selfcheck_df.round(8).to_string(index=False), flush=True)
+    if not bool(orion_selfcheck["single_pass"]) or not bool(orion_selfcheck["grid_pass"]):
+        raise RuntimeError("Orion self-check failed; refusing to run planner suite")
+
     h_lambdas_max = 0
-    for slo_class, slo_ms in [("premium", 15000.0), ("free", 20000.0)]:
+    for slo_class, slo_ms in [("premium", slo_premium_ms), ("free", slo_free_ms)]:
         config = PlannerConfig(
             slo_ms=slo_ms,
             max_violation_rate=0.05,
@@ -804,8 +871,13 @@ def run_suite(
             else:
                 start_key = initial_state_key(config)
                 effects = single_change_candidates(ctx=ctx, state_key=start_key, all_higher=True)
-                h_lambdas_max = max(h_lambdas_max, len(build_lambda_grid(effects)))
-                result = risk_price_plan(ctx, pairwise=(runner == "risk_price_pairwise"))
+                lambdas = resolve_lambda_grid(effects, lambda_values)
+                h_lambdas_max = max(h_lambdas_max, len(lambdas))
+                result = risk_price_plan(
+                    ctx,
+                    pairwise=(runner == "risk_price_pairwise"),
+                    lambda_values=lambdas,
+                )
             method_rows.append(
                 result_row(
                     slo_class=slo_class,
@@ -837,6 +909,22 @@ def run_suite(
             for item in result.trace:
                 trace_rows.append({"slo_class": slo_class, "method": result.method, **item})
 
+        orion = orion_plan(
+            workflow=workflow,
+            config=config,
+            ref_data=ref_data,
+            rho=float(rho),
+            contention_factor=float(contention_factor),
+        )
+        method_rows.append(
+            orion_result_row(
+                slo_class=slo_class,
+                config=config,
+                result=orion,
+                brute_row=brute_row,
+            )
+        )
+
         if brute_row is not None:
             method_rows.append(brute_result_row(slo_class=slo_class, config=config, row=brute_row))
 
@@ -867,6 +955,7 @@ def run_suite(
         "method_comparison": method_df,
         "risk_price_trace": trace_df,
         "complexity_summary": complexity_df,
+        "orion_selfcheck": selfcheck_df,
     }
 
 
@@ -874,11 +963,19 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR))
     parser.add_argument("--brute-force-path", default=str(DEFAULT_BRUTE_FORCE))
+    parser.add_argument("--workflow", default=str(DEFAULT_WORKFLOW))
     parser.add_argument("--lognormal-params", default=str(DEFAULT_LOGNORMAL_PARAMS))
     parser.add_argument("--baseline-trace", default=str(DEFAULT_BASELINE_TRACE))
     parser.add_argument("--predicted-arrivals", type=float, default=5.0)
+    parser.add_argument("--slo-premium-ms", type=float, default=18000.0)
+    parser.add_argument("--slo-free-ms", type=float, default=24000.0)
     parser.add_argument("--rho", type=float, default=DEFAULT_RHO)
     parser.add_argument("--contention-factor", type=float, default=DEFAULT_CONTENTION_FACTOR)
+    parser.add_argument(
+        "--lambda-grid",
+        default=",".join(str(value).rstrip("0").rstrip(".") for value in DEFAULT_LAMBDA_GRID),
+        help="Comma/space separated risk-price lambda grid, or 'auto' for data-derived ratios.",
+    )
     parser.add_argument("--beam-width", type=int, action="append", default=None)
     return parser.parse_args()
 
@@ -888,11 +985,15 @@ def main() -> None:
     outputs = run_suite(
         out_dir=args.out_dir,
         brute_force_path=args.brute_force_path,
+        workflow_path=args.workflow,
         lognormal_params_path=args.lognormal_params,
         baseline_trace_path=args.baseline_trace,
         predicted_arrivals=args.predicted_arrivals,
+        slo_premium_ms=args.slo_premium_ms,
+        slo_free_ms=args.slo_free_ms,
         rho=args.rho,
         contention_factor=args.contention_factor,
+        lambda_values=parse_lambda_grid(args.lambda_grid),
         beam_widths=args.beam_width,
     )
     print("method_comparison:")
@@ -900,6 +1001,9 @@ def main() -> None:
     print()
     print("complexity_summary:")
     print(outputs["complexity_summary"].to_string(index=False))
+    print()
+    print("orion_selfcheck:")
+    print(outputs["orion_selfcheck"].round(8).to_string(index=False))
 
 
 if __name__ == "__main__":
