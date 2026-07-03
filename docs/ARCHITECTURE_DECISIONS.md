@@ -388,12 +388,19 @@ alternative input to the planner for ablation.
 
 ## 9. SLO Definition (FINALIZED 2026-05-29)
 
+> **SUPERSEDED 2026-07-03 → deadlines are now Premium 18s / Free 24s.**
+> The 15s/20s below was the original 2026-05-29 decision, kept for
+> history. 15/20 was razor-thin (premium 4.42% violation at 15s) and would
+> not survive real-forecaster entry-cold; 18/24 ≈ 1.3× each class's warm
+> nominal E2E and clears realized max with margin. All 15/20 plans are
+> invalidated. See **Section 15** for the current numbers and grounding.
+
 ### Final SLO targets
 
-| Class | SLO target | Max violation rate |
-|---|---|---|
-| **Premium** | P(E2E > 15s) | ≤ 5% |
-| **Free** | P(E2E > 20s) | ≤ 5% |
+| Class | SLO target (CURRENT) | original (deprecated) | Max violation rate |
+|---|---|---|---|
+| **Premium** | P(E2E > **18s**) | P(E2E > 15s) | ≤ 5% |
+| **Free** | P(E2E > **24s**) | P(E2E > 20s) | ≤ 5% |
 
 Both classes use a 5% violation budget. The differentiation is in the
 latency target (15s vs 20s), not the violation rate.
@@ -857,8 +864,83 @@ P4 deliverables:
 
 ---
 
+## 15. Confirmed Decisions & Deprecations (2026-07-03)
+
+### Confirmed (current)
+
+- **SLO deadlines: Premium 18s / Free 24s**, both ≤ 5% violation
+  (calibrated to realized E2E; supersedes the 15/20 in Section 9).
+- **Canonical eval trace: CANON_20h** (`reports/trace_selection_v3/
+  schedule_regular_aggregate_CANON_20h_peak40_15_FINAL_eval.csv`, 755
+  arrivals, real-time ~20h replay, day/night shape). Forecaster training =
+  first 12 days of the same Azure aggregate (train_days=12, heldout_days=2);
+  CANON eval window is held-out day ~13. Old 95.58% / 97.92% numbers were
+  15/20 on the derived SHORT18h slice — **superseded**.
+- **Oracle+static ceiling on CANON at 18/24** (deploy `risk_price` plan,
+  `--enable-jit --enable-jit-sync --enable-entry-prewarm`, no dynamic/no
+  forecaster/no pool): **Premium 98.9%, Free 100%**
+  (`reports/eval_canon_1824_oracle_static/full/`).
+- **contention_factor = 1.10 VALIDATED on CANON**: with it, the model's
+  warm-median matches realized within ~1% (premium 16090 vs 15971, free
+  20847 vs 20644); without it the model under-predicts ~8%. It is a
+  concurrency effect — the single-workflow (n=1) "too conservative"
+  observation was a wrong-regime artifact; do NOT lower it from n=1 data.
+- **Deployed plan = `risk_price` (our method), 18/24** (near-optimal vs
+  brute): Premium `detect_object:2048, estimate_pose:1280, match_face:1792,
+  classify_scene:1280, translate_alert:1792`; Free
+  `1024/1280/1024/1024/1024`.
+- **Offline planner comparison** (`reports/risk_price_planner_1824_orion/`,
+  all at rho=0.67, contention=1.10): `risk_price_pairwise` near-optimal
+  (premium +0.04% vs brute, free exact); **faithful Orion baseline**
+  (`runner/stage5_control/orion_planner.py`: its own numerical CDF
+  propagation, root-cold/rest-warm/independent, critical-path best-first,
+  memory-only) overpays premium **+8.8%** and is **infeasible on free**
+  (0.0545 > 5%) under our risk model — its optimistic model underestimates
+  the tail. Caveat to state in the paper: Orion was given memory-only
+  (no entry-prewarm knob), consistent with its design.
+- **risk-price is the main planner algorithm.** Its necessity is the
+  ONLINE per-stage real-time conditional-risk re-planning (brute/beam
+  cannot run there) plus larger-DAG scalability; offline it is near-optimal.
+  Details (per-stage Lagrangian decomposition ignores DAG coupling; λ grid
+  is start-state-derived) still to refine.
+
+### Deprecated / abandoned (marked, kept for history)
+
+- **SLO 15s/20s** and all 15/20 plans → superseded by 18/24 (Section 9).
+- **`entry_prewarm_safety_factor` as a planner decision variable** →
+  REMOVED from the risk-price search. Reason: it only shifts `p_entry_cold`
+  (never touches execution-time estimation), is always driven to 0 by an
+  over-priced prewarm cost model, and conflates warm-execution risk with
+  entry-cold insurance. Entry prewarm is owned by the forecaster/pool
+  subsystem; the static planner optimizes the warm-path objective
+  `P(all-warm violation)`. `p_entry_cold` becomes a calibrated INPUT (a
+  fixed historical calibration in experiments — do NOT claim per-cycle
+  updating unless implemented; note it is 2-4× below the CANON-realized
+  0.072/0.128 and "works" only via error cancellation).
+- **Beam search as a reported baseline** → dropped (it is our own search
+  variant and reproduces the brute optimum at this scale; not an
+  informative baseline). risk-price is the reported heuristic; brute is the
+  small-scale oracle.
+- **Monte Carlo as risk model / validation** → long deprecated. The
+  closed-form FW+Clark aggregation is authoritative (O(1), re-evaluable
+  online). MC is not in the live pipeline.
+
+### Still open (NOT decided)
+
+- SMIless path-search (A* over DAG) baseline — to implement faithfully
+  (borrowing its search, honest that its problem is prewarm/keepalive, not
+  memory sizing); needs a defensible admissible heuristic.
+- Whether to construct a larger DAG (8-10 stages) to exercise the
+  scalability axis where brute becomes infeasible.
+- risk-price λ / decomposition refinement.
+
+---
+
 ## Changelog
 
+- 2026-07-03: Added Section 15 (confirmed 18/24 + CANON decisions;
+  deprecations: 15/20, safety_factor-as-planner-variable, beam-as-baseline,
+  Monte-Carlo, old 95.58/97.92 headline). Section 9 SLO table superseded.
 - 2026-05-26: Initial document created, aligning all decisions made in
   pre-implementation discussion.
 - 2026-05-27: Added Section 10 on dynamic plan adjustment. P3 first-pass

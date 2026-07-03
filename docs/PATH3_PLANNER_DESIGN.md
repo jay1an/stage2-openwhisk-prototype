@@ -7,6 +7,23 @@ Companion documents:
 - `ARCHITECTURE_DECISIONS.md` - high-level alignment
 - `ANALYTICAL_RISK_MODEL.md` - path 2 closed-form risk model (used by planner)
 
+> **STATUS 2026-07-03 (read first — parts below are deprecated).** See
+> `ARCHITECTURE_DECISIONS.md` Section 15 for the authoritative current
+> decisions. Deltas vs this document:
+> - **SLO is now Premium 18s / Free 24s** (this doc's 15s/20s is superseded).
+> - **`entry_prewarm_safety_factor` is REMOVED from the planner search**
+>   (Sections 2-3 still describe it). It never touches execution-time
+>   estimation, is always driven to 0, and conflated warm risk with
+>   entry-cold insurance. Entry prewarm is now a separate forecaster/pool
+>   subsystem; the static planner optimizes `P(all-warm violation)`.
+> - **Beam is dropped as a reported baseline** (reproduces brute at this
+>   scale). Reported: `risk_price` (main heuristic) vs `brute` (small-scale
+>   oracle) vs `orion` (faithful baseline, `runner/stage5_control/
+>   orion_planner.py`); SMIless-A* baseline is planned, not yet built.
+> - **risk-price's necessity is ONLINE per-stage real-time re-planning**
+>   (brute/beam cannot run there) plus larger-DAG scale — not offline speed
+>   at 5 stages, where brute is feasible.
+
 ---
 
 ## 0. Paper Positioning and Priority (aligned 2026-05-29)
