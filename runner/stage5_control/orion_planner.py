@@ -6,6 +6,13 @@ project's FW/Clark analytical model:
 * root stage is cold-like; all other stages are warm;
 * stages are independent, with no contention or cross-stage correlation;
 * DAG latency is propagated numerically on a fixed time grid using PMFs.
+
+The search follows ORION Algorithm 1's successor expansion shape: every stage
+can be upgraded by one tier when expanding a state. ORION/SMIless-style
+descriptions often write the priority as ``-latency * cost``. In this Python
+implementation the queue is ``heapq`` (a min-heap), so we push
+``+latency * cost`` to pop the smaller latency-cost product first. Using the
+negative value directly with ``heapq`` reverses the intended ordering.
 """
 
 from __future__ import annotations
@@ -345,7 +352,7 @@ def orion_plan(
 ) -> OrionPlanResult:
     start_key = tuple([0] * len(config.stages))
     counter = 0
-    frontier: list[tuple[float, float, int, tuple[int, ...]]] = []
+    frontier: list[tuple[float, int, tuple[int, ...]]] = []
     cache: dict[tuple[int, ...], OrionEvaluation] = {}
 
     def evaluate(state_key: tuple[int, ...]) -> OrionEvaluation:
@@ -360,23 +367,52 @@ def orion_plan(
             )
         return cache[state_key]
 
+    def priority(evaluation: OrionEvaluation) -> float:
+        return float(evaluation.p95_ms) * float(evaluation.cost_gbsec)
+
+    def result_from(
+        best: OrionEvaluation,
+        *,
+        states_expanded: int,
+        search_exhausted: bool,
+    ) -> OrionPlanResult:
+        violation, expected = _our_plan_violation(
+            config=config,
+            ref_data=ref_data,
+            memory_tier_per_stage=best.memory_tier_per_stage,
+            rho=rho,
+            contention_factor=contention_factor,
+        )
+        return OrionPlanResult(
+            memory_tier_per_stage=best.memory_tier_per_stage,
+            cost_gbsec=best.cost_gbsec,
+            orion_p95_ms=best.p95_ms,
+            orion_own_survival=best.survival_at_slo,
+            feasible_by_orion=best.feasible_by_orion,
+            feasible_by_ours=bool(violation <= config.max_violation_rate + EPS),
+            violation_rate=float(violation),
+            expected_e2e_ms=float(expected),
+            states_expanded=states_expanded,
+            states_evaluated=len(cache),
+            search_exhausted=search_exhausted,
+        )
+
     start_eval = evaluate(start_key)
-    heapq.heappush(frontier, (start_eval.p95_ms, start_eval.cost_gbsec, counter, start_key))
+    if start_eval.feasible_by_orion:
+        return result_from(start_eval, states_expanded=0, search_exhausted=False)
+
+    heapq.heappush(frontier, (priority(start_eval), counter, start_key))
     queued: set[tuple[int, ...]] = {start_key}
     expanded: set[tuple[int, ...]] = set()
-    feasible: list[OrionEvaluation] = []
 
     while frontier and len(expanded) < int(expansion_limit):
-        _, _, _, state_key = heapq.heappop(frontier)
+        _, _, state_key = heapq.heappop(frontier)
         if state_key in expanded:
             continue
         expanded.add(state_key)
-        evaluation = evaluate(state_key)
-        if evaluation.feasible_by_orion:
-            feasible.append(evaluation)
+        evaluate(state_key)
 
-        for stage_name in evaluation.critical_path:
-            stage_index = list(config.stages).index(stage_name)
+        for stage_index, _stage_name in enumerate(config.stages):
             tier_index = int(state_key[stage_index])
             if tier_index >= len(config.tiers) - 1:
                 continue
@@ -386,36 +422,23 @@ def orion_plan(
             if next_key in queued or next_key in expanded:
                 continue
             next_eval = evaluate(next_key)
+            if next_eval.feasible_by_orion:
+                return result_from(
+                    next_eval,
+                    states_expanded=len(expanded),
+                    search_exhausted=False,
+                )
             counter += 1
             queued.add(next_key)
             heapq.heappush(
                 frontier,
-                (next_eval.p95_ms, next_eval.cost_gbsec, counter, next_key),
+                (priority(next_eval), counter, next_key),
             )
 
-    if feasible:
-        best = min(feasible, key=lambda item: (item.cost_gbsec, item.p95_ms, item.state_key))
-    else:
-        best = min(cache.values(), key=lambda item: (item.p95_ms, item.cost_gbsec, item.state_key))
-
-    violation, expected = _our_plan_violation(
-        config=config,
-        ref_data=ref_data,
-        memory_tier_per_stage=best.memory_tier_per_stage,
-        rho=rho,
-        contention_factor=contention_factor,
-    )
-    return OrionPlanResult(
-        memory_tier_per_stage=best.memory_tier_per_stage,
-        cost_gbsec=best.cost_gbsec,
-        orion_p95_ms=best.p95_ms,
-        orion_own_survival=best.survival_at_slo,
-        feasible_by_orion=best.feasible_by_orion,
-        feasible_by_ours=bool(violation <= config.max_violation_rate + EPS),
-        violation_rate=float(violation),
-        expected_e2e_ms=float(expected),
+    best = min(cache.values(), key=lambda item: (item.p95_ms, item.cost_gbsec, item.state_key))
+    return result_from(
+        best,
         states_expanded=len(expanded),
-        states_evaluated=len(cache),
         search_exhausted=bool(frontier and len(expanded) >= int(expansion_limit)),
     )
 
