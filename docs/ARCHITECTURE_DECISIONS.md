@@ -936,8 +936,92 @@ P4 deliverables:
 
 ---
 
+## 16. Convergence Plan & Baseline Corrections (2026-07-04)
+
+### Roadmap — converge patches into ONE pipeline
+Target chain: `arrival forecast → entry-cold probability → warm/cold-entry E2E
+risk → resource plan → JIT/reservation/pool runtime enforcement`. Eight steps:
+(0) freeze conventions; (1) fix lognormal risk model (explicit sync-wait +
+entry-cold-overhead decomposition, validate vs replay); (2) explicit
+`p_entry_cold`, drop safety_factor; (3) re-run planners + baselines on the fixed
+model; (4) offline forecaster (300s Ridge/RF/HGBR + 60s top-up + NB/Poisson
+count layer); (5) wire `/poolState → p_entry_cold(t)`; (6) three-arm CANON
+cluster experiment (no-pool / oracle / forecast-driven pool); (7) dynamic as
+SECONDARY (it cannot fix an entry cold already incurred; only upgrades pending
+downstream); (8) add wide-fan-in / deep-chain DAGs if the planner gap stays
+small.
+
+### Conventions frozen (Step 0)
+- **Main cost = provider-style execution GB-s only**; idle/pool GB-s reported as
+  platform overhead, NOT in the optimization objective.
+- **downstream default warm** (JIT + reservation drove downstream cold
+  10.42% → 0%).
+- **safety_factor removed** from the planner; entry cold enters as an explicit
+  `p_entry_cold` (calibrated from history; do NOT claim per-cycle updating
+  unless implemented).
+
+### Baseline corrections (VERIFIED 2026-07-04)
+- **ORION heap-direction bug fixed.** Our Python best-first used a priority that
+  reversed ORION's intent: Algorithm 1 writes `-latency×cost` for a
+  MAX-priority queue, but in Python's `heapq` (min-heap) that pops the WORST
+  (slowest×most-expensive) state first. Fixed in `orion_planner.py` to
+  priority `= +p95×cost`, expand ALL stages (not only critical-path), return
+  first-feasible. **Verified premium 18s: ORION cost 23.499 = +1.12% vs brute
+  (was the buggy +8.8%), 185 expansions (converged, not capped).** On free 24s
+  ORION is INFEASIBLE under our risk model (0.0545 > 5%) — genuine, not a search
+  bug: its root-cold/independent/no-ρ/no-contention model under-estimates the
+  tail (its own model says feasible at survival 0.0266). So ORION is a fast
+  p95-first-feasible right-sizing baseline: near-optimal on premium, model-
+  optimistic on free. **The earlier +8.8%/2000-cap ORION numbers are void
+  (heap-bug artifact).**
+- **SMIless baseline implemented** (`smiless_planner.py`): prefix A* over memory
+  tiers, remaining-min-exec-time p95 SLA bound, deterministic p95 DAG
+  feasibility (root cold-like, downstream warm). It optimizes prefix-p95
+  feasibility, not full-DAG P(E2E>SLO), so it is conservative (premium18
+  ~+34.5%, free ~+25.4% vs our method). Honest framing: we borrow its search
+  shape; SMIless's real problem is device (cpu/gpu) + keepalive, not memory
+  tiers — state this in the paper.
+- **“Our method” is NOT risk-price/λ.** Traced at premium 18s: the λ machinery
+  is inert — the all-min start saturates risk at 1.0, so every single-change
+  `risk_delta = 0`, the λ grid degenerates to {0,1}, and proposals are
+  λ-independent. The plan comes entirely from greedy repair-to-feasibility +
+  pairwise cost-prune (greedy-repair+prune alone gives the identical plan).
+  Report our method as **warm-only seed + exact entry-mixture repair + pairwise
+  prune**; do NOT claim a working Lagrangian risk-pricing.
+
+### Model fix decided (Step 1 — pending implementation + validation)
+- **Cold-entry conditional distribution is over-conservative.** The old model
+  uses `cold_like` as the whole entry distribution AND keeps the entry-warm
+  first-hop JIT sync wait; in reality the entry cold overhead (~2s) OVERLAPS the
+  first-hop warmup, so the first-hop sync wait collapses to ~0 when entry is
+  cold. Fix: `E2E_warm = DAG_warm_execution + explicit sync_wait`;
+  `T_entry_cold = T_entry_warm_exec + H_entry_cold` with the sync-wait overlap.
+  A one-off validation cut premium cold-entry p95 error from +1.2s to +0.05s.
+- **This refines §15's “contention 1.10 validated”.** 1.10 empirically made the
+  model E2E match CANON (that stands), but the mechanism is now understood as
+  1.10 largely STANDING IN for the unmodeled first-hop sync wait (entry-warm
+  first-hop sync p95 ≈ 1.6s ≈ what ×1.10 adds to E2E). Decompose it: model
+  `sync_wait` explicitly, set contention back to 1.0, and re-introduce a small
+  residual contention ONLY if held-out validation shows execution itself slows
+  under concurrency. **Validation is load-bearing — do not drop 1.10 until the
+  decomposition reproduces the CANON warm/cold p95 match.**
+
+### Still open
+- **free SLO = 22 or 24 must be unified** (we use **24**; some fork analysis
+  used 22).
+- `p_entry_cold` grid {0, 0.1, 0.2, 0.4}: 0.4 = no-pool stress point; the
+  deployed arm uses the realized rate (~0.07 premium / ~0.13 free). The planner
+  comparison should sweep the grid, not report only 0.4.
+
+---
+
 ## Changelog
 
+- 2026-07-04: Added Section 16 (convergence roadmap; ORION heap-direction fix
+  verified +8.8%→+1.12%, earlier ORION numbers void; SMIless baseline
+  implemented; risk-price λ shown inert → method renamed to seed+repair+prune;
+  contention 1.10 → explicit sync-wait decomposition, refines §15; main cost =
+  execution GB-s only).
 - 2026-07-03: Added Section 15 (confirmed 18/24 + CANON decisions;
   deprecations: 15/20, safety_factor-as-planner-variable, beam-as-baseline,
   Monte-Carlo, old 95.58/97.92 headline). Section 9 SLO table superseded.

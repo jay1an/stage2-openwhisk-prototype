@@ -34,19 +34,20 @@ but deferred — our DAG dispatching is currently parallel, not queue-based.
 
 **How it finds a plan:**
 Offline profiling → empirical CDF per stage → CDF propagation through DAG
-using CONV (series) and MAX (parallel) → greedy right-sizing along the
-critical path → prewarming with DAG look-ahead timing.
+using CONV (series) and MAX (parallel) → **best-first right-sizing
+(Algorithm 1, priority ~ latency×cost, first-feasible)** → prewarming with
+DAG look-ahead timing. Feasibility is a percentile bound `p95(E2E) ≤ SLA`.
 
 Three optimizations:
-1. Right-sizing: greedy memory allocation to critical-path stages.
+1. Right-sizing: best-first search over resource states (Algorithm 1).
 2. Bundling: co-locate parallel invocations in one VM to reduce skew.
 3. Right-prewarming: warm downstream VMs at the p50 completion time of
    their upstream stage.
 
 **Relevance to our project:**
 - The CDF CONV+MAX propagation is the standard approach for DAG latency
-  estimation. Our project currently uses Monte Carlo for this; we should
-  also implement the closed-form version.
+  estimation. Our project now uses a closed-form FW (series) + Clark (max)
+  lognormal model for this; Monte Carlo is retired from the live pipeline.
 - The JIT prewarming idea (warm downstream based on upstream completion
   estimate) is directly what we want. Our delay_kernel already captures the
   upstream-to-downstream propagation delay distribution.
@@ -60,6 +61,21 @@ as a fast analytical risk model alternative to Monte Carlo.
 - ORION does not optimize keepalive. We add keepalive as a decision variable.
 - ORION treats cold starts simplistically (root=cold, rest=warm). We model
   cold probability per stage per window.
+
+**Baseline implementation + correction (2026-07-04, `orion_planner.py`):**
+Our faithful ORION baseline reuses our per-stage marginals but keeps ORION's
+own model (root cold-like, downstream warm, independent, no ρ, no contention;
+numerical CONV/MAX; `p95(E2E) ≤ SLA`). A bug in the Python port reversed the
+best-first priority — Algorithm 1's `-latency×cost` assumes a MAX-priority
+queue, but `heapq` is a min-heap, so `-latency×cost` popped the WORST state
+first. Corrected to priority `= +p95×cost`, expand all stages, first-feasible.
+Verified on civic_alert 18/24: **premium ORION = 23.499 GB-s (+1.12% vs brute,
+185 expansions, converged)**; **free ORION is infeasible under OUR risk model
+(0.0545 > 5%)** because its optimistic model under-estimates the tail (its own
+model deems it feasible). So ORION is a fast p95-first-feasible right-sizing
+baseline — near-optimal on premium, model-optimistic on free. The earlier
++8.8%/expansion-capped numbers were the heap-bug artifact and are void. See
+`ARCHITECTURE_DECISIONS.md` §16.
 
 ---
 

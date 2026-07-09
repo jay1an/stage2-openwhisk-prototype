@@ -23,6 +23,20 @@ Companion documents:
 > - **risk-price's necessity is ONLINE per-stage real-time re-planning**
 >   (brute/beam cannot run there) plus larger-DAG scale — not offline speed
 >   at 5 stages, where brute is feasible.
+>
+> **UPDATE 2026-07-04 (see `ARCHITECTURE_DECISIONS.md` §16, authoritative):**
+> - **“Our method” is NOT risk-price/λ.** The λ machinery is inert at the
+>   all-min saturated start (single-change `risk_delta`=0 → λ grid {0,1}); the
+>   plan is produced by greedy repair + pairwise prune. Report it as
+>   **warm-only seed + exact entry-mixture repair + pairwise prune**.
+> - **ORION heap-direction bug fixed** (`orion_planner.py`, priority `+p95×cost`,
+>   expand-all, first-feasible): premium 18s **+1.12%** vs brute (185 exp.),
+>   free infeasible under our risk (model-optimism). Earlier +8.8%/capped void.
+> - **SMIless baseline is now IMPLEMENTED** (`smiless_planner.py`, prefix A* +
+>   p95 SLA bound); conservative (premium ~+34.5%).
+> - **Model fix pending (Step 1):** decompose E2E into `warm_execution +
+>   explicit sync_wait`; cold-entry overlaps first-hop sync wait; contention
+>   1.10 → 1.0 once the sync-wait decomposition is validated on replay.
 
 ---
 
