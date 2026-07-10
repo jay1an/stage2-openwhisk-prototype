@@ -14,7 +14,24 @@ from typing import Any, Iterable
 
 import pandas as pd
 
+from runner.stage4_risk.dag_aggregation import (
+    add_deterministic_shift,
+    aggregate_civic_alert,
+    fenton_wilkinson_sum,
+)
 from runner.stage4_risk.plan_risk import PlanInput, compute_plan_risk
+from runner.stage4_risk.plan_risk import (
+    DEFAULT_REPAIRED_V2_COLD_OVERHEAD_TRACE,
+    ENTRY_STAGE,
+    REPAIRED_V2_SYNC_SHIFT_COLD_MS,
+    REPAIRED_V2_SYNC_SHIFT_WARM_MS,
+    _load_entry_cold_overhead_params,
+)
+from runner.stage4_risk.scaling import (
+    memory_to_cpu_cores,
+    scale_stage_for_memory_tier,
+    spline_predict_warm_mean,
+)
 from runner.stage5_control.multi_slo_planner import (
     DEFAULT_BASELINE_TRACE,
     DEFAULT_LOGNORMAL_PARAMS,
@@ -33,6 +50,8 @@ DEFAULT_GREEDY_SUMMARY = Path(__file__).resolve().parents[2] / "reports" / "path
 MAX_FULL_SECONDS_PER_CLASS = 30.0 * 60.0
 TIMING_SUBSET_SIZE = 1000
 RANDOM_SEED = 20260529
+REPAIRED_V2_P_ENTRY_GRID = (0.0, 0.05, 0.1, 0.2, 0.4)
+REPAIRED_V2_FULL_SEARCH_DECISION = "full_repaired_v2"
 
 
 @dataclass(frozen=True)
@@ -51,6 +70,16 @@ class PlanRecord:
     safety_factor: float
     violation_rate: float
     cost_gbsec: float
+
+
+@dataclass(frozen=True)
+class RepairedV2FastRecord:
+    memory_tier_per_stage: dict[str, int]
+    cost_gbsec: float
+    warm_survival: float
+    cold_survival: float
+    warm_p95_ms: float
+    cold_p95_ms: float
 
 
 def _resolve(path: str | Path) -> Path:
@@ -107,6 +136,206 @@ def evaluate_candidate(
         violation_rate=float(risk.p_violation_total),
         cost_gbsec=float(cost),
     )
+
+
+def parse_p_entry_grid(value: str | Iterable[float]) -> list[float]:
+    if isinstance(value, str):
+        parts = [part for part in value.replace(",", " ").split() if part]
+        if not parts:
+            raise ValueError("p-entry grid must contain at least one value")
+        values = [float(part) for part in parts]
+    else:
+        values = [float(part) for part in value]
+    if not values:
+        raise ValueError("p-entry grid must contain at least one value")
+    for item in values:
+        if not math.isfinite(item) or item < 0.0 or item > 1.0:
+            raise ValueError(f"p-entry values must be finite in [0,1], got {item}")
+    return sorted(set(values))
+
+
+def _repaired_v2_fast_tables(
+    *,
+    ref_data: ReferenceData,
+    tiers: list[int],
+    contention_factor: float,
+    cold_overhead_trace_path: str | Path = DEFAULT_REPAIRED_V2_COLD_OVERHEAD_TRACE,
+) -> tuple[
+    dict[tuple[str, int], Any],
+    dict[tuple[str, int], float],
+    dict[int, Any],
+]:
+    stage_warm: dict[tuple[str, int], Any] = {}
+    stage_cost: dict[tuple[str, int], float] = {}
+    entry_overhead: dict[int, Any] = {}
+    for stage_name in STAGES:
+        for tier in tiers:
+            memory_mb = int(tier)
+            stage_warm[(stage_name, memory_mb)] = scale_stage_for_memory_tier(
+                stage_name=stage_name,
+                latency_class="warm",
+                target_memory_mb=memory_mb,
+                base_memory_mb=1280,
+                base_params=ref_data.lognormal_params[stage_name]["warm"],
+                amdahl_params=ref_data.amdahl_params,
+                splines=ref_data.warm_splines,
+                contention_factor=float(contention_factor),
+            )
+            warm_ms = spline_predict_warm_mean(
+                stage_name,
+                memory_to_cpu_cores(memory_mb),
+                ref_data.warm_splines,
+            )
+            stage_cost[(stage_name, memory_mb)] = (memory_mb / 1024.0) * (warm_ms / 1000.0)
+        if stage_name == ENTRY_STAGE:
+            for tier in tiers:
+                entry_overhead[int(tier)] = _load_entry_cold_overhead_params(
+                    int(tier), str(cold_overhead_trace_path)
+                )
+    return stage_warm, stage_cost, entry_overhead
+
+
+def _evaluate_repaired_v2_fast(
+    *,
+    slo_class: str,
+    slo_ms: float,
+    memory_tier_per_stage: dict[str, int],
+    stage_warm: dict[tuple[str, int], Any],
+    stage_cost: dict[tuple[str, int], float],
+    entry_overhead: dict[int, Any],
+    rho: float,
+) -> RepairedV2FastRecord:
+    warm_execution = aggregate_civic_alert(
+        {
+            stage_name: stage_warm[(stage_name, int(memory_tier_per_stage[stage_name]))]
+            for stage_name in STAGES
+        },
+        rho=float(rho),
+    )
+    warm = add_deterministic_shift(warm_execution, REPAIRED_V2_SYNC_SHIFT_WARM_MS[slo_class])
+    cold = add_deterministic_shift(
+        fenton_wilkinson_sum(
+            [warm_execution, entry_overhead[int(memory_tier_per_stage[ENTRY_STAGE])]],
+            rho=0.0,
+        ),
+        REPAIRED_V2_SYNC_SHIFT_COLD_MS[slo_class],
+    )
+    cost = sum(
+        stage_cost[(stage_name, int(memory_tier_per_stage[stage_name]))]
+        for stage_name in STAGES
+    )
+    return RepairedV2FastRecord(
+        memory_tier_per_stage=dict(memory_tier_per_stage),
+        cost_gbsec=float(cost),
+        warm_survival=float(warm.survival(float(slo_ms))),
+        cold_survival=float(cold.survival(float(slo_ms))),
+        warm_p95_ms=float(warm.quantile(0.95)),
+        cold_p95_ms=float(cold.quantile(0.95)),
+    )
+
+
+def brute_force_repaired_v2_grid(
+    *,
+    slo_class: str,
+    slo_ms: float,
+    p_entry_cold_values: Iterable[float],
+    ref_data: ReferenceData,
+    tiers: list[int] = DEFAULT_TIERS,
+    rho: float = 0.67,
+    contention_factor: float = 1.0,
+    cold_overhead_trace_path: str | Path = DEFAULT_REPAIRED_V2_COLD_OVERHEAD_TRACE,
+) -> list[dict[str, Any]]:
+    """Full 14^5 repaired_v2 oracle with explicit p-entry filtering.
+
+    Each memory plan is evaluated exactly once for warm/cold-entry survival.
+    The per-p optimum is then selected by the mixture
+    ``(1-p)*warm_survival + p*cold_survival``.
+    """
+
+    p_values = parse_p_entry_grid(p_entry_cold_values)
+    stage_warm, stage_cost, entry_overhead = _repaired_v2_fast_tables(
+        ref_data=ref_data,
+        tiers=list(tiers),
+        contention_factor=float(contention_factor),
+        cold_overhead_trace_path=cold_overhead_trace_path,
+    )
+    best: dict[float, tuple[float, str, RepairedV2FastRecord, float] | None] = {
+        p_entry: None for p_entry in p_values
+    }
+    feasible_counts = {p_entry: 0 for p_entry in p_values}
+    n_total = 0
+    start = time.perf_counter()
+    for tier_tuple in itertools.product(tiers, repeat=len(STAGES)):
+        n_total += 1
+        memory = {
+            stage_name: int(memory_mb)
+            for stage_name, memory_mb in zip(STAGES, tier_tuple)
+        }
+        record = _evaluate_repaired_v2_fast(
+            slo_class=slo_class,
+            slo_ms=float(slo_ms),
+            memory_tier_per_stage=memory,
+            stage_warm=stage_warm,
+            stage_cost=stage_cost,
+            entry_overhead=entry_overhead,
+            rho=float(rho),
+        )
+        config_string = format_memory_config(record.memory_tier_per_stage)
+        for p_entry in p_values:
+            violation = (1.0 - p_entry) * record.warm_survival + p_entry * record.cold_survival
+            if violation > 0.05 + 1e-12:
+                continue
+            feasible_counts[p_entry] += 1
+            key = (record.cost_gbsec, config_string)
+            current = best[p_entry]
+            if current is None or key < (current[0], current[1]):
+                best[p_entry] = (record.cost_gbsec, config_string, record, violation)
+    wall = time.perf_counter() - start
+    rows: list[dict[str, Any]] = []
+    for p_entry in p_values:
+        selected = best[p_entry]
+        if selected is None:
+            rows.append(
+                {
+                    "slo_class": slo_class,
+                    "slo_ms": float(slo_ms),
+                    "p_entry_cold": float(p_entry),
+                    "optimal_cost_gbsec": math.nan,
+                    "optimal_violation_rate": math.nan,
+                    "optimal_warm_survival": math.nan,
+                    "optimal_cold_survival": math.nan,
+                    "optimal_warm_p95_ms": math.nan,
+                    "optimal_cold_p95_ms": math.nan,
+                    "n_feasible_plans": feasible_counts[p_entry],
+                    "n_total_evaluated": n_total,
+                    "optimal_memory_config": "",
+                    "optimal_safety_factor": 0.0,
+                    "search_wall_time_sec": wall,
+                    "search_decision": REPAIRED_V2_FULL_SEARCH_DECISION,
+                }
+            )
+            continue
+        _cost, config_string, record, violation = selected
+        rows.append(
+            {
+                "slo_class": slo_class,
+                "slo_ms": float(slo_ms),
+                "p_entry_cold": float(p_entry),
+                "optimal_cost_gbsec": record.cost_gbsec,
+                "optimal_violation_rate": float(violation),
+                "optimal_warm_survival": record.warm_survival,
+                "optimal_cold_survival": record.cold_survival,
+                "optimal_warm_p95_ms": record.warm_p95_ms,
+                "optimal_cold_p95_ms": record.cold_p95_ms,
+                "n_feasible_plans": feasible_counts[p_entry],
+                "n_total_evaluated": n_total,
+                "optimal_memory_config": config_string,
+                "optimal_safety_factor": 0.0,
+                "search_wall_time_sec": wall,
+                "search_decision": REPAIRED_V2_FULL_SEARCH_DECISION,
+            }
+        )
+    return rows
 
 
 def _random_memory_config(rng: random.Random, tiers: list[int]) -> dict[str, int]:
@@ -372,9 +601,11 @@ def run_brute_force_suite(
     baseline_trace_path: str | Path = DEFAULT_BASELINE_TRACE,
     greedy_summary_path: str | Path = DEFAULT_GREEDY_SUMMARY,
     slo_premium_ms: float = 18000.0,
-    slo_free_ms: float = 24000.0,
+    slo_free_ms: float = 22000.0,
     rho: float = 0.0,
     contention_factor: float = 1.0,
+    risk_model: str = "legacy",
+    p_entry_cold_values: Iterable[float] = REPAIRED_V2_P_ENTRY_GRID,
 ) -> dict[str, pd.DataFrame]:
     out = _resolve(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -383,51 +614,99 @@ def run_brute_force_suite(
         baseline_trace_path=baseline_trace_path,
     )
 
-    decision = timing_trial(ref_data=ref_data)
-    timing_df = pd.DataFrame(
-        [
-            {
-                "subset_size": decision.subset_size,
-                "wall_time_sec": decision.wall_time_sec,
-                "estimated_full_time_sec": decision.estimated_full_time_sec,
-                "decision": decision.decision,
-                "full_space_size": decision.full_space_size,
-                "evaluated_space_size": decision.evaluated_space_size,
-            }
-        ]
-    )
-    timing_df.to_csv(out / "timing_trial.csv", index=False)
-    print("timing_trial:")
-    print(timing_df.round(6).to_string(index=False), flush=True)
-
     optimal_rows = []
-    for slo_class, slo_ms in [("premium", slo_premium_ms), ("free", slo_free_ms)]:
-        print(f"enumerating {slo_class} slo={slo_ms} decision={decision.decision}", flush=True)
-        optimal_rows.append(
-            brute_force_one_slo(
-                slo_class=slo_class,
-                slo_ms=slo_ms,
-                predicted_arrivals=5.0,
-                ref_data=ref_data,
-                decision=decision,
-                rho=rho,
-                contention_factor=contention_factor,
-            )
+    comparison_df = pd.DataFrame()
+    if risk_model == "repaired_v2":
+        p_values = parse_p_entry_grid(p_entry_cold_values)
+        full_space = len(DEFAULT_TIERS) ** len(STAGES)
+        timing_df = pd.DataFrame(
+            [
+                {
+                    "subset_size": 0,
+                    "wall_time_sec": 0.0,
+                    "estimated_full_time_sec": math.nan,
+                    "decision": REPAIRED_V2_FULL_SEARCH_DECISION,
+                    "full_space_size": full_space,
+                    "evaluated_space_size": full_space,
+                }
+            ]
         )
+        timing_df.to_csv(out / "timing_trial.csv", index=False)
+        print("timing_trial:")
+        print(timing_df.round(6).to_string(index=False), flush=True)
+        for slo_class, slo_ms in [("premium", slo_premium_ms), ("free", slo_free_ms)]:
+            print(
+                f"enumerating repaired_v2 {slo_class} slo={slo_ms} "
+                f"p_entry={p_values} full_space={full_space}",
+                flush=True,
+            )
+            optimal_rows.extend(
+                brute_force_repaired_v2_grid(
+                    slo_class=slo_class,
+                    slo_ms=float(slo_ms),
+                    p_entry_cold_values=p_values,
+                    ref_data=ref_data,
+                    tiers=list(DEFAULT_TIERS),
+                    rho=float(rho),
+                    contention_factor=float(contention_factor),
+                )
+            )
+    elif risk_model == "legacy":
+        decision = timing_trial(ref_data=ref_data)
+        timing_df = pd.DataFrame(
+            [
+                {
+                    "subset_size": decision.subset_size,
+                    "wall_time_sec": decision.wall_time_sec,
+                    "estimated_full_time_sec": decision.estimated_full_time_sec,
+                    "decision": decision.decision,
+                    "full_space_size": decision.full_space_size,
+                    "evaluated_space_size": decision.evaluated_space_size,
+                }
+            ]
+        )
+        timing_df.to_csv(out / "timing_trial.csv", index=False)
+        print("timing_trial:")
+        print(timing_df.round(6).to_string(index=False), flush=True)
+
+        for slo_class, slo_ms in [("premium", slo_premium_ms), ("free", slo_free_ms)]:
+            print(f"enumerating {slo_class} slo={slo_ms} decision={decision.decision}", flush=True)
+            optimal_rows.append(
+                brute_force_one_slo(
+                    slo_class=slo_class,
+                    slo_ms=slo_ms,
+                    predicted_arrivals=5.0,
+                    ref_data=ref_data,
+                    decision=decision,
+                    rho=rho,
+                    contention_factor=contention_factor,
+                )
+            )
+    else:
+        raise ValueError(f"unknown risk_model={risk_model!r}")
     optimal_df = pd.DataFrame(optimal_rows)
     optimal_df.to_csv(out / "brute_force_optimal.csv", index=False)
 
-    comparison_df = compare_greedy_vs_optimal(
-        optimal_df=optimal_df,
-        greedy_summary_path=greedy_summary_path,
-    )
-    comparison_df.to_csv(out / "greedy_vs_optimal.csv", index=False)
-    _write_report(
-        path=out / "comparison_report.md",
-        timing_df=timing_df,
-        optimal_df=optimal_df,
-        comparison_df=comparison_df,
-    )
+    if risk_model == "legacy":
+        comparison_df = compare_greedy_vs_optimal(
+            optimal_df=optimal_df,
+            greedy_summary_path=greedy_summary_path,
+        )
+        comparison_df.to_csv(out / "greedy_vs_optimal.csv", index=False)
+        _write_report(
+            path=out / "comparison_report.md",
+            timing_df=timing_df,
+            optimal_df=optimal_df,
+            comparison_df=comparison_df,
+        )
+    else:
+        comparison_df.to_csv(out / "greedy_vs_optimal.csv", index=False)
+        (out / "comparison_report.md").write_text(
+            "# repaired_v2 Brute Force Oracle\n\n"
+            "Full 14^5 memory-tier enumeration with explicit p_entry_cold; "
+            "legacy greedy-summary comparison is intentionally skipped.\n",
+            encoding="utf-8",
+        )
 
     return {
         "timing_trial": timing_df,
@@ -443,9 +722,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline-trace", default=str(DEFAULT_BASELINE_TRACE))
     parser.add_argument("--greedy-summary", default=str(DEFAULT_GREEDY_SUMMARY))
     parser.add_argument("--slo-premium-ms", type=float, default=18000.0)
-    parser.add_argument("--slo-free-ms", type=float, default=24000.0)
+    parser.add_argument("--slo-free-ms", type=float, default=22000.0)
     parser.add_argument("--rho", type=float, default=0.0)
     parser.add_argument("--contention-factor", type=float, default=1.0)
+    parser.add_argument("--risk-model", choices=["legacy", "repaired_v2"], default="legacy")
+    parser.add_argument(
+        "--p-entry-grid",
+        default=",".join(str(value) for value in REPAIRED_V2_P_ENTRY_GRID),
+        help="Comma/space separated p_entry_cold grid for repaired_v2.",
+    )
     return parser.parse_args()
 
 
@@ -460,6 +745,8 @@ def main() -> None:
         slo_free_ms=args.slo_free_ms,
         rho=args.rho,
         contention_factor=args.contention_factor,
+        risk_model=args.risk_model,
+        p_entry_cold_values=parse_p_entry_grid(args.p_entry_grid),
     )
     print()
     print("brute_force_optimal:")

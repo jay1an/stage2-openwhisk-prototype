@@ -18,7 +18,12 @@ from typing import Any, Iterable
 import pandas as pd
 
 from runner.stage4_risk.plan_risk import PlanInput, PlanRiskResult, compute_plan_risk
-from runner.stage5_control.brute_force_planner import format_memory_config
+from runner.stage5_control.brute_force_planner import (
+    REPAIRED_V2_P_ENTRY_GRID,
+    brute_force_repaired_v2_grid,
+    format_memory_config,
+    parse_p_entry_grid,
+)
 from runner.stage5_control.multi_slo_planner import (
     DEFAULT_BASELINE_TRACE,
     DEFAULT_LOGNORMAL_PARAMS,
@@ -50,7 +55,7 @@ DEFAULT_BRUTE_FORCE = (
 )
 DEFAULT_WORKFLOW = Path(__file__).resolve().parents[3] / "configs" / "civic_alert_flow.yaml"
 DEFAULT_RHO = 0.67
-DEFAULT_CONTENTION_FACTOR = 1.10
+DEFAULT_CONTENTION_FACTOR = 1.0
 DEFAULT_LAMBDA_GRID = (0.0, 1.0, 4.0, 16.0, 64.0)
 EPS = 1e-12
 
@@ -79,6 +84,9 @@ class EvalContext:
     ref_data: ReferenceData
     rho: float
     contention_factor: float
+    risk_model: str
+    slo_class: str | None
+    p_entry_cold: float | None
     eval_cache: dict[tuple[int, ...], StateEval]
 
     def evaluate(self, state_key: tuple[int, ...]) -> StateEval:
@@ -104,6 +112,9 @@ class EvalContext:
             slo_ms=self.config.slo_ms,
             rho=self.rho,
             contention_factor=self.contention_factor,
+            risk_model=self.risk_model,  # type: ignore[arg-type]
+            slo_class=self.slo_class,
+            p_entry_cold=self.p_entry_cold,
         )
         cost = plan_cost_gbsec(
             memory_tier_per_stage=memory,
@@ -659,6 +670,7 @@ def result_row(
     config: PlannerConfig,
     result: PlanResult,
     brute_row: dict[str, Any] | None,
+    p_entry_cold: float | None = None,
 ) -> dict[str, Any]:
     brute_cost = None
     brute_config = ""
@@ -669,10 +681,15 @@ def result_row(
     return {
         "slo_class": slo_class,
         "slo_ms": config.slo_ms,
+        "p_entry_cold": math.nan if p_entry_cold is None else float(p_entry_cold),
         "method": result.method,
         "cost_gbsec": result.evaluation.cost_gbsec,
         "violation_rate": result.evaluation.violation_rate,
         "expected_e2e_ms": result.evaluation.expected_e2e_ms,
+        "warm_p95_ms": result.evaluation.risk_result.e2e_warm_params.quantile(0.95),
+        "entry_cold_p95_ms": result.evaluation.risk_result.e2e_cold_entry_params.quantile(0.95),
+        "warm_survival": result.evaluation.risk_result.p_violation_warm,
+        "entry_cold_survival": result.evaluation.risk_result.p_violation_cold_entry,
         "entry_prewarm_safety_factor": result.evaluation.safety_factor,
         "entry_prewarm_count": result.evaluation.entry_prewarm_count,
         "feasible": result.feasible,
@@ -693,10 +710,15 @@ def brute_result_row(
     return {
         "slo_class": slo_class,
         "slo_ms": config.slo_ms,
+        "p_entry_cold": float(row.get("p_entry_cold", math.nan)),
         "method": "brute_force",
         "cost_gbsec": float(row["optimal_cost_gbsec"]),
         "violation_rate": float(row["optimal_violation_rate"]),
         "expected_e2e_ms": math.nan,
+        "warm_p95_ms": float(row.get("optimal_warm_p95_ms", math.nan)),
+        "entry_cold_p95_ms": float(row.get("optimal_cold_p95_ms", math.nan)),
+        "warm_survival": float(row.get("optimal_warm_survival", math.nan)),
+        "entry_cold_survival": float(row.get("optimal_cold_survival", math.nan)),
         "entry_prewarm_safety_factor": float(row["optimal_safety_factor"]),
         "entry_prewarm_count": entry_prewarm_count(
             float(row["optimal_safety_factor"]), config.predicted_arrivals
@@ -708,6 +730,78 @@ def brute_result_row(
         "configs_match_brute": True,
         "memory_config": str(row["optimal_memory_config"]),
     }
+
+
+def external_plan_row(
+    *,
+    slo_class: str,
+    config: PlannerConfig,
+    method: str,
+    memory_tier_per_stage: dict[str, int],
+    ref_data: ReferenceData,
+    brute_row: dict[str, Any] | None,
+    risk_model: str,
+    rho: float,
+    contention_factor: float,
+    p_entry_cold: float | None,
+    iterations: int,
+    states_evaluated: int,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    plan = PlanInput(
+        memory_tier_per_stage=dict(memory_tier_per_stage),
+        entry_prewarm_count=0.0,
+        predicted_arrivals=float(config.predicted_arrivals),
+        lognormal_params=ref_data.lognormal_params,
+        amdahl_params=ref_data.amdahl_params,
+        cold_overhead_per_stage=ref_data.cold_overhead_per_stage,
+        p_baseline=ref_data.p_baseline,
+    )
+    risk = compute_plan_risk(
+        plan,
+        slo_ms=float(config.slo_ms),
+        rho=float(rho),
+        contention_factor=float(contention_factor),
+        risk_model=risk_model,  # type: ignore[arg-type]
+        slo_class=(slo_class if risk_model == "repaired_v2" else None),
+        p_entry_cold=(p_entry_cold if risk_model == "repaired_v2" else None),
+    )
+    cost = plan_cost_gbsec(
+        memory_tier_per_stage=dict(memory_tier_per_stage),
+        entry_prewarm_count_value=0,
+        warm_splines=ref_data.warm_splines,
+        stages=list(config.stages),
+    )
+    brute_cost = None
+    brute_config = ""
+    if brute_row is not None:
+        brute_cost = float(brute_row["optimal_cost_gbsec"])
+        brute_config = str(brute_row["optimal_memory_config"])
+    config_string = format_memory_config(memory_tier_per_stage, list(config.stages))
+    row = {
+        "slo_class": slo_class,
+        "slo_ms": float(config.slo_ms),
+        "p_entry_cold": math.nan if p_entry_cold is None else float(p_entry_cold),
+        "method": method,
+        "cost_gbsec": float(cost),
+        "violation_rate": float(risk.p_violation_total),
+        "expected_e2e_ms": float(risk.expected_e2e_ms),
+        "warm_p95_ms": risk.e2e_warm_params.quantile(0.95),
+        "entry_cold_p95_ms": risk.e2e_cold_entry_params.quantile(0.95),
+        "warm_survival": float(risk.p_violation_warm),
+        "entry_cold_survival": float(risk.p_violation_cold_entry),
+        "entry_prewarm_safety_factor": 0.0,
+        "entry_prewarm_count": 0,
+        "feasible": bool(risk.p_violation_total <= config.max_violation_rate + EPS),
+        "iterations": int(iterations),
+        "states_evaluated": int(states_evaluated),
+        "cost_gap_vs_brute_pct": cost_gap(float(cost), brute_cost),
+        "configs_match_brute": bool(config_string == brute_config) if brute_config else False,
+        "memory_config": config_string,
+    }
+    if extra:
+        row.update(extra)
+    return row
 
 
 def complexity_rows(
@@ -773,13 +867,21 @@ def write_report(
     rho: float,
     contention_factor: float,
     brute_force_path: Path,
+    risk_model: str,
+    p_entry_values: list[float],
 ) -> None:
     lines: list[str] = []
     lines.append("# Risk-Price Planner Suite")
     lines.append("")
     lines.append("## Setup")
-    lines.append(f"- Risk model: `compute_plan_risk(rho={rho}, contention_factor={contention_factor})`.")
-    lines.append(f"- Brute-force oracle: `{brute_force_path}`.")
+    lines.append(
+        f"- Risk model: `compute_plan_risk(risk_model={risk_model!r}, rho={rho}, contention_factor={contention_factor})`."
+    )
+    if risk_model == "repaired_v2":
+        lines.append(f"- Explicit p_entry_cold grid: `{p_entry_values}`.")
+        lines.append("- Brute-force oracle: in-process full 14^5 memory enumeration.")
+    else:
+        lines.append(f"- Brute-force oracle: `{brute_force_path}`.")
     lines.append("- Decision space: per-stage memory tier plus entry prewarm safety factor.")
     lines.append("")
     lines.append("## Method Comparison")
@@ -808,13 +910,16 @@ def run_suite(
     baseline_trace_path: str | Path = DEFAULT_BASELINE_TRACE,
     predicted_arrivals: float = 5.0,
     slo_premium_ms: float = 18000.0,
-    slo_free_ms: float = 24000.0,
+    slo_free_ms: float = 22000.0,
     rho: float = DEFAULT_RHO,
     contention_factor: float = DEFAULT_CONTENTION_FACTOR,
     lambda_values: Iterable[float] | None = DEFAULT_LAMBDA_GRID,
     beam_widths: list[int] | None = None,
+    risk_model: str = "repaired_v2",
+    p_entry_cold_values: Iterable[float] = REPAIRED_V2_P_ENTRY_GRID,
 ) -> dict[str, pd.DataFrame]:
-    beam_widths = beam_widths or [3, 5]
+    beam_widths = beam_widths or []
+    p_values = parse_p_entry_grid(p_entry_cold_values)
     out = resolve(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     ref_data = load_reference_data(
@@ -822,7 +927,37 @@ def run_suite(
         baseline_trace_path=baseline_trace_path,
     )
     workflow = load_workflow(str(resolve(workflow_path)))
-    brute_rows = load_brute_force_rows(resolve(brute_force_path))
+    active_safety_factors = [0.0] if risk_model == "repaired_v2" else list(DEFAULT_SAFETY_FACTORS)
+    if risk_model == "repaired_v2":
+        brute_records: list[dict[str, Any]] = []
+        for slo_class, slo_ms in [("premium", slo_premium_ms), ("free", slo_free_ms)]:
+            print(
+                f"repaired_v2 brute oracle: class={slo_class} slo={slo_ms} "
+                f"p_entry={p_values} full_space={len(DEFAULT_TIERS) ** len(STAGES)}",
+                flush=True,
+            )
+            brute_records.extend(
+                brute_force_repaired_v2_grid(
+                    slo_class=slo_class,
+                    slo_ms=float(slo_ms),
+                    p_entry_cold_values=p_values,
+                    ref_data=ref_data,
+                    tiers=list(DEFAULT_TIERS),
+                    rho=float(rho),
+                    contention_factor=float(contention_factor),
+                )
+            )
+        brute_df = pd.DataFrame(brute_records)
+        brute_df.to_csv(out / "brute_force_optimal.csv", index=False)
+        brute_rows: dict[tuple[str, float | None], dict[str, Any]] = {
+            (str(row["slo_class"]), float(row["p_entry_cold"])): row
+            for row in brute_records
+        }
+    elif risk_model == "legacy":
+        brute_legacy = load_brute_force_rows(resolve(brute_force_path))
+        brute_rows = {(slo_class, None): row for slo_class, row in brute_legacy.items()}
+    else:
+        raise ValueError(f"unknown risk_model={risk_model!r}")
     method_rows: list[dict[str, Any]] = []
     trace_rows: list[dict[str, Any]] = []
 
@@ -831,7 +966,7 @@ def run_suite(
         max_violation_rate=0.05,
         predicted_arrivals=predicted_arrivals,
         tiers=list(DEFAULT_TIERS),
-        safety_factors=list(DEFAULT_SAFETY_FACTORS),
+        safety_factors=list(active_safety_factors),
         stages=list(STAGES),
     )
     orion_selfcheck = run_orion_self_checks(
@@ -847,86 +982,166 @@ def run_suite(
         raise RuntimeError("Orion self-check failed; refusing to run planner suite")
 
     h_lambdas_max = 0
+    external_cache: dict[tuple[str, str], Any] = {}
     for slo_class, slo_ms in [("premium", slo_premium_ms), ("free", slo_free_ms)]:
-        config = PlannerConfig(
-            slo_ms=slo_ms,
-            max_violation_rate=0.05,
-            predicted_arrivals=predicted_arrivals,
-            tiers=list(DEFAULT_TIERS),
-            safety_factors=list(DEFAULT_SAFETY_FACTORS),
-            stages=list(STAGES),
-        )
-        brute_row = brute_rows.get(slo_class)
-
-        for runner in ["greedy", "risk_price_fast", "risk_price_pairwise"]:
-            ctx = EvalContext(
-                config=config,
-                ref_data=ref_data,
-                rho=float(rho),
-                contention_factor=float(contention_factor),
-                eval_cache={},
+        p_loop: list[float | None] = p_values if risk_model == "repaired_v2" else [None]
+        for p_entry in p_loop:
+            config = PlannerConfig(
+                slo_ms=slo_ms,
+                max_violation_rate=0.05,
+                predicted_arrivals=predicted_arrivals,
+                tiers=list(DEFAULT_TIERS),
+                safety_factors=list(active_safety_factors),
+                stages=list(STAGES),
             )
-            if runner == "greedy":
-                result = greedy_plan(ctx)
+            brute_row = brute_rows.get((slo_class, p_entry))
+            if brute_row is not None:
+                method_rows.append(brute_result_row(slo_class=slo_class, config=config, row=brute_row))
+
+            for runner in ["greedy", "risk_price_pairwise"]:
+                ctx = EvalContext(
+                    config=config,
+                    ref_data=ref_data,
+                    rho=float(rho),
+                    contention_factor=float(contention_factor),
+                    risk_model=risk_model,
+                    slo_class=(slo_class if risk_model == "repaired_v2" else None),
+                    p_entry_cold=(float(p_entry) if p_entry is not None else None),
+                    eval_cache={},
+                )
+                if runner == "greedy":
+                    result = greedy_plan(ctx)
+                else:
+                    start_key = initial_state_key(config)
+                    effects = single_change_candidates(ctx=ctx, state_key=start_key, all_higher=True)
+                    lambdas = resolve_lambda_grid(effects, lambda_values)
+                    h_lambdas_max = max(h_lambdas_max, len(lambdas))
+                    result = risk_price_plan(
+                        ctx,
+                        pairwise=True,
+                        lambda_values=lambdas,
+                    )
+                method_rows.append(
+                    result_row(
+                        slo_class=slo_class,
+                        config=config,
+                        result=result,
+                        brute_row=brute_row,
+                        p_entry_cold=p_entry,
+                    )
+                )
+                for item in result.trace:
+                    trace_rows.append(
+                        {
+                            "slo_class": slo_class,
+                            "p_entry_cold": math.nan if p_entry is None else float(p_entry),
+                            "method": result.method,
+                            **item,
+                        }
+                    )
+
+            for width in beam_widths:
+                ctx = EvalContext(
+                    config=config,
+                    ref_data=ref_data,
+                    rho=float(rho),
+                    contention_factor=float(contention_factor),
+                    risk_model=risk_model,
+                    slo_class=(slo_class if risk_model == "repaired_v2" else None),
+                    p_entry_cold=(float(p_entry) if p_entry is not None else None),
+                    eval_cache={},
+                )
+                result = beam_plan(ctx, beam_width=width)
+                method_rows.append(
+                    result_row(
+                        slo_class=slo_class,
+                        config=config,
+                        result=result,
+                        brute_row=brute_row,
+                        p_entry_cold=p_entry,
+                    )
+                )
+                for item in result.trace:
+                    trace_rows.append(
+                        {
+                            "slo_class": slo_class,
+                            "p_entry_cold": math.nan if p_entry is None else float(p_entry),
+                            "method": result.method,
+                            **item,
+                        }
+                    )
+
+            if ("orion", slo_class) not in external_cache:
+                external_cache[("orion", slo_class)] = orion_plan(
+                    workflow=workflow,
+                    config=config,
+                    ref_data=ref_data,
+                    rho=float(rho),
+                    contention_factor=float(contention_factor),
+                )
+            orion = external_cache[("orion", slo_class)]
+            method_rows.append(
+                external_plan_row(
+                    slo_class=slo_class,
+                    config=config,
+                    method="orion_scored_repaired_v2" if risk_model == "repaired_v2" else "orion",
+                    memory_tier_per_stage=orion.memory_tier_per_stage,
+                    ref_data=ref_data,
+                    brute_row=brute_row,
+                    risk_model=risk_model,
+                    rho=float(rho),
+                    contention_factor=float(contention_factor),
+                    p_entry_cold=p_entry,
+                    iterations=orion.states_expanded,
+                    states_evaluated=orion.states_evaluated,
+                    extra={
+                        "orion_p95_ms": orion.orion_p95_ms,
+                        "orion_own_survival": orion.orion_own_survival,
+                        "orion_feasible": orion.feasible_by_orion,
+                        "orion_search_exhausted": orion.search_exhausted,
+                    },
+                )
+            )
+
+            try:
+                from runner.stage5_control.smiless_planner import smiless_plan
+            except Exception as exc:  # pragma: no cover - optional baseline.
+                print(f"SMIless unavailable: {exc}", flush=True)
             else:
-                start_key = initial_state_key(config)
-                effects = single_change_candidates(ctx=ctx, state_key=start_key, all_higher=True)
-                lambdas = resolve_lambda_grid(effects, lambda_values)
-                h_lambdas_max = max(h_lambdas_max, len(lambdas))
-                result = risk_price_plan(
-                    ctx,
-                    pairwise=(runner == "risk_price_pairwise"),
-                    lambda_values=lambdas,
+                if ("smiless", slo_class) not in external_cache:
+                    external_cache[("smiless", slo_class)] = smiless_plan(
+                        workflow=workflow,
+                        config=config,
+                        ref_data=ref_data,
+                        rho=float(rho),
+                        contention_factor=float(contention_factor),
+                    )
+                smiless = external_cache[("smiless", slo_class)]
+                method_rows.append(
+                    external_plan_row(
+                        slo_class=slo_class,
+                        config=config,
+                        method=(
+                            "smiless_scored_repaired_v2"
+                            if risk_model == "repaired_v2"
+                            else "smiless"
+                        ),
+                        memory_tier_per_stage=smiless.memory_tier_per_stage,
+                        ref_data=ref_data,
+                        brute_row=brute_row,
+                        risk_model=risk_model,
+                        rho=float(rho),
+                        contention_factor=float(contention_factor),
+                        p_entry_cold=p_entry,
+                        iterations=smiless.states_expanded,
+                        states_evaluated=smiless.states_evaluated,
+                        extra={
+                            "smiless_p95_ms": smiless.smiless_p95_ms,
+                            "smiless_feasible": smiless.feasible_by_smiless,
+                            "smiless_search_exhausted": smiless.search_exhausted,
+                        },
+                    )
                 )
-            method_rows.append(
-                result_row(
-                    slo_class=slo_class,
-                    config=config,
-                    result=result,
-                    brute_row=brute_row,
-                )
-            )
-            for item in result.trace:
-                trace_rows.append({"slo_class": slo_class, "method": result.method, **item})
-
-        for width in beam_widths:
-            ctx = EvalContext(
-                config=config,
-                ref_data=ref_data,
-                rho=float(rho),
-                contention_factor=float(contention_factor),
-                eval_cache={},
-            )
-            result = beam_plan(ctx, beam_width=width)
-            method_rows.append(
-                result_row(
-                    slo_class=slo_class,
-                    config=config,
-                    result=result,
-                    brute_row=brute_row,
-                )
-            )
-            for item in result.trace:
-                trace_rows.append({"slo_class": slo_class, "method": result.method, **item})
-
-        orion = orion_plan(
-            workflow=workflow,
-            config=config,
-            ref_data=ref_data,
-            rho=float(rho),
-            contention_factor=float(contention_factor),
-        )
-        method_rows.append(
-            orion_result_row(
-                slo_class=slo_class,
-                config=config,
-                result=orion,
-                brute_row=brute_row,
-            )
-        )
-
-        if brute_row is not None:
-            method_rows.append(brute_result_row(slo_class=slo_class, config=config, row=brute_row))
 
     method_df = pd.DataFrame(method_rows)
     trace_df = pd.DataFrame(trace_rows)
@@ -934,7 +1149,7 @@ def run_suite(
         complexity_rows(
             n_stages=len(STAGES),
             n_tiers=len(DEFAULT_TIERS),
-            n_safety=len(DEFAULT_SAFETY_FACTORS),
+            n_safety=len(active_safety_factors),
             beam_widths=beam_widths,
             h_lambdas=h_lambdas_max,
         )
@@ -950,6 +1165,8 @@ def run_suite(
         rho=float(rho),
         contention_factor=float(contention_factor),
         brute_force_path=resolve(brute_force_path),
+        risk_model=risk_model,
+        p_entry_values=p_values,
     )
     return {
         "method_comparison": method_df,
@@ -968,9 +1185,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline-trace", default=str(DEFAULT_BASELINE_TRACE))
     parser.add_argument("--predicted-arrivals", type=float, default=5.0)
     parser.add_argument("--slo-premium-ms", type=float, default=18000.0)
-    parser.add_argument("--slo-free-ms", type=float, default=24000.0)
+    parser.add_argument("--slo-free-ms", type=float, default=22000.0)
     parser.add_argument("--rho", type=float, default=DEFAULT_RHO)
     parser.add_argument("--contention-factor", type=float, default=DEFAULT_CONTENTION_FACTOR)
+    parser.add_argument("--risk-model", choices=["legacy", "repaired_v2"], default="repaired_v2")
+    parser.add_argument(
+        "--p-entry-grid",
+        default=",".join(str(value) for value in REPAIRED_V2_P_ENTRY_GRID),
+        help="Comma/space separated p_entry_cold grid for repaired_v2.",
+    )
     parser.add_argument(
         "--lambda-grid",
         default=",".join(str(value).rstrip("0").rstrip(".") for value in DEFAULT_LAMBDA_GRID),
@@ -995,6 +1218,8 @@ def main() -> None:
         contention_factor=args.contention_factor,
         lambda_values=parse_lambda_grid(args.lambda_grid),
         beam_widths=args.beam_width,
+        risk_model=args.risk_model,
+        p_entry_cold_values=parse_p_entry_grid(args.p_entry_grid),
     )
     print("method_comparison:")
     print(outputs["method_comparison"].round(8).to_string(index=False))

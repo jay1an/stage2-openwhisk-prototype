@@ -28,6 +28,13 @@ PREMIUM_PLAN = {
     "classify_scene": 3072,
     "translate_alert": 1024,
 }
+RISK_PRICE_18_PLAN = {
+    "detect_object": 2048,
+    "estimate_pose": 1280,
+    "match_face": 1792,
+    "classify_scene": 1280,
+    "translate_alert": 1792,
+}
 
 
 @dataclass(frozen=True)
@@ -69,6 +76,8 @@ def risk_for(
         memory_tier_per_stage=plan,
         completed_finish_ms=completed,
         cold_upgrade_stages=cold_upgrades or set(),
+        rho=0.67,
+        contention_factor=1.10,
     )
 
 
@@ -115,17 +124,22 @@ def test_dynamic_cold_dist_matches_offline_scaled_stage(fixture_data: FixtureDat
 
 
 def test_u1_noop_when_state_is_healthy(fixture_data: FixtureData) -> None:
-    config = make_config(15000.0)
+    # Re-anchored under the current real-sigma/rho/contention model:
+    # RISK_PRICE_18_PLAN has conditional risk 0.031517714956 <= 0.05,
+    # so the dynamic branch should be inert.
+    config = make_config(18000.0)
     completed: dict[str, float] = {}
     pending = list(STAGES)
-    r0 = risk_for(fixture_data, config, PREMIUM_PLAN, completed)
+    r0 = risk_for(fixture_data, config, RISK_PRICE_18_PLAN, completed)
     changes = dynamic_upgrade(
         config,
         fixture_data.ref_data,
         fixture_data.workflow,
-        PREMIUM_PLAN,
+        RISK_PRICE_18_PLAN,
         completed,
         pending,
+        rho=0.67,
+        contention_factor=1.10,
     )
     print(
         "U1 no-op: "
@@ -136,10 +150,14 @@ def test_u1_noop_when_state_is_healthy(fixture_data: FixtureData) -> None:
 
 
 def test_u2_recovery_improves_slow_state(fixture_data: FixtureData) -> None:
-    config = make_config(25000.0)
+    # Re-anchored state: all-512, detect has completed late at 6000 ms.
+    # With generous JIT lead, pending upgrades are prewarmable; dynamic should
+    # recover from r0~=1.0 to r1~=0.0479, under the 5% target.
+    config = make_config(30000.0)
     current = {stage: 512 for stage in STAGES}
-    completed = {"detect_object": 3500.0, "estimate_pose": 5500.0}
+    completed = {"detect_object": 6000.0}
     pending = [stage for stage in STAGES if stage not in completed]
+    jit_leads = {stage: 60000.0 for stage in pending}
     r0 = risk_for(fixture_data, config, current, completed)
     changes = dynamic_upgrade(
         config,
@@ -148,9 +166,14 @@ def test_u2_recovery_improves_slow_state(fixture_data: FixtureData) -> None:
         current,
         completed,
         pending,
+        jit_lead_ms_by_stage=jit_leads,
+        jit_margin_ms=0.0,
+        min_jit_slack_ms=0.0,
+        rho=0.67,
+        contention_factor=1.10,
     )
     upgraded = apply_changes(current, changes)
-    r1 = risk_for(fixture_data, config, upgraded, completed, set(changes or {}))
+    r1 = risk_for(fixture_data, config, upgraded, completed)
     print(
         "U2 recovery: "
         f"r0={r0:.12f} r1={r1:.12f} target={config.max_violation_rate:.6f} "
@@ -166,12 +189,24 @@ def test_u2_recovery_improves_slow_state(fixture_data: FixtureData) -> None:
 
 
 def test_u3_decision_a_rejects_cold_worse_upgrade(fixture_data: FixtureData) -> None:
+    # Re-anchored decision-a witness:
+    # detect completed at 3000 ms; estimate_pose 1280->1536 has
+    # warm-only risk 0.878178535680 < r0 0.897220540888, but if the
+    # upgraded tier is not prewarmed and is cold-accounted, risk rises to
+    # 0.922618756723. Giving estimate zero JIT lead makes that candidate
+    # ineligible, while other pending stages can still be upgraded.
     config = make_config(15000.0)
-    completed = {"detect_object": 4200.0}
+    completed = {"detect_object": 3000.0}
     pending = [stage for stage in STAGES if stage not in completed]
     candidate_stage = "estimate_pose"
     candidate = dict(PREMIUM_PLAN)
     candidate[candidate_stage] = 1536
+    jit_leads = {
+        "estimate_pose": 0.0,
+        "match_face": 60000.0,
+        "classify_scene": 60000.0,
+        "translate_alert": 60000.0,
+    }
 
     r0 = risk_for(fixture_data, config, PREMIUM_PLAN, completed)
     warm_only_risk = risk_for(fixture_data, config, candidate, completed)
@@ -189,6 +224,12 @@ def test_u3_decision_a_rejects_cold_worse_upgrade(fixture_data: FixtureData) -> 
         PREMIUM_PLAN,
         completed,
         pending,
+        jit_lead_ms_by_stage=jit_leads,
+        jit_margin_ms=0.0,
+        min_jit_slack_ms=0.0,
+        allow_partial=True,
+        rho=0.67,
+        contention_factor=1.10,
     )
     print(
         "U3 decision-a: "
