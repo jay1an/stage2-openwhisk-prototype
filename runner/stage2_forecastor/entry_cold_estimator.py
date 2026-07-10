@@ -9,6 +9,11 @@ currently available entry warm slots A_t.  The planner-facing probability is
 which is the expected fraction of arrivals that cannot find a warm entry
 container.  The same function can be fed with live /poolState rows where
 ``available = free + warming``.
+
+Important caveat: this estimator should be fed with measured pool availability
+when used online.  Feeding a forecaster's own K_t back as "available" is
+optimistic for bursty dynamic pools because it ignores forecast error, bin
+boundaries, and prewarm timing.  The offline report prints this gap explicitly.
 """
 
 from __future__ import annotations
@@ -432,6 +437,18 @@ def _render_report(
     anchor: pd.DataFrame,
     available_example: dict[tuple[str, int], int],
 ) -> str:
+    dynamic_gap_line = "- Dynamic-K caveat row unavailable."
+    dynamic_rows = selfcheck[selfcheck["arm"].eq("hgb_q90_60s")]
+    if not dynamic_rows.empty:
+        row = dynamic_rows.iloc[0]
+        dynamic_gap_line = (
+            "- Dynamic-K caveat: when the forecast K itself is treated as "
+            f"available, the point estimator gives NB {row['est_nb_rate']:.2%} "
+            f"for `hgb_q90_60s`, but event simulation gives "
+            f"{row['simulate_forecaster_cold_rate']:.2%}. This roughly 2x "
+            "optimism is the loop-back failure mode: K_t is a forecast, not a "
+            "measured pool state."
+        )
     lines = [
         "# Step 5 Entry Cold Estimator",
         "",
@@ -467,7 +484,10 @@ def _render_report(
             "## Interpretation",
             "",
             "- The estimator is a point-in-time shortage model: `E[(D-A)+]/E[D]`.",
-            "- Event-level simulation can be lower because warm containers carry over between bins.",
+            "- For fixed K, event-level simulation is close to this model because warm-container carry-over is the main difference.",
+            dynamic_gap_line,
+            "- Operational rule: use `/poolState` measured `free + warming` as `available`; do not feed forecast K_t back as if it were already real capacity.",
+            "- Planner rule: use this estimator conservatively for `p_entry_cold` (NB is safer than Poisson), or calibrate to real entry-cold measurements when available.",
             "- The anchor table turns observed real entry-cold rates into an effective available-slot explanation for planner `p_entry_cold`.",
         ]
     )
